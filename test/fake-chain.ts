@@ -3,9 +3,11 @@ import { mainnet } from 'viem/chains';
 
 import { createEvmAdapter } from '../src/chains/evm/adapter.ts';
 import { TRANSFER_TOPIC } from '../src/chains/evm/logs.ts';
+import { MULTICALL3 } from '../src/chains/evm/multicall.ts';
 import { addTransfer, emptyAggregate } from '../src/core/aggregate.ts';
 import type { Address, BlockRef, ChainAdapter, ChunkAggregate, Hex, RpcClient, TransferEvent } from '../src/core/types.ts';
 import { RpcError } from '../src/rpc/errors.ts';
+import { createRpcLogSource } from '../src/sources/rpc-logs.ts';
 
 export const address = (n: number): Address => `0x${n.toString(16).padStart(40, '0')}` as Address;
 export const blockHash = (n: bigint): Hex => `0x${n.toString(16).padStart(64, 'b')}`;
@@ -123,16 +125,17 @@ export class FakeChain {
   };
 
   adapter(overrides: Partial<{ startBlock: bigint; logsMaxRange: bigint; followerMaxRange: bigint; scanConcurrency: number }> = {}): ChainAdapter {
+    const logsMaxRange = overrides.logsMaxRange ?? 1_000n;
     return createEvmAdapter(this.rpc, {
       network: 'ethereum',
       chain: mainnet,
       startBlock: 100n,
+      accountLogs: createRpcLogSource(this.rpc, { preferredMaxRange: logsMaxRange, minRange: 1n }),
       finalizedMaxNoProgressMs: 1_200_000,
-      logsMaxRange: 1_000n,
-      logsMinRange: 1n,
       scanConcurrency: 2,
       followerMaxRange: 500n,
       multicallBatch: 1_000,
+      multicall3: MULTICALL3,
       headCacheMs: 0,
       ...overrides,
     });

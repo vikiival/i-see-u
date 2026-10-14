@@ -57,8 +57,13 @@ const stats = (): RpcStats => ({
 const adapterWith = (overrides: Partial<ChainAdapter> = {}): ChainAdapter => ({
   network: 'ethereum',
   startBlock: 25_933_634n,
-  logsMaxRange: 10_000n,
-  logsMinRange: 500n,
+  accountLogs: {
+    name: 'rpc',
+    preferredMaxRange: 10_000n,
+    adaptiveRange: { minRange: 500n },
+    async scanAccount() { return { aggregate: { tokens: new Map(), nfts: new Map(), selfSeen: new Set() }, calls: 0, logs: 0, heavy: false }; },
+    stats: () => ({ rpc: { requests: 0, chunks: 0, logs: 0, failures: 0, fallbacks: 0 } }),
+  },
   scanConcurrency: 4,
   followerMaxRange: 500n,
   normalizeAddress(input) {
@@ -72,7 +77,6 @@ const adapterWith = (overrides: Partial<ChainAdapter> = {}): ChainAdapter => ({
       stale: false,
     };
   },
-  async scanChunk() { return { aggregate: { tokens: new Map(), nfts: new Map(), selfSeen: new Set() }, calls: 0, heavy: false }; },
   async blockByNumber(number) { return { number, hash: hash(Number(number)), timestamp: 0n }; },
   async scanAllTransfers() { return { calls: 0 }; },
   async erc20BalancePairs(pairs) {
@@ -234,4 +238,12 @@ test('rejects an invalid boolean query before discovery', async () => {
   expect(response.status).toBe(400);
   expect(await response.json()).toEqual({ error: 'Invalid boolean query value for balances' });
   expect(discover).not.toHaveBeenCalled();
+});
+
+test('/health exposes per-source backfill stats', async () => {
+  const response = await appWith({ async discover() { return resultFor(); } }).request('/health');
+  expect(response.status).toBe(200);
+  expect((await response.json()).logSources).toEqual({
+    ethereum: { rpc: { requests: 0, chunks: 0, logs: 0, failures: 0, fallbacks: 0 } },
+  });
 });

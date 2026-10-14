@@ -2,6 +2,7 @@ import { expect, test } from 'vitest';
 
 import type {
   Address,
+  AccountLogSource,
   BalanceResult,
   BlockRange,
   BlockRef,
@@ -30,6 +31,7 @@ class FakeAdapter implements ChainAdapter {
   readonly logsMinRange: bigint = 1n;
   readonly scanConcurrency: number = 2;
   readonly followerMaxRange: bigint = 500n;
+  readonly accountLogs: AccountLogSource;
   head: BlockRef = {
     number: 110n,
     hash: '0x110' as Hex,
@@ -41,6 +43,17 @@ class FakeAdapter implements ChainAdapter {
   stale = false;
   handler?: (direction: TransferDirection, range: BlockRange) => Promise<{ events: TransferEvent[]; calls: number }>;
   heavy?: (range: BlockRange) => boolean;
+
+  constructor() {
+    const adapter = this;
+    this.accountLogs = {
+      name: 'fake',
+      get preferredMaxRange() { return adapter.logsMaxRange; },
+      get adaptiveRange() { return { minRange: adapter.logsMinRange }; },
+      scanAccount: (requestedAccount, range) => adapter.scanChunk(requestedAccount, range),
+      stats: () => ({ fake: { requests: 0, chunks: 0, logs: 0, failures: 0, fallbacks: 0 } }),
+    };
+  }
 
   normalizeAddress(input: string): Address | undefined {
     return /^0x[0-9a-f]{40}$/i.test(input) ? input.toLowerCase() as Address : undefined;
@@ -65,7 +78,7 @@ class FakeAdapter implements ChainAdapter {
     if (received.status === 'rejected') throw received.reason;
     const aggregate = emptyAggregate();
     for (const event of [...sent.value.events, ...received.value.events]) addTransfer(aggregate, requestedAccount, event);
-    return { aggregate, calls: sent.value.calls + received.value.calls, heavy: this.heavy?.(range) ?? false };
+    return { aggregate, calls: sent.value.calls + received.value.calls, logs: 0, heavy: this.heavy?.(range) ?? false };
   }
 
   async blockByNumber(number: bigint): Promise<BlockRef> {
