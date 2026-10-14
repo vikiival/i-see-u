@@ -180,7 +180,7 @@ test('handoff: the follower advances during a backfill without missing or double
   }
 });
 
-test('handoff: an account tracked while the follower is decoding a range is refetched, not missed', async () => {
+test('an account tracked while a range is decoded is folded from the retained logs without refetching', async () => {
   const chain = new FakeChain(150n);
   const account = address(78);
   historyFor(chain, account);
@@ -206,11 +206,95 @@ test('handoff: an account tracked while the follower is decoding a range is refe
 
     followerGate.release();
     await ticking;
-    expect(unfiltered).toBe(2); // the commit saw an unknown tracked account and refetched the range
+    expect(unfiltered).toBe(1); // the commit saw the new account and re-folded the retained logs without another RPC
     expect(s.follower.status()).toMatchObject({ lastError: undefined, cursor: { number: 210n } });
     await expectTruth(s.store, chain, account, 100n, 210n);
   } finally {
     await s.close();
+  }
+});
+
+test('a self-transfer of a newly tracked account is counted once after a refold', async () => {
+  const chain = new FakeChain(150n);
+  const account = address(79);
+  chain.addTransfer({ token: address(31), from: account, to: account, value: 1n, blockNumber: 151n });
+  const s = await stack(chain);
+  try {
+    await s.follower.tick();
+    chain.finalized = 160n;
+    const followerGate = gate();
+    let unfiltered = 0;
+    chain.beforeLogs = (filter) => {
+      if (filter.filtered) return undefined;
+      unfiltered += 1;
+      return unfiltered === 1 ? followerGate.opened : undefined;
+    };
+    const ticking = s.follower.tick();
+    while (unfiltered === 0) await new Promise((resolve) => setImmediate(resolve));
+    expect((await s.get(`/v1/ethereum/accounts/${account}/erc20`)).status).toBe(200);
+
+    followerGate.release();
+    await ticking;
+    expect(unfiltered).toBe(1);
+    await expectTruth(s.store, chain, account, 100n, 160n);
+  } finally {
+    await s.close();
+  }
+});
+
+test('status().leader turns false as soon as the lock is lost', async () => {
+  const chain = new FakeChain(150n);
+  const { store } = await createTestStore();
+  let held = true;
+  const follower = createFollower({
+    adapter: chain.adapter(),
+    store,
+    lock: { tryAcquire: async () => true, held: () => held, release: async () => {} },
+    pollMs: 60_000,
+    maxLagBlocks: 96n,
+    staleAfterMs: 1_200_000,
+    maxNoAdvanceMs: 1_800_000,
+  });
+  try {
+    await follower.tick();
+    expect(follower.status().leader).toBe(true);
+    held = false;
+    expect(follower.status().leader).toBe(false);
+  } finally {
+    await follower.stop();
+    await store.close();
+  }
+});
+
+test('a failed leadership acquisition clears the previous leader state', async () => {
+  const chain = new FakeChain(150n);
+  const { store } = await createTestStore();
+  let fail = false;
+  const follower = createFollower({
+    adapter: chain.adapter(),
+    store,
+    lock: {
+      tryAcquire: async () => {
+        if (fail) throw new Error('lock failed');
+        return true;
+      },
+      held: () => true,
+      release: async () => {},
+    },
+    pollMs: 60_000,
+    maxLagBlocks: 96n,
+    staleAfterMs: 1_200_000,
+    maxNoAdvanceMs: 1_800_000,
+  });
+  try {
+    await follower.tick();
+    expect(follower.status().leader).toBe(true);
+    fail = true;
+    await follower.tick();
+    expect(follower.status()).toMatchObject({ leader: false, lastError: 'lock failed' });
+  } finally {
+    await follower.stop();
+    await store.close();
   }
 });
 

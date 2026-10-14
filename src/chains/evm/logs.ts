@@ -173,6 +173,18 @@ async function scanLogs(
     }
     stats.maxBytes = Math.max(stats.maxBytes, bytes ?? raw.length * APPROX_LOG_BYTES);
     stats.maxMs = Math.max(stats.maxMs, ms);
+    for (const log of raw) {
+      if (log.removed === true) continue;
+      let number: bigint;
+      try {
+        number = quantity(log.blockNumber);
+      } catch {
+        throw new RpcError('transient', 'Log has no valid block number');
+      }
+      if (number < part.fromBlock || number > part.toBlock) {
+        throw new RpcError('transient', `Log block ${number} outside requested range ${part.fromBlock}-${part.toBlock}`);
+      }
+    }
     for (const log of raw) onLog(log);
   };
   await fetchRange(range);
@@ -211,12 +223,16 @@ export async function scanAllTransfers(
   range: BlockRange,
   onTransfer: (event: TransferEvent) => void,
   accept?: (address: Address) => boolean,
+  onSkipped?: (from: Address, to: Address, decode: () => TransferEvent | undefined) => void,
 ): Promise<{ calls: number }> {
   const { calls } = await scanLogs(rpc, [TRANSFER_TOPIC], range, (log) => {
     if (accept && Array.isArray(log.topics)) {
       const from = topicAddress(log.topics[1]);
       const to = topicAddress(log.topics[2]);
-      if (from && to && !accept(from) && !accept(to)) return;
+      if (from && to && !accept(from) && !accept(to)) {
+        onSkipped?.(from, to, () => decodeTransferLog(log));
+        return;
+      }
     }
     const event = decodeTransferLog(log);
     if (event) onTransfer(event);
