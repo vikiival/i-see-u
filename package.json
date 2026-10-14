@@ -6,6 +6,8 @@
   "description": "Token discovery PoC over plain JSON-RPC",
   "scripts": {
     "start": "node src/server.ts",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "node src/store/migrate.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest"
@@ -14,12 +16,17 @@
     "node": ">=24"
   },
   "dependencies": {
+    "@electric-sql/pglite": "^0.5.9",
     "@hono/node-server": "^2.1.5",
+    "drizzle-orm": "^0.45.4",
     "hono": "^4.13.13",
+    "pg": "^8.23.1",
     "viem": "^2.57.6"
   },
   "devDependencies": {
     "@types/node": "^26.6.5",
+    "@types/pg": "^8.23.1",
+    "drizzle-kit": "^0.31.11",
     "typescript": "^7.0.2",
     "vitest": "^5.0.4"
   }
