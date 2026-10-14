@@ -1,6 +1,6 @@
 import { decodeEventLog, encodeEventTopics, isAddress, isHex, pad, parseAbiItem } from 'viem';
 
-import { addTransfer, emptyAggregate } from '../../core/aggregate.ts';
+import { addTransfer, aggregateLogCount, emptyAggregate } from '../../core/aggregate.ts';
 import type { Address, BlockRange, ChunkScan, Hex, RpcClient, TransferDirection, TransferEvent } from '../../core/types.ts';
 import { rpcErrorOf } from '../../rpc/errors.ts';
 
@@ -16,7 +16,7 @@ const HEAVY_MS = 3_000;
 const APPROX_LOG_BYTES = 640;
 
 /** eth_getLogs entry as it comes off the wire: unvalidated. */
-interface WireLog {
+export interface WireLog {
   address?: unknown;
   topics?: unknown;
   data?: unknown;
@@ -193,5 +193,5 @@ export async function scanAccountChunk(rpc: RpcClient, account: Address, range: 
   // and shrinking a slow small request would only add requests.
   const bytes = Math.max(a.maxBytes, b.maxBytes);
   const heavy = a.split || b.split || bytes > HEAVY_BYTES || (bytes > HEAVY_BYTES / 10 && Math.max(a.maxMs, b.maxMs) > HEAVY_MS);
-  return { aggregate, calls: a.calls + b.calls, heavy };
+  return { aggregate, calls: a.calls + b.calls, logs: aggregateLogCount(aggregate), heavy };
 }

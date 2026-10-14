@@ -69,9 +69,35 @@ export interface ChunkAggregate {
 
 export interface ChunkScan {
   aggregate: ChunkAggregate;
+  /** Logical upstream requests used for this chunk (both RPC directions, or one HyperSync stream query). */
   calls: number;
+  /** Distinct matching transfers folded into the aggregate (self-transfers count once). */
+  logs: number;
   /** The chunk had to be split, or a response was large or slow: use a smaller range next. */
   heavy: boolean;
+}
+
+export interface AccountLogSourceStats {
+  requests: number;
+  chunks: number;
+  logs: number;
+  failures: number;
+  /** Chunks redirected to a fallback after a failure or while the breaker is open. */
+  fallbacks: number;
+  lastError?: string;
+  cooldownUntil?: number;
+}
+
+/** Chain-agnostic, aggregate-while-decoding source for one account's resumable historical backfill. */
+export interface AccountLogSource {
+  readonly name: string;
+  /** Preferred inclusive block span per independently committed backfill chunk. */
+  readonly preferredMaxRange: bigint;
+  /** Present only for sources whose successful/heavy responses should adapt and persist a per-account range. */
+  readonly adaptiveRange?: { minRange: bigint };
+  scanAccount(account: Address, range: BlockRange): Promise<ChunkScan>;
+  stats(): Record<string, AccountLogSourceStats>;
+  close?(): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -81,9 +107,8 @@ export interface ChunkScan {
 export interface ChainAdapter {
   readonly network: string; // e.g. "ethereum"
   readonly startBlock: bigint;
-  readonly logsMaxRange: bigint;
-  /** Floor for the adaptive per-account chunk range. */
-  readonly logsMinRange: bigint;
+  /** Pluggable source used only for per-account historical backfills. */
+  readonly accountLogs: AccountLogSource;
   readonly scanConcurrency: number;
   /** Max block span of one unfiltered (all-Transfer) getLogs call made by the follower. */
   readonly followerMaxRange: bigint;
@@ -92,11 +117,6 @@ export interface ChainAdapter {
   finalizedHead(): Promise<HeadObservation>;
   /** Highest latest-block number seen by finalizedHead()'s background refresh; never triggers RPC. */
   cachedLatestBlockNumber?(): bigint | undefined;
-  /**
-   * Aggregate every Transfer with `account` on either side within range (both directions).
-   * Must handle provider range/result limits internally (adaptive splitting); rejects if either direction fails.
-   */
-  scanChunk(account: Address, range: BlockRange): Promise<ChunkScan>;
   /** Header of a (finalized) block by number, for cursors that end below the head. */
   blockByNumber(number: bigint): Promise<BlockRef>;
   /**
