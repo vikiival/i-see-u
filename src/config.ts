@@ -98,6 +98,12 @@ export const config = {
     activeAccountTtlMs: int('ACTIVE_ACCOUNT_TTL_MS', '300000'),
     refreshMs: int('BALANCE_REFRESH_MS', '60000'),
   },
+  db: {
+    /** Postgres pool size (one connection is held permanently by the follower leader lock). */
+    poolMax: int('DB_POOL_MAX', '20'),
+    /** Fail pool acquisition after this long (surfaces as 503) instead of queueing forever. */
+    connectTimeoutMs: int('DB_CONNECT_TIMEOUT_MS', '5000'),
+  },
   request: {
     /** Per-request deadline for RPC work left on the request path (cold backfill wait, first balance read). */
     deadlineMs: int('REQUEST_DEADLINE_MS', '10000'),

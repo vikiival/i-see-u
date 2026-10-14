@@ -110,6 +110,11 @@ export function createApp(deps: RouteDeps, opts: { requestLog?: boolean } = {}):
       return c.json({ error: 'RPC temporarily unavailable' }, 503);
     }
 
+    if (/timeout exceeded when trying to connect/i.test(error.message)) {
+      c.header('Retry-After', '2');
+      return c.json({ error: 'Database busy' }, 503);
+    }
+
     console.error('request failed', error);
     return c.json({ error: 'Internal server error' }, 500);
   });

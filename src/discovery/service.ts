@@ -153,8 +153,9 @@ export function createDiscoveryService(deps: DiscoveryDependencies): DiscoverySe
 
   return {
     async discover(network: string, input: string, requestedFinality?: 'latest' | 'finalized'): Promise<DiscoveryResult | SyncingResult> {
-      const adapter = deps.adapters[network];
-      const follower = deps.followers[network];
+      // Own-property lookup: names like `constructor` must 404, not hit Object.prototype.
+      const adapter = Object.hasOwn(deps.adapters, network) ? deps.adapters[network] : undefined;
+      const follower = Object.hasOwn(deps.followers, network) ? deps.followers[network] : undefined;
       if (!adapter || !follower) {
         throw Object.assign(new Error(`Unknown network: ${network}`), { statusCode: 404 });
       }
@@ -190,7 +191,7 @@ export function createDiscoveryService(deps: DiscoveryDependencies): DiscoverySe
       const view = await deps.store.readAccount(network, account);
       if (!view) throw unavailable('Follower has no cursor yet', 5);
       const { cursor } = view;
-      const tailStatus = deps.tails?.[network]?.status();
+      const tailStatus = (deps.tails && Object.hasOwn(deps.tails, network) ? deps.tails[network] : undefined)?.status();
       const wantsLatest = requestedFinality !== 'finalized' && tailStatus !== undefined;
       const serveLatest = wantsLatest && tailStatus.healthy && view.tailTip !== undefined;
       let holdings = view.holdings;

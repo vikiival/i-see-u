@@ -169,6 +169,18 @@ test('the chunk aggregate dedupes only self-transfers and keeps the latest ERC-7
   expect(aggregate.selfSeen.size).toBe(2);
 });
 
+test('concurrent first trackAccount calls for one account both resolve to the same target', async () => {
+  const { store } = await createTestStore();
+  try {
+    await store.initFollowerCursor('ethereum', block(20n), 1);
+    const results = await Promise.all([store.trackAccount('ethereum', account, 1), store.trackAccount('ethereum', account, 2)]);
+    expect(results).toEqual([{ target: 20n, progress: undefined }, { target: 20n, progress: undefined }]);
+    expect(await store.trackedAccounts('ethereum')).toEqual([account]);
+  } finally {
+    await store.close();
+  }
+});
+
 test('trackAccount pins the backfill target to the follower cursor; the backfill cannot write above it', async () => {
   const { store } = await createTestStore();
   try {

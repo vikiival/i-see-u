@@ -32,7 +32,7 @@ const adapters = Object.fromEntries(Object.values(config.networks).map((network)
     : rpcLogs;
   return [network.name, createEvmAdapter(rpc, { ...network, network: network.name, accountLogs })];
 }));
-const { store, followerLock } = await openPostgresStore(config.databaseUrl);
+const { store, followerLock } = await openPostgresStore(config.databaseUrl, { max: config.db.poolMax, connectionTimeoutMillis: config.db.connectTimeoutMs });
 const logError = (what: string) => (error: unknown) =>
   console.warn(`${what} failed:`, error instanceof Error ? error.message : String(error));
 

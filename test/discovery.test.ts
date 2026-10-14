@@ -189,6 +189,17 @@ test('unknown network rejects with 404, a malformed address with 400', async () 
   }
 });
 
+test('network names inherited from Object.prototype are unknown networks (404), not crashes', async () => {
+  const { store, service } = await setup(new FakeAdapter());
+  try {
+    for (const name of ['constructor', 'toString', '__proto__', 'hasOwnProperty']) {
+      await expect(service.discover(name, account)).rejects.toMatchObject({ statusCode: 404, message: `Unknown network: ${name}` });
+    }
+  } finally {
+    await store.close();
+  }
+});
+
 test('legacy scan progress above the follower cursor is discarded and rebuilt, not double counted', async () => {
   const adapter = new FakeAdapter();
   const { store, service } = await setup(adapter);

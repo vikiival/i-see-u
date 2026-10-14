@@ -227,6 +227,17 @@ test('maps transient RPC failures to 503 with Retry-After', async () => {
   expect(await response.json()).toEqual({ error: 'RPC temporarily unavailable' });
 });
 
+test('maps a Postgres pool acquisition timeout to 503 with Retry-After', async () => {
+  const discovery: DiscoveryService = {
+    async discover() { throw new Error('timeout exceeded when trying to connect'); },
+  };
+
+  const response = await appWith(discovery).request(`/v1/ethereum/accounts/${account}/erc20`);
+  expect(response.status).toBe(503);
+  expect(response.headers.get('retry-after')).toBe('2');
+  expect(await response.json()).toEqual({ error: 'Database busy' });
+});
+
 test('returns normalized JSON for unknown routes', async () => {
   const response = await appWith({ async discover() { return resultFor(); } }).request('/unknown');
 
