@@ -1,256 +1,241 @@
-# Token discovery PoC: technology and architecture proposal
+# Token discovery PoC: architecture and rationale
 
-Status: proposal, revision 2. What is implemented is in section 0.1.
+Status: describes the system **as built** on branch `poc/token-discovery` (2026-10-14, 66 tests). How we got here, including the dead ends: [PROGRESS.md](PROGRESS.md). Running it, API fields and configuration: [README.md](README.md). Values marked *(estimate)* are derived, not measured.
 
-What changed since revision 1:
-- The authors clarified that "full indexer" means walking blocks, transactions and native transfers (Blockbook-style account discovery). An index of ERC-20/721 `Transfer` logs only is therefore in scope.
-- They looked for an off-the-shelf service for token discovery over plain JSON-RPC and found none, which is why this is a PoC.
-- Decision: `eth_getLogs` over Quicknode is the primary source. SQD and Envio are backup sources behind the same adapter interface.
-- Numbers below were re-measured on mainnet on 2026-10-14. Values marked *(estimate)* are derived, not measured.
+## 0. Scope decisions
 
-## 0. Scope decisions for the PoC (2026-10-14)
+Answers from the scope round with Jakub and Tali, plus Viktor's later decisions.
 
 | Question | Decision |
 |---|---|
-| Tokens held before block 25,933,634 and untouched since | Out of scope. Documented as a limit |
-| Spam tokens | Return everything. No filtering yet |
-| Freshness | A few seconds behind head is acceptable, so `confirmationDepth` of about 2 blocks is fine |
-| What counts as "interacted" | `Transfer` in or out. Tokens that change balances without `Transfer` are a documented limit |
-| Native ETH balance | Out of scope |
-| ERC-721 response (bonus) | Not specified by the authors. Proposal: return contracts plus token IDs seen in logs, with optional `ownerOf` verification through Multicall (`?verifyOwnership=true`) |
+| What "not a full indexer" means | Clarified by Jakub and Tali: no Blockbook-style discovery over blocks, transactions and native transfers. An index of `Transfer` logs is in scope. They found no existing service that does token discovery over plain RPC, hence the PoC |
+| Primary data source | Quicknode `eth_getLogs` (premium: 10k-block ranges). SQD and Envio are backfill or backup sources |
+| Tokens held before block 25,933,634 and untouched since | Out of scope (limit) |
+| Spam tokens | Returned. No filtering |
+| What counts as "interacted" | `Transfer` in or out |
+| Native ETH | Out of scope |
+| ERC-721 (bonus) | Contracts plus the token IDs seen in logs, with optional `ownerOf` verification |
+| Freshness | The scope answer was "a few seconds of lag is fine". **We then chose finalized only, with no rollback.** That puts responses about 64 blocks (about 13 min) behind the tip. It is the main trade-off to defend (§7) |
 
-## 0.1 Implementation status (what the code does today)
+## 1. Architecture as built
 
-The PoC was built in phases, so it differs from the target design in sections 1–5:
+A TypeScript service on Node 26: Hono, viem on our own `RpcClient`, and PostgreSQL 18 via Drizzle. Only finalized data is stored, and only for **tracked accounts**: accounts someone has requested.
 
-| Area | Target design (below) | Implemented now |
-|---|---|---|
-| Discovery | Global ingestion of all Transfer logs | **Hybrid:** a shared finalized follower reads every `Transfer` log once (unfiltered `eth_getLogs`, ≤ 500-block ranges, one call per 32-block epoch at the head) and applies it for **tracked** accounts only. A new account is backfilled once with address-filtered `getLogs` up to the follower cursor at tracking time (handoff target C); the follower owns every block above C. Not a full global index of all holders |
-| Storage | Postgres | **PostgreSQL 18** via Drizzle ORM; one row per `(account, token)`, no per-transfer rows; global `follower_cursor`, `tracked_accounts(backfill_target)`, `balance_snapshots`; generated migrations run at startup |
-| Consistency | Confirmation depth plus reorg rollback | **Finalized only (decided):** only finalized blocks are persisted, cursors store the block hash. Reorg-safe by construction, no realtime tail, about 13 min behind the tip |
-| Single writer | Advisory lock | **Session advisory lock** on a dedicated connection for the follower's lifetime; commits also lock the cursor row and refuse non-contiguous ranges |
-| Balances | Cached and invalidated by the follower | **Shared balance worker:** every minute and on each follower advance, all active (account, token) pairs are re-read at the follower cursor (by hash) in 1,000-call Multicall3 batches and stored with their block. A request serves the snapshot (`balanceBlock` per token); only an account without a snapshot is read on the request path (single-flight) |
-| Request path | DB only | **DB only once backfilled:** zero RPC per request; cold backfills (202 `syncing` past a 10 s deadline), first balance reads and `verifyOwnership` go through bounded limiters (503 + `Retry-After` on overload) |
-| viem / RPC boundary | viem plus a resilient RPC pool | **viem on top of `RpcClient`:** viem provides types, standard ABIs, topic/calldata encoding, strict decoding, and block/call actions. `RpcClient` alone performs HTTP and owns retries, endpoint failover, circuit breakers, unsupported-method memory, error classification, result validation, rate limiting, and per-attempt stats. viem retries and call batching are disabled. Hybrid transport: viem `http()` (one per endpoint, `retryCount: 0`, no batching) does request building, timeouts and response parsing, while `RpcClient` keeps all retry/failover/classification policy, because viem's would retry `-32005` range errors instead of splitting, miss Quicknode `-32010`, not fail over on null results, lack a breaker, ignore a Retry-After cap and hide retried attempts from billing stats; viem's `fallback` is not used |
+```
+                         ┌────────────── Quicknode JSON-RPC (+ fallbacks) ──────────────┐
+                         │ 1 unfiltered getLogs per finalized epoch (≤500-block ranges) │
+   finalized head poll ──┤ address-filtered getLogs for one account's backfill          │
+   (every 30 s)          │ Multicall3 aggregate3 balanceOf at the follower block (hash) │
+                         └──────────────▲────────────────▲───────────────▲──────────────┘
+                                        │                │               │
+                            ┌───────────┴───┐  ┌─────────┴──────┐  ┌─────┴───────────┐
+                            │ Follower      │  │ Backfill       │  │ Balance worker  │
+                            │ (1 per net,   │  │ [start, C] per │  │ active accounts,│
+                            │ advisory lock)│  │ new account    │  │ 60 s + advance  │
+                            └───────┬───────┘  └───────┬────────┘  └────────┬────────┘
+                                    └──────────► PostgreSQL 18 ◄────────────┘
+                                                      ▲
+                       GET /v1/ethereum/accounts/{addr}/erc20|erc721  (DB reads only once backfilled)
+```
 
-Measured live with the follower (Quicknode, 2026-10-14):
-- Follower advance of one epoch (32 blocks): **1 `eth_getLogs`**, plus 2 `eth_getBlockByNumber` (finalized + latest) per 30 s poll.
-- Balance refresh of 109 active pairs: **1 `eth_call`**, at the new cursor right after the advance (and every 60 s).
-- 10 warm requests (ERC-20 with balances, ERC-721): **0 RPC calls**, 7–12 ms each.
-- Cold backfill of an active account over 257,541 blocks: 172 calls, about 26 s (two 202 `syncing` responses first); 109 tokens.
-- Acceptance test (fake RPC): 5k tracked accounts × 10 tokens → 1 `getLogs` for the epoch, 50 `eth_call` for 50k pairs, then 0 calls for 5k requests.
+1. **Shared finalized follower.** A single follower per network reads **every** `Transfer` log once, with no address filter. It applies only the logs whose `from`/`to` is a tracked account. At the head this is one `getLogs` per finalized epoch (32 blocks, about 17–22k logs, about 10–14 MB), no matter how many accounts are tracked.
+2. **Backfill with handoff.** A new account is tracked and the follower cursor C is read in one transaction. The account is then backfilled once over [25,933,634, C] with address-filtered `getLogs`. The follower owns every block above C. Until the backfill finishes, the API answers `202 syncing`.
+3. **Shared balance worker.** Balances of active accounts are re-read on a cadence, batched across all accounts into Multicall3 calls at one block. Every balance carries the block it was read at.
+4. **Request path.** Once an account is backfilled, a request is pure database reads, with **zero RPC calls**.
 
-Measured live on Quicknode before the follower (2026-10-14):
-- Cold scan of an active account: 2.4–2.6 s and 52 calls. Warm scan: 13–19 ms.
-- Binance hot wallet (about 2.5M transfers in the window): 81 s cold, which is mostly client-side JSON parsing.
-- A topic0-only `getLogs` over 1,000 blocks: 701,764 logs, 446 MB, 4 s. There was no result cap on the demo endpoint.
+**The key point:** RPC cost depends on the block rate and the number of active (account, token) pairs, not on how many requests users make. 5,000 balance requests a minute become about 50 Multicall calls a minute (§4).
 
-Other measurements (public RPCs, SQD, HyperSync):
-- **Multicall3:** 2,000 `balanceOf` calls in one call is safe, at about 6.8k gas each. `eth_estimateGas` is capped at 16.7M on public nodes. Bodies over about 1.3–1.7 MB get HTTP 413.
-- **Provider result caps:** 10k (mevblocker) and 20k (tenderly). Both return a suggested sub-range, which the code parses.
-- **SQD Portal:** head lag 0 blocks. Topic values must be lowercase and 32-byte padded; other formats return 0 logs silently. HTTP 529 "overloaded" is frequent on the free tier.
-- **HyperSync:** an API token is required (HTTP 401 without one).
-- **Distinct `(holder, token)` pairs for global ingestion:** about 15–40M over the window, roughly 1.5–6 GB in Postgres *(extrapolated from 300-block samples)*.
+### 1.1 Alternatives considered
 
-Corrections from a documentation review:
-- Quicknode bills **each call inside a JSON-RPC batch**, and every WebSocket notification.
-- Quicknode Streams costs about 4.3M credits per month on mainnet, about the same as our follower.
-- Historical-balance APIs exist for major chains (GoldRush, Ankr), but they are proprietary indexers that new networks lack. That is the gap this PoC targets.
-
-## 1. Recommendation
-
-Build a **log-only Transfer indexer** in **TypeScript (Node 22) + viem + Fastify + Postgres**, with an in-process cache.
-
-1. **Global ingestion.** One worker per network reads every `Transfer` log (topic0 only) from block 25,933,634 to head and upserts a compact `(holder, token)` set for **all** accounts. No blocks, transactions, receipts, traces or native transfers are stored.
-2. **Near-realtime follower.** After backfill, the same worker follows the head block by block, with reorg handling.
-3. **Balances via Multicall3**, pinned to the indexed block. Balances are cached per `(holder, token)` and invalidated by the Transfer logs the follower already sees, so a balance is refetched only when it can have changed.
-4. **Fallback sources.** SQD Portal and Envio HyperSync implement the same `LogSource` interface and take over log ingestion (fast backfill, or failover when Quicknode is down). Balances always come from JSON-RPC.
-
-Key point for the presentation: **RPC cost depends on the block rate, not on the number of users or how often they poll.**
-
-### Why global ingestion instead of the watched-only design in revision 1
-
-- **The follower downloads every Transfer log either way.** Filtering by 5k watched addresses in `topics` is not practical (providers cap OR-list sizes), so even the watched-only design pays for the full log stream at the head.
-- **The only savings of watched-only were backfill and storage.** Global backfill is about 0.5M credits once (section 4), well under 1% of the cheapest paid plan, and storage is a few GB.
-- **Global is simpler and gives better answers.** Every address is answerable immediately: no 52-call backfill per new address, no `sync: in_progress` state, and no race between the backfill and the follower.
-- **It stays clear of "full indexer".** It never touches blocks, transactions or native transfers, and it stores one row per `(holder, token)` pair, not per transfer.
+| Alternative | Why not (yet) |
+|---|---|
+| **Global ingestion**: index every `Transfer` for all holders (REPORT rev 2's recommendation) | The follower already sees every log at the head, so the difference is only the backfill and storage. Global backfill is cheap in credits (about 260 calls of 1k blocks, about 5k credits). But it means downloading about 70–115 GB of JSON *(estimate)* with a streaming parser, and storing about 15–40M (holder, token) rows (1.5–6 GB) *(extrapolated)*. Storage then grows with the chain, not with users. That is closer in spirit to a full indexer, and more than a one-day PoC needed. **Still an option:** if the cold-start `202 syncing` is unacceptable, bootstrap a global table once from HyperSync or SQD and hand over to the same follower. Nothing else would change |
+| **Per-account on demand** (the first build): rescan new blocks on every request | Each request cost about 2 `getLogs` plus a Multicall, about 15k calls/min at 5k users. Under finalized-only it was still about 1.6k `getLogs`/min plus about 5k Multicalls/min. That is what the follower and balance worker replaced |
+| **Realtime tail** with reorg rollback (journal or reversible tail) | Viktor's decision was "only finalized blocks". Finalized blocks cannot reorg, so there is no rollback code, and the cursor hash makes `blockHeight`/`blockHash` consistent by construction. The earlier "delete pairs above the fork" rollback was invalid anyway, because it cannot restore counts or NFT ownership |
+| **Indexer frameworks** (Squid SDK, Envio HyperIndex, Ponder, Goldsky) | They own the process, the schema and the filters. None supports a tracked set that grows at runtime with a handoff. Squid and Ponder fetch blocks one by one in RPC mode, at about 15–30× our credits (§3). Hosted pipelines also contradict "new networks with only JSON-RPC" |
 
 ## 2. Measured facts
 
-Mainnet measurements on 2026-10-14 via public RPC (dRPC):
+Mainnet, 2026-10-14. Provider latency varied about 6× during the day, so each figure notes its context. The full tables are in [PROGRESS.md](PROGRESS.md).
 
-- **Window:** head was 26,189,8xx. Block 25,933,634 was mined on 2026-09-08. That is **about 256k blocks**, growing by about 7,200 per day.
-- **Transfer log volume:** 10 samples of 10 blocks across the window gave **305–999 logs per block, typically about 450**, and **220–620 KB of JSON per block, typically about 280 KB**.
-- **ERC-20 vs ERC-721:** same topic0, `Transfer(address,address,uint256)`. ERC-20 logs have 3 topics, ERC-721 logs have 4 (tokenId is indexed). Every sampled log was one of the two. The ERC-721 share was 0.3–9%.
-- **Distinct `(account, token)` pairs:** 380–890 per block within a 10-block window. The total across the window is not measured; repeat pairs dedupe heavily.
-- **Public RPCs are unreliable in practice:**
-  - publicnode rejected `eth_getLogs` at the start block ("Archive requests require a personal token").
-  - It also rejected topic0-only queries at head ("Please specify an address").
-  - 1rpc returned "method not available" for recent blocks.
-  - merkle.io returned -32005 "Rate limit exceeded".
-  - llamarpc returned HTTP 525.
+**Chain and logs**
+- The window started at block 25,933,634 (mined 2026-09-08). It was about 257k blocks at the time of measurement and grows by about 7,200 per day.
+- `Transfer` volume is about 300–1,000 logs per block (typically 450–700) and about 200–450 KB of JSON per block.
+- ERC-20 and ERC-721 share topic0. They differ in topic count: 3 for ERC-20, 4 for ERC-721 (`tokenId` indexed). The ERC-721 share was 0.3–9%.
+- Unfiltered `getLogs` over 1,000 blocks returned 701,764 logs, 446 MB, in 4.0 s, with no result cap (Quicknode demo endpoint). 10k unfiltered blocks would be about 4.5 GB, beyond a JS string. That is why follower ranges are capped at 500 blocks (`ETH_FOLLOWER_MAX_RANGE`, hard limit 1,000).
 
-  This is useful evidence for the resilience section of the presentation.
+**Backfill: address-filtered, cold, full window**
 
-Quicknode, verified from their pages:
+| Chunk | Normal account (`0x5a52…`, 109 tokens) | Binance hot wallet (`0x28c6…`, about 2.5M logs) | Calls | Conditions |
+|---|---|---|---|---|
+| 10k | 2.4–2.6 s (morning), 5.5–11.7 s (afternoon) | 81–88 s, later 64–98 s with failures, 1.9 GB RSS | 52 | 49 MB per received-side chunk |
+| 1k | 36.7 s | 305 s, 733 MB | 516 | slow provider |
+| **3k, pipelined (default)** | **8.0 s** (floored by `RPC_MAX_RPS=20`) | **71.6 s**, about 1.1 GB, 0 errors | 172 / 320 | about 1.6 GB of JSON for Binance; download-bound |
 
-- **Credits:** Ethereum standard methods cost **20 credits each**, including `eth_getLogs` and `eth_call`. Trace/debug calls are 2x, and specialised calls are 4x. ([credits](https://www.quicknode.com/api-credits))
-- **Not stated on that page:** whether a JSON-RPC batch is billed per inner call, whether WebSocket messages are billed, and whether response size affects cost.
-- **Plans:** Build $49, 80M credits, 50 RPS. Accelerate $249, 450M credits, 125 RPS. Overage is $0.50–0.62 per 1M credits. Archive data is included on every plan. ([pricing](https://www.quicknode.com/pricing))
-- **getLogs range:** up to 10,000 blocks per call on paid plans, 5 on the Free Trial. The limit is on range, not result count. ([support](https://support.quicknode.com/hc/en-us/articles/10258449939473-Understanding-the-10-000-Block-Range-Limit-for-querying-Logs-and-Events))
+**Steady state with the follower (live, Quicknode)**
+- One epoch advance: **1 `getLogs`**, plus 2 head calls (`finalized`, `latest`) per 30 s poll.
+- Balance refresh of 109 pairs: **1 `eth_call`**.
+- 10 warm requests: **0 RPC calls**, 7–12 ms each.
+- A cold backfill under the shared limiter took 172 calls and about 26 s, with two 202s first.
+- Fake-RPC acceptance test: 5k accounts × 10 tokens cost 1 `getLogs` per epoch and 50 `eth_call` for 50k pairs. Serving 5k requests afterwards cost 0 calls.
 
-Implication: topic0-only queries must use **small ranges**. 10 blocks is about 4,500 logs and 2.8 MB. A 10k-block range would be about 4.5M logs, so it is useless here.
+**RPC limits**
+- **Multicall3:** 2,000 `balanceOf` calls in one call are safe (about 6.8k gas each). HTTP 413 above about 1.3–1.7 MB of calldata. `eth_estimateGas` is capped at 16.7M. We use 1,000 per call.
+- **Public RPCs** failed in practice: archive refused, "specify an address", "method not available", -32005 rate limits, HTTP 525. Result caps were 10k (mevblocker) and 20k (tenderly), both with a suggested sub-range, which `RpcClient` parses.
+- **Quicknode** (from docs; dashboard not checked):
+  - 20 credits per standard call at any range or response size.
+  - Each call inside a JSON-RPC batch is billed.
+  - Build plan: $49 for 80M credits at 50 RPS.
+  - `getLogs` range up to 10k blocks on paid plans.
 
-## 3. Third-party data sources
+## 3. Third-party data sources and frameworks
 
-No source fully replaces this service. The authors' finding holds: none returns "tokens this address interacted with, plus balances at block N" over plain JSON-RPC.
+No source replaces the service. None answers "tokens this address interacted with, plus balances at block N" for a network that has only JSON-RPC. The useful ones are **data sources behind our adapter**, never frameworks we build on.
 
-| Source | What it gives | Role |
+| Source | Finding | Role |
 |---|---|---|
-| Quicknode JSON-RPC | `eth_getLogs`, `eth_call`, archive data | **Primary** for logs and balances |
-| SQD Portal | HTTP archive stream. `logs[]` filters on `address` and `topic0..3` (AND within an object, OR across objects). `/stream` includes unfinalized blocks, `/finalized-stream` is finalized only. ([docs](https://docs.sqd.dev/en/portal/evm/api)) | **Backup `LogSource`**: fast bulk backfill, failover |
-| Envio HyperSync / HyperRPC | High-throughput log queries. HyperRPC exposes JSON-RPC, so it could join the RPC fallback pool. API token reportedly required *(not verified)* | **Backup `LogSource`** |
-| Quicknode Streams | Managed push of block data with backfill and reorg handling | Production alternative. Mention only |
-| Goldsky Turbo | Managed pipelines into Postgres or Kafka | Not used. A hosted indexer, outside the premise |
-
-Open on SQD: whether topic filters need lowercase, 32-byte-padded values, and the real head lag for `ethereum-mainnet`.
+| Quicknode JSON-RPC | All of §2 | **Primary** for logs, heads and balances |
+| **Envio HyperSync** (live, free token) | One OR query covers sent and received. Normal account: 1 request, 0.6 s, logs identical to Quicknode. Binance: 13.0 s and 580 MB with `@envio-dev/hypersync-client` 1.4.1 `stream()` (napi, loads on Node 26 darwin-arm64); `collect()` peaked at 2.6 GB and sequential JSON took 77 s. Follower epoch: 1 request, 150 ms vs 112 ms on Quicknode, 16,777 logs equal. It **serves the chain head (0 lag vs `latest`)**, so `to_block` must be capped at our finalized block. No rate limit seen at 8 parallel requests | **Next: backfill `LogSource`**, about 5× faster on heavy accounts and about 0 Quicknode credits |
+| Envio HyperRPC | 403: our token is not enabled for it. `getLogs` only, no `eth_call` | Possible `RPC_FALLBACK_URLS` entry |
+| Envio HyperIndex | A full framework with a fixed config, its own DB and its own loop | Rejected |
+| SQD Portal | 0 head lag. Topics must be lowercase and 32-byte padded, or it **silently returns 0 logs**. The free tier gives frequent 529s at about 0.1 MB/s. Paid tiers are $99 and $499 | Backup `LogSource` on a paid tier |
+| Squid SDK (`@subsquid/evm-processor` 1.30.1) | RPC mode makes `eth_getBlockByNumber` per block plus unfiltered `getLogs` in 10-block slices: about 36 calls per epoch vs about 2 for us. Fixed filters, no runtime account set or handoff, a TypeORM store, owns the main loop, GPL-3.0. Pipes SDK 1.0.0-beta.8 is Portal-only | Rejected |
+| Ponder (`ponder` 0.18.1, MIT; Postgres 14–17 only per its requirements) | Rejected from docs and source (`sync-historical`), with no spike. The log, row and credit numbers are *(estimates)*:<br>1. **Static addresses.** Filters are fixed in `ponder.config.ts` (only `factory()` is dynamic), so runtime-tracked accounts would force global ingestion: about 690 logs/block × 257k ≈ 177M logs, 15–40M rows, a large RPC cache. No per-account backfill handoff.<br>2. **Block calls.** Historical sync calls `eth_getBlockByNumber(n, true)` for every block with a matching log, and realtime fetches every block. That is ≥ 257k block calls for the backfill, about 5M+ credits (6–10M including `getLogs`), and 32+ calls per epoch vs our 1–2.<br>3. **No finalized-only mode.** Realtime is reorg-aware (`reorgWindow`).<br>4. **Owns the app.** Its own `onchainTable` schema, process (`ponder start`) and codegen. Balances through `publicClients` would cost one call per request.<br>5. **Backfill-only use** is redundant with HyperSync. SQD's fork `@subsquid/ponder` adds a Portal historical source (beta) | Rejected |
+| Quicknode Streams | Managed block push with reorg handling, about 4.3M credits/month on mainnet *(docs)* | Production alternative to our follower |
+| GoldRush, Ankr | Historical holdings APIs, proprietary, major chains only | Shows the gap for new networks |
+| Goldsky | Hosted pipelines into your own database | Not used |
 
 ## 4. Cost (Quicknode credits)
 
-Assumptions: 5k users, about 10 tokens each, 20 credits per call, 7,200 blocks per day. Steady-state rows are what the implemented follower and balance worker do (measured call counts in section 0.1).
+Assumptions: 5k active users with about 10 tokens each (50k pairs), 20 credits per call, 7,200 blocks per day.
 
 | Item | Calls | Credits |
 |---|---|---|
-| Cold backfill per new account (address-filtered, 3k-block chunks over 257k blocks; measured) | about 172 once per account; 5k accounts ≈ 860k once | **about 17M once** |
-| Follower, 1 unfiltered `getLogs` per finalized epoch (32 blocks; measured) | about 225/day | about 0.14M/month |
-| Head polling, `finalized` plus `latest` every 30 s (`FOLLOWER_POLL_MS`) | about 5.8k/day | about 3.5M/month |
-| Balance worker: 50k active pairs at 1,000 per Multicall, so 50 calls per refresh, every 60 s plus once per follower advance (the timer restarts at each advance, about +10%) | about 79k/day | about 47M/month |
-| First balance read per newly active account | 1 per account activation | small |
-| Request path for backfilled accounts (measured) | 0 | 0 |
-| **Total steady state** | | **about 51M/month, fits Build (80M)** |
+| Cold backfill per new account (3k chunks over about 257k blocks; measured) | 172 once per account; 5k accounts ≈ 860k | **about 17M once** |
+| Follower, 1 unfiltered `getLogs` per finalized epoch (measured) | about 225/day | about 0.14M/month |
+| Head polling, `finalized` + `latest` every 30 s | about 5.8k/day | about 3.5M/month |
+| Balance worker: 50 Multicalls per refresh, every 60 s plus once per follower advance (about +10%) | about 79k/day | about 47M/month |
+| First balance read for a newly active account | 1 per activation | small |
+| Requests for backfilled accounts (measured) | 0 | 0 |
+| **Total steady state** | | **about 51M/month; fits Build (80M)** |
 
-*(Correction to revision 2:* the earlier 19M total assumed only "dirty" pairs need re-reading. That assumption is invalid (section 5, balance path), so balances are re-read on a cadence. The balance worker is the dominant cost. Refreshing only accounts polled in the last few minutes (`ACTIVE_ACCOUNT_TTL_MS`, implemented), or every 2 minutes, scales it down linearly. Refreshing every block instead (12 s) would cost about 215M/month, which needs Accelerate.)
-
-For comparison, one Multicall per user request costs 5k × 60 × 24 × 30 × 20 = **4.3B credits/month**, and the pre-follower per-account rescan on each finalized advance added about 1.6k `getLogs` per minute. Batching across accounts is what makes the difference: 5,000 requests a minute become 50 calls a minute.
-
-Bandwidth: about 14 MB per epoch at head, about 3 GB/day *(estimate)*. Credits don't depend on response size per Quicknode's page, but this is worth confirming.
-
-Storage: one row per (tracked account, token) plus one balance snapshot per active pair; for 5k accounts × 10 tokens, about 100k rows *(estimate)*.
+- **Balances dominate.** The cost scales linearly with the refresh cadence and the activity window (`BALANCE_REFRESH_MS`, `ACTIVE_ACCOUNT_TTL_MS`). Refreshing every block (12 s) would cost about 215M/month and need the Accelerate plan.
+- **The naive design** (one Multicall per request) would cost 5k × 60 × 24 × 30 × 20 ≈ **4.3B credits/month**.
+- **The backfill grows with the window**, by about 7,200 blocks a day. HyperSync would make it about 0 credits.
+- **Bandwidth:** about 10–14 MB per epoch, about 3 GB/day at the head *(estimate)*.
+- **Storage:** one row per (tracked account, token) plus one balance snapshot per active pair. That is about 100k rows for 5k × 10 *(estimate)*.
 
 ## 5. Design
 
-### Ingestion worker
+### Follower (`src/follower/follower.ts`)
+- **Polling:** it polls the finalized head every 30 s. When finalized is above the global `follower_cursor`, it fetches (cursor, head] unfiltered in ≤ 500-block ranges. Logs whose from/to isn't tracked are dropped before decoding. Each range commits in one transaction with the cursor advance (number, hash, timestamp).
+- **Exactly one per network:** it holds a session `pg_try_advisory_lock` on a dedicated connection, re-checked every tick. Commits also lock the cursor row and refuse a range that doesn't continue it.
+- **Race with new accounts:** if an account was tracked while a range was being decoded, the commit applies nothing and the range is refetched with that account included.
+- **Startup:** `follower.load()` reads the saved cursor before the server listens, so a restart can serve immediately.
+- **Health:** responses are `stale` after a failed poll, a lag above one epoch, or 20 min without progress. Discovery returns 503 above 96 blocks of lag or after 30 min without progress.
 
-- **Backfill** from `start_block` in 10-block chunks, adapting the size: grow when a response is small, halve on a timeout or "too large".
-- **Concurrency** of about 8–16 to stay under the plan's RPS. At 1–2 s per call, the backfill takes roughly one hour *(estimate)*.
-- **Each chunk is one Postgres transaction:** upsert pairs, then advance the cursor. A crash replays the chunk, and upserts make that idempotent.
-- **At the head:** poll `eth_blockNumber` every 12 s. For each new block, call `getLogs({ blockHash })` (EIP-234) so logs are tied to a specific block hash.
-- **Finalized-only, no rollback (decision 2026-10-14).** Only finalized blocks are ingested. They cannot reorg, so no rollback machinery is needed. Responses lag the tip by about 64 blocks (about 13 min), which the authors accepted for the PoC.
-- *(Correction to revision 2:* the earlier "delete pairs with `first_block > F`" rollback was not valid anyway. It cannot restore counts, last-seen blocks or NFT ownership on rows that already existed. Finalized-only removes the problem.)
-- **The follower steps by epoch.** `finalized` advances by 32 blocks about every 6.4 min, so one ranged `getLogs` per epoch (about 22k logs, about 14 MB) replaces one call per block. That is about 225 calls a day instead of 7,200.
-- **Range size is bounded by payload, not credits.** Credits are 20 per call at any range. Address-filtered queries use the full 10,000 blocks. Unfiltered Transfer queries return about 450 KB per block, so 10k blocks would be about 4.5 GB in one response, beyond a single JS string (about 0.5–1 GB). Unfiltered ranges are therefore capped at about 500–1,000 blocks (1,000 measured at 446 MB in 4 s).
-- **Single worker per network,** enforced with a Postgres advisory lock.
-- **Classification by topic count:** 3 topics is ERC-20, 4 is ERC-721. Skip the zero address as a *holder* (never skip the log, or every mint is lost). Optionally confirm ERC-721 contracts with ERC-165 `supportsInterface(0x80ac58cd)`.
+### Backfill and handoff (`src/discovery/service.ts`)
+- **`trackAccount`:** in one transaction, it takes a share lock on the cursor row, inserts `tracked_accounts`, and stores C as `backfill_target`. The store rejects backfill chunks above C. Counts add, first/last block widen, and the newest ERC-721 transfer wins by (block, logIndex), so the two writers commute.
+- **Scan:** `Transfer` with the account in topic1 and in topic2, run in parallel per chunk. 3k-block chunks, up to 8 in flight. Completed chunks commit strictly in order, each with its `progress_to`, so a failure resumes at the first incomplete chunk.
+- **Aggregation while decoding:** logs go straight into per-token aggregates. Only self-transfers are deduplicated.
+- **Range splitting:** split on "too large" or on a timeout of a multi-block range, using the provider's suggested range when given.
+- **Adaptive per-account range:** it halves after a split, a response over 50 MB, or a slow response over 5 MB, and doubles after three light chunks. The range is persisted in `account_scan_range`.
+- **Requests during backfill:** a request waits up to 10 s, then gets `202 syncing` with progress. Backfills are bounded (4 concurrent, 64 queued); beyond that the API returns 503 with `Retry-After`.
 
-### Balance path
+### Balances (`src/balances/worker.ts`)
+- **Which accounts:** those that requested balances within 5 min are active.
+- **When:** every 60 s and on every follower advance, the worker reads all their pairs at **the follower cursor, pinned by hash** (EIP-1898). Reads are packed into Multicall3 `aggregate3` calls (`allowFailure`, 1,000 per call) and stored in `balance_snapshots` with block number and hash.
+- **No inferred freshness:** a snapshot is never relabelled as valid at a newer block. Each token reports `balanceBlock`, and the response reports `balancesAtBlockHeight`. "No Transfer, so unchanged" is never assumed, because of WETH `deposit` and rebasing tokens.
+- **Failure handling:** batches split only on size, gas or revert errors. Authentication errors, rate limits and outages propagate as 503.
+- **Request path:** only a token with no snapshot yet is read on the request path, single-flight per account, through a bounded limiter (16 concurrent, 256 queued).
 
-- When `balances=true`, read the address's tokens from Postgres and pin to `blockHeight = indexed cursor`.
-- **Cache per `(holder, token)` keyed by the block hash it was read at, and report that block.** *(Correction to revision 2:* "no Transfer touched the pair, so a balance read at N is still valid at M" is **false**. WETH `deposit`/`withdraw`, rebasing tokens and admin actions change balances without a Transfer. A cached balance is never relabelled as valid at a newer block. Each token carries its own `balanceBlock`, or the whole snapshot is re-read at one block.)
-- **Shared balance worker for active accounts.** It batches `(account, token)` reads across all accounts at one explicit block, e.g. 5k accounts × 10 tokens = 50k reads at 500 per Multicall, so about 100 calls per full refresh. Transfers seen by the follower prioritise which pairs refresh first; they don't prove the others are unchanged. *(Capacity hypothesis, to be measured.)*
-- **Batch misses across concurrent requests** into Multicall3 `aggregate3` with `allowFailure = true`, about 500 calls per batch. Native ETH can be added via `getEthBalance`.
-- **Single-flight per address** so concurrent requests share a fetch.
-- **Return per-token partial results** (`balanceStatus: ok | error`) instead of failing the whole response.
-- **Refresh cadence** bounds staleness for tokens that change without events (stETH, aTokens, WETH). The API discloses the block every balance was read at.
+### RPC resilience (`src/rpc/`)
+`RpcClient` is the only component that performs HTTP. Details are in README "Unreliable RPC".
+- **Error classes:** `rate_limited`, `transient`, `too_large` (carrying the suggested range), `unsupported`, `fatal`.
+- **Retries:** full-jitter backoff. `Retry-After` is honoured but capped at 10 s.
+- **Breakers and failover:** a breaker per endpoint (5 failures, 15 s open). "Method not available" is remembered per endpoint and method for 10 min. Requests fail over across `RPC_FALLBACK_URLS`.
+- **Validation:** a `validate` option makes `null` or invalid blocks and logs fail over.
+- **Accounting:** a token-bucket limiter (`RPC_MAX_RPS`, shared by follower, backfill and balances), per-attempt stats in `/health`, and API-key redaction.
 
-### RPC resilience
+### Interfaces (`src/core/types.ts`)
+- **`ChainAdapter`** (EVM: `createEvmAdapter`):
+  - head and blocks: `finalizedHead`, `blockByNumber`
+  - logs: `scanChunk(account, range)` for the backfill, `scanAllTransfers(range, onTransfer, accept)` for the follower
+  - state reads: `erc20BalancePairs(pairs, blockHash)` and `erc721Owners(items, blockHash)`
+  - addresses: `normalizeAddress`
 
-- **`RpcPool`:** Quicknode first, then a second provider. Each endpoint has a circuit breaker and exponential backoff with jitter.
-- **Error classes:**
-  - 429, 5xx and timeouts: retry with backoff.
-  - -32005 or "too many results": split the range in half.
-  - "Method not available" or archive refusal: mark that endpoint unfit for the method.
-  - Anything else: fail.
-- **Head-lag check:** compare `eth_blockNumber` across endpoints and skip any endpoint more than N blocks behind.
-- **If the worker falls more than X blocks behind the head,** the API keeps serving the last snapshot with `stale: true` and `lagBlocks`.
-- **Failover of log ingestion to SQD or Envio** if Quicknode is down for longer than a threshold. The same cursor and upserts apply, so switching sources is transparent.
+  A new EVM chain is a config entry. A non-EVM chain implements the interface.
+- **`Store`:** async. One implementation serves `pg` and PGlite.
+- **`RpcClient`:** transport and policy.
+- **Not built yet:** splitting log reads out into a `LogSource` (RPC, HyperSync, SQD) behind `scanChunk`/`scanAllTransfers`, as the first step of the HyperSync work.
 
-### Modular interfaces
+### Tables (`src/store/schema.ts`, migrations in `drizzle/`)
+- `follower_cursor(network, block_number, block_hash, block_timestamp, updated_at)`
+- `tracked_accounts(network, account, backfill_target, tracked_at)`
+- `account_scan_progress(network, account, progress_to)`
+- `account_scan_range(network, account, logs_range)`
+- `holdings(network, holder, token, standard, first_block, last_block, sent_count, received_count)`, primary key (network, holder, token)
+- `nft_items(network, holder, token, token_id, held, last_block, last_log_index)`
+- `balance_snapshots(network, account, token, balance, error, block_number, block_hash)`
 
-```ts
-interface LogSource {             // RpcLogSource (default) | SqdPortalLogSource | HyperSyncLogSource
-  head(): Promise<BlockRef>;
-  transferLogs(range: BlockRange | BlockRef): Promise<RawLog[]>;
-}
-interface StateReader {           // always JSON-RPC
-  balances(pairs: HolderToken[], at: BlockRef): Promise<BalanceResult[]>;
-}
-interface TokenStandard {         // erc20 | erc721
-  id: 'erc20' | 'erc721';
-  matches(log: RawLog): boolean;
-  decode(log: RawLog): TransferEvent;
-}
-interface ChainAdapter {          // one per network family; EVM chains differ mostly by config
-  logSources: LogSource[];
-  state: StateReader;
-  standards: TokenStandard[];
-}
-```
+No individual transfers are stored.
 
-### Tables
-
-- `networks(id, start_block, confirmation_depth)`
-- `cursor(net, block_number, block_hash, source, updated_at)`
-- `recent_blocks(net, number, hash, parent)`: the last 128 blocks, for reorg detection
-- `holdings(net, holder, token, standard, first_block, last_block)`, primary key `(net, holder, token)`, index on `(net, holder)`
-- Bonus: `nft_tokens(net, holder, token, token_id, block)`, verified with `ownerOf` through Multicall
-- Optional: `balance_cache(net, holder, token, balance, at_block, dirty)` if the in-process cache is moved to Postgres or Redis
-
-### API
-
-- `GET /v1/{net}/accounts/{addr}/erc20?balances=true`
-  returns `{ network, account, fromBlock, blockHeight, blockHash, chainHeadBlock, stale, lagBlocks, tokens: [{ contract, firstSeenBlock, lastSeenBlock, balance?, balanceStatus? }] }`
-- `GET /v1/{net}/accounts/{addr}/erc721` is the bonus endpoint.
-- `GET /health` reports the cursor, the head, lag and the active source.
+### API (Hono)
+- `GET /v1/ethereum/accounts/{addr}/erc20?balances=true` and `…/erc721?verifyOwnership=true` return:
+  - `blockHeight`/`blockHash`: the follower cursor, read in the same repeatable-read transaction as the holdings
+  - freshness: `stale`, `lagBlocks`, `followerLagBlocks`, `dataAgeS`
+  - per token: first and last seen block, sent and received counts, and optionally `balance` and `balanceBlock`
+- During a backfill: `202 syncing` with `Retry-After: 2`.
+- `/health` reports the follower, the balance worker, and RPC stats per method.
 
 ## 6. Why this stack
 
-- viem ships Multicall, a ranked fallback transport and typed ABIs.
-- TypeScript matches the Trezor Suite ecosystem, and fits a short PoC.
-- 5k users once a minute is about 83 requests per second, which is trivial for one Node process plus an indexed Postgres lookup.
-- Postgres gives transactional cursor and upserts, the advisory lock, and enough capacity for tens of millions of pairs.
-- Go is the natural production choice (Blockbook is Go). Say so in the presentation.
+| Choice | Reason |
+|---|---|
+| **TypeScript on Node 26, native type stripping** | `node src/server.ts` with no build step. The constraints are `.ts` import extensions and no enums or parameter properties. TypeScript 7 is used only for `tsc --noEmit`. It matches the Trezor Suite ecosystem and is fast to write for a PoC. Go would be the natural production choice, since Blockbook is Go |
+| **Hono** (over Fastify) | Viktor's preference. It is small and built on Web-standard Request/Response, and `app.request()` tests routes without a port. Only the HTTP layer depended on the framework, so the swap was cheap |
+| **viem**, on top of our own `RpcClient` | viem covers everything Ethereum-specific: types, `erc20Abi`/`erc721Abi`/`multicall3Abi`, topic encoding, strict `decodeEventLog`, and `getBlock`/`call` actions. Inside `RpcClient`, viem's `http()` transport (one per endpoint, `retryCount: 0`, no batching, `maxResponseBodySize: false`) only builds requests, applies timeouts and parses responses |
+| **Our own retry policy** instead of viem's | viem's retry and `fallback` would resend `-32005` "more than 10000 results" (each attempt billed) instead of splitting. It doesn't retry Quicknode `-32010`, treats a `null` block as success, has no circuit breaker, doesn't cap `Retry-After`, and hides retried attempts from billing stats. "RPC is unreliable and billed per call" is the core of the brief, so this layer is ours |
+| **PostgreSQL 18** (docker-compose `postgres:18-alpine`) | Transactional cursor plus upserts (`LEAST`/`GREATEST`), session advisory locks for the single follower, `FOR SHARE`/`FOR UPDATE` for the handoff, and repeatable-read responses. The first build used `node:sqlite` (zero dependencies). We moved before the follower because it needs the lock and more than one process |
+| **Drizzle ORM** | A typed schema with generated SQL migrations committed in `drizzle/`, applied at startup. The same code runs on `pg` and PGlite, and it doesn't take over the process |
+| **PGlite** for tests | Real Postgres compiled to WASM, in-process. `npm test` runs the real migrations with no Docker or network |
+| **vitest** (over `node:test`) | Watch mode, `vi.fn`/fake timers/`stubGlobal` instead of hand-rolled stubs, and readable diffs |
+| **`process.loadEnvFile()`** (over dotenv) | Built into Node, so we need neither a dependency nor our own parser. Real environment variables take precedence |
+| **Multicall3 `aggregate3`** | Thousands of `balanceOf`/`ownerOf` reads per call, with per-call failure. Batching across accounts is what makes the balance cost manageable |
 
-## 7. Limits and risks (for the README)
+At 5k users polling once a minute, the API sees about 83 requests/s. That is trivial for one Node process doing indexed Postgres reads.
 
-- **Only tokens that emit standard `Transfer` are discovered.** WETH `deposit` emits `Deposit`, and mints that don't emit `Transfer` from the zero address are missed. Some legacy NFTs (CryptoKitties) emit non-indexed Transfer. ERC-1155 is out of scope.
-- **Tokens held before block 25,933,634 and untouched since are invisible** by definition of the source of truth.
-- **Rebasing, reflection and WETH-style tokens:** balances can change without Transfer events. Balances are therefore always reported with the block they were read at, never inferred from the absence of transfers.
-- **Spam airdrops inflate token lists.** Consider a "received only, never sent" flag or a deny list.
-- **Not measured yet:**
-  - Total pair count and storage for the window.
-  - Quicknode response time for 10-block topic0 queries.
-  - The `eth_call` gas cap for large Multicalls.
-  - Whether JSON-RPC batches are billed per inner call. The `credits` page doesn't say.
-- **Bandwidth:** at about 2 GB/day, the worker should run close to the provider, or use compression where supported.
+## 7. Limits and risks
 
-## 8. Cheapest experiments to de-risk
+- **Freshness:** responses are about 13 min behind the tip (finalized), plus up to one 30 s poll. A realtime tail would bring back reorg handling. The brief says "almost realtime", so expect this question.
+- **Discovery is `Transfer`-only.** Tokens that change balances without `Transfer` (WETH `deposit`, rebasing tokens) and non-standard legacy NFTs (3-topic CryptoKitties-style) are missed or misclassified. ERC-1155 is not supported.
+- **Holdings from before block 25,933,634 are invisible**, by definition of the source of truth.
+- **Spam and address-poisoning tokens are returned.** Many show `balanceStatus: "error"`.
+- **Cold start:** about 8–26 s for a normal account, depending on the shared rate limit, and about 75 s and about 1 GB RSS for an exchange wallet. The first requests get 202. The backfill window grows by about 7,200 blocks a day.
+- **Single replica:** the active-account set, single-flight maps and limiters live in memory, and every process runs a balance worker. Only the follower is safe across processes.
+- **Tracked accounts are never untracked.** The per-epoch cost doesn't grow with them, but the set and the commit-time check do.
+- **5k users is not 5k addresses.** Suite users have several accounts, and discovery probes empty addresses up to a gap limit. The real tracked set could be several times larger, which scales the backfill and balance cost.
+- **Single provider:** with no fallback endpoint configured, a Quicknode outage stops the follower. Responses go `stale` and then 503.
+- **Not verified on the Quicknode dashboard:** credits per call regardless of range, and per-inner-call batch billing. Both come from docs.
 
-1. **Quicknode, one topic0-only `getLogs` over 10 blocks.** Measure latency and size, and check the dashboard credit delta. This confirms 20 credits regardless of size.
-2. **Send a 3-call JSON-RPC batch** and check whether it costs 20 or 60 credits.
-3. **Run Multicall3 `aggregate3` with 500 and with 1,000 `balanceOf` calls** to find the gas or response ceiling.
-4. **Backfill 10k blocks into Postgres** and extrapolate rows, storage and time to the full window.
-5. **SQD Portal: stream `Transfer` logs for the same 10k blocks.** Compare speed and output with RPC, and confirm the topic padding rules.
-6. **Ask Jakub:**
-   - Does the start-block gap matter?
-   - Should spam tokens be filtered?
-   - Is a few seconds of lag behind head acceptable?
+## 8. Next experiments
+
+1. **A `HyperSyncLogSource` for the backfill:**
+   - `stream()` with the OR query and `JoinNothing`, `to_block` capped at RPC finalized
+   - a canary against silent empty results
+   - Quicknode chunking as the fallback
+   - check that the Linux napi build loads before deploying
+
+   Expected: normal accounts in under 1 s, Binance in about 13 s, about 0 Quicknode credits.
+2. **Raise `RPC_MAX_RPS` toward the plan's 50.** This should bring a normal cold scan from about 8.6 s to about 3.5 s, while keeping headroom for the follower and balances.
+3. **Check credits on the Quicknode dashboard:** one 3k `getLogs`, a 3-call batch, and a 1,000-call Multicall.
+4. **A live HTTP load test:** 5k accounts polling once a minute, measuring RPC calls/min and p99 latency.
+5. **Decide the open limits:** shared state for multiple replicas (active set and balance-worker leader in Postgres), untracking idle accounts, spam flags, native ETH, and whether a realtime tail is worth the reorg handling.
 
 ## Sources
 
-- [Quicknode API credits](https://www.quicknode.com/api-credits)
-- [Quicknode pricing](https://www.quicknode.com/pricing)
-- [Quicknode eth_getLogs](https://www.quicknode.com/docs/ethereum/eth_getLogs)
-- [Quicknode block range limit](https://support.quicknode.com/hc/en-us/articles/10258449939473-Understanding-the-10-000-Block-Range-Limit-for-querying-Logs-and-Events)
-- [SQD Portal EVM API](https://docs.sqd.dev/en/portal/evm/api)
-- [Envio HyperSync](https://docs.envio.dev/docs/HyperSync/overview)
+- [Quicknode API credits](https://www.quicknode.com/api-credits), [pricing](https://www.quicknode.com/pricing), [eth_getLogs](https://www.quicknode.com/docs/ethereum/eth_getLogs), [10k block range limit](https://support.quicknode.com/hc/en-us/articles/10258449939473-Understanding-the-10-000-Block-Range-Limit-for-querying-Logs-and-Events)
+- [SQD Portal EVM API](https://docs.sqd.dev/en/portal/evm/api), [SQD SDK overview](https://docs.sqd.dev/en/sdk/overview)
+- [Envio HyperSync](https://docs.envio.dev/docs/HyperSync/overview), [HyperSync query](https://docs.envio.dev/docs/HyperSync/hypersync-query), [HyperRPC](https://docs.envio.dev/docs/HyperRPC/overview-hyperrpc), [pricing](https://envio.dev/pricing/hypersync)
+- [Ponder requirements](https://ponder.sh/docs/requirements)
 - [Goldsky Turbo](https://docs.goldsky.com/turbo-pipelines/quickstart)
