@@ -11,7 +11,7 @@ interface EncodedCall {
   callData: Hex;
 }
 
-type CallOutcome = { ok: true; returnData: Hex } | { ok: false; error: string };
+type CallOutcome = { ok: true; returnData: Hex } | { ok: false; error: string; transient?: true };
 
 const shortReason = (error: unknown): string => {
   const message = error instanceof Error ? error.message : String(error);
@@ -32,10 +32,17 @@ async function aggregateChunk(rpc: RpcClient, calls: EncodedCall[], blockHash: H
     });
     // EIP-1898: pinned to the exact block hash, never re-resolved against another block at the same height.
     const response = await rpc.request<Hex>('eth_call', [{ to: multicall3, data }, { blockHash }], {
-      validate: (value) => typeof value === 'string' && isHex(value),
+      validate: (value) => {
+        if (typeof value !== 'string' || !isHex(value)) return false;
+        try {
+          const decoded = decodeFunctionResult({ abi: multicall3Abi, functionName: 'aggregate3', data: value });
+          return decoded.length === calls.length;
+        } catch {
+          return false;
+        }
+      },
     });
     const decoded = decodeFunctionResult({ abi: multicall3Abi, functionName: 'aggregate3', data: response });
-    if (decoded.length !== calls.length) throw new Error('multicall result length mismatch');
     return decoded.map((result) =>
       result.success ? { ok: true, returnData: result.returnData } : { ok: false, error: 'inner call failed' });
   } catch (error) {
@@ -58,21 +65,32 @@ async function readCalls<T>(
   label: string,
   decode: (data: Hex) => T,
   multicall3: Address,
-): Promise<({ status: 'ok'; value: T } | { status: 'error'; error: string })[]> {
+): Promise<({ status: 'ok'; value: T } | { status: 'error'; error: string; transient?: true })[]> {
   const chunks: EncodedCall[][] = [];
   for (let i = 0; i < calls.length; i += batchSize) chunks.push(calls.slice(i, i + batchSize));
-  const results = new Array<CallOutcome[]>(chunks.length);
+  const chunksResults = new Array<{ outcomes: CallOutcome[] } | { error: unknown }>(chunks.length);
   let next = 0;
   const worker = async (): Promise<void> => {
     while (next < chunks.length) {
       const index = next++;
-      results[index] = await aggregateChunk(rpc, chunks[index], blockHash, multicall3);
+      try {
+        chunksResults[index] = { outcomes: await aggregateChunk(rpc, chunks[index], blockHash, multicall3) };
+      } catch (error) {
+        chunksResults[index] = { error };
+      }
     }
   };
   await Promise.all(Array.from({ length: Math.min(2, chunks.length) }, worker));
+  const failures = chunksResults.filter((result): result is { error: unknown } => 'error' in result);
+  if (failures.length > 0 && failures.length === chunks.length) throw failures[0].error;
+  const results = chunksResults.flatMap((result, index) => 'outcomes' in result
+    ? result.outcomes
+    : chunks[index].map((): CallOutcome => ({ ok: false, error: shortReason(result.error), transient: true })));
 
-  return results.flat().map((outcome) => {
-    if (!outcome.ok) return { status: 'error', error: outcome.error };
+  return results.map((outcome) => {
+    if (!outcome.ok) return outcome.transient
+      ? { status: 'error', error: outcome.error, transient: true }
+      : { status: 'error', error: outcome.error };
     if (!/^0x[0-9a-fA-F]{64}$/.test(outcome.returnData)) return { status: 'error', error: `invalid ${label} return data` };
     try {
       return { status: 'ok', value: decode(outcome.returnData) };

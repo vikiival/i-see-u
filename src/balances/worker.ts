@@ -30,7 +30,7 @@ export interface BalanceWorker {
   /** Read every (active account, ERC-20 token) pair at the follower cursor, batched across accounts. */
   refresh(): Promise<{ pairs: number; block?: bigint }>;
   /** Refresh now (the follower advanced) and restart the interval. */
-  kick(): void;
+  kick(opts?: { reorg?: boolean }): void;
   start(): void;
   stop(): Promise<void>;
   stats(): { activeAccounts: number; lastRefresh?: { at: number; block?: bigint; pairs: number } };
@@ -46,17 +46,23 @@ export function createBalanceWorker(o: BalanceWorkerOptions): BalanceWorker {
   let readsAt: Hex | undefined;
   let refreshing: Promise<{ pairs: number; block?: bigint }> | undefined;
   let kicked = false;
+  let pendingReorg = false;
   let stopped = true;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let lastRefresh: { at: number; block?: bigint; pairs: number } | undefined;
 
   const readNow = async (account: Address, tokens: Address[], at: BlockRef): Promise<void> => {
     const results = await adapter.erc20BalancePairs(tokens.map((token) => ({ account, token })), at.hash);
-    await store.saveBalances(network, at, tokens.map((token, i) => ({ account, token, result: results[i] })));
+    const rows = tokens
+      .map((token, i) => ({ account, token, result: results[i] }))
+      .filter((row) => row.result.status !== 'error' || !row.result.transient);
+    if (rows.length > 0) await store.saveBalances(network, at, rows);
   };
 
   const refresh = (): Promise<{ pairs: number; block?: bigint }> => {
     refreshing ??= (async () => {
+      const replaceNewer = pendingReorg;
+      pendingReorg = false;
       const cutoff = now() - o.activeTtlMs;
       for (const [account, seenAt] of active) if (seenAt < cutoff) active.delete(account);
       const cursor = await store.getFollowerCursor(network);
@@ -66,7 +72,12 @@ export function createBalanceWorker(o: BalanceWorkerOptions): BalanceWorker {
       if (pairs.length === 0) return { pairs: 0, block: at.number };
       // One block for every pair, pinned by hash; a balance read at N is never reported for a later block.
       const results = await adapter.erc20BalancePairs(pairs, at.hash);
-      await store.saveBalances(network, at, pairs.map((pair, i) => ({ ...pair, result: results[i] })));
+      const rows = pairs
+        .map((pair, i) => ({ ...pair, result: results[i] }))
+        .filter((row) => row.result.status !== 'error' || !row.result.transient);
+      if (rows.length > 0) {
+        await store.saveBalances(network, at, rows, replaceNewer ? { replaceNewer: true } : undefined);
+      }
       return { pairs: pairs.length, block: at.number };
     })().then((result) => {
       lastRefresh = { at: now(), ...result };
@@ -97,23 +108,31 @@ export function createBalanceWorker(o: BalanceWorkerOptions): BalanceWorker {
       if (tokens.length === 0) return [];
       const snapshot = async () => new Map((await store.balances(network, account)).map((row) => [row.token, row]));
       let byToken = await snapshot();
-      if (tokens.some((token) => !byToken.has(token))) {
+      const missing = tokens.filter((token) => !byToken.has(token));
+      if (missing.length > 0) {
         // Kept until the block changes (not just while in flight), so a request that read the snapshot before
         // another request's read committed still joins that read instead of starting a second one.
         if (at.hash !== readsAt) {
           reads.clear();
           readsAt = at.hash;
         }
-        let read = reads.get(account);
-        if (!read) {
-          read = o.requestRpc.limiter.run(() => readNow(account, tokens, at));
-          read.catch(() => { if (reads.get(account) === read) reads.delete(account); });
-          reads.set(account, read);
-        }
+        const previous = reads.get(account);
+        const read = previous
+          ? previous.then(async () => {
+              const current = await snapshot();
+              const stillMissing = tokens.filter((token) => !current.has(token));
+              if (stillMissing.length > 0) {
+                await o.requestRpc.limiter.run(() => readNow(account, stillMissing, at));
+              }
+            })
+          : o.requestRpc.limiter.run(() => readNow(account, missing, at));
+        read.catch(() => { if (reads.get(account) === read) reads.delete(account); });
+        reads.set(account, read);
         await withDeadline(read, o.requestRpc.deadlineMs, () => {
           throw unavailable('Balance read did not finish within the request deadline', 2);
         });
         byToken = await snapshot();
+        if (tokens.some((token) => !byToken.has(token)) && reads.get(account) === read) reads.delete(account);
       }
       return tokens.map((token) => byToken.get(token) ?? {
         token,
@@ -125,8 +144,9 @@ export function createBalanceWorker(o: BalanceWorkerOptions): BalanceWorker {
 
     refresh,
 
-    kick() {
+    kick(opts) {
       if (stopped) return;
+      if (opts?.reorg) pendingReorg = true;
       if (refreshing) kicked = true;
       else void cycle();
     },

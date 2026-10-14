@@ -34,6 +34,8 @@ export class FakeChain {
   balanceOf: (account: Address, token: Address, at: Hex) => bigint | undefined = () => 0n;
   /** Awaited before answering eth_getLogs (e.g. a gate the test releases). */
   beforeLogs?: (filter: LogFilter) => Promise<void> | void;
+  /** Awaited before answering one decoded Multicall3 aggregate. */
+  beforeMulticall?: (targets: Address[]) => Promise<void> | void;
   failHead = false;
   mismatchRangeLogHash = false;
   readonly unknownBlockOnce = new Set<Hex>();
@@ -167,6 +169,7 @@ export class FakeChain {
         const { args } = decodeFunctionData({ abi: multicall3Abi, data });
         const calls = (args as unknown as [{ target: Address; callData: Hex }[]])[0];
         this.multicallSizes.push(calls.length);
+        await this.beforeMulticall?.(calls.map((call) => call.target.toLowerCase() as Address));
         return encodeFunctionResult({
           abi: multicall3Abi,
           functionName: 'aggregate3',
@@ -184,7 +187,13 @@ export class FakeChain {
     stats: () => ({ requests: this.total, attempts: this.total, byMethod: { ...this.calls }, errors: {}, endpoints: [] }),
   };
 
-  adapter(overrides: Partial<{ startBlock: bigint; logsMaxRange: bigint; followerMaxRange: bigint; scanConcurrency: number }> = {}): ChainAdapter {
+  adapter(overrides: Partial<{
+    startBlock: bigint;
+    logsMaxRange: bigint;
+    followerMaxRange: bigint;
+    scanConcurrency: number;
+    multicallBatch: number;
+  }> = {}): ChainAdapter {
     const logsMaxRange = overrides.logsMaxRange ?? 1_000n;
     return createEvmAdapter(this.rpc, {
       network: 'ethereum',

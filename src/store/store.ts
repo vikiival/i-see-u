@@ -470,7 +470,7 @@ export function createStore(db: StoreDatabase, close: () => Promise<void> = asyn
       return pairs;
     },
 
-    async saveBalances(network, block, rows) {
+    async saveBalances(network, block, rows, opts) {
       await inBatches(rows, (batch) => db.insert(schema.balanceSnapshots).values(batch.map((row) => ({
         network,
         account: row.account,
@@ -487,7 +487,9 @@ export function createStore(db: StoreDatabase, close: () => Promise<void> = asyn
           blockNumber: sql`excluded.block_number`,
           blockHash: sql`excluded.block_hash`,
         },
-        setWhere: sql`excluded.block_number >= ${schema.balanceSnapshots.blockNumber}`,
+        setWhere: opts?.replaceNewer
+          ? sql`excluded.block_number >= ${schema.balanceSnapshots.blockNumber} OR ${schema.balanceSnapshots.blockNumber} > excluded.block_number`
+          : sql`excluded.block_number >= ${schema.balanceSnapshots.blockNumber}`,
       }));
     },
 

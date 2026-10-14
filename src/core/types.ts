@@ -153,8 +153,8 @@ export interface BalancePair {
   token: Address;
 }
 
-export type BalanceResult = { status: 'ok'; balance: bigint } | { status: 'error'; error: string };
-export type OwnerResult = { status: 'ok'; owner: Address } | { status: 'error'; error: string };
+export type BalanceResult = { status: 'ok'; balance: bigint } | { status: 'error'; error: string; transient?: true };
+export type OwnerResult = { status: 'ok'; owner: Address } | { status: 'error'; error: string; transient?: true };
 
 // ---------------------------------------------------------------------------
 // Low-level JSON-RPC client (src/rpc). Resilience lives here.
@@ -310,8 +310,13 @@ export interface Store {
   nftItems(network: string, account: Address): Promise<NftItem[]>;
   /** Every ERC-20 (account, token) pair of these accounts. */
   erc20Pairs(network: string, accounts: Address[]): Promise<BalancePair[]>;
-  /** Upsert balance snapshots read at `block`; a row never moves to an older block. */
-  saveBalances(network: string, block: BlockRef, rows: (BalancePair & { result: BalanceResult })[]): Promise<void>;
+  /** Upsert balance snapshots read at `block`; a row moves backward only for a canonical-tip reorg refresh. */
+  saveBalances(
+    network: string,
+    block: BlockRef,
+    rows: (BalancePair & { result: BalanceResult })[],
+    opts?: { replaceNewer?: boolean },
+  ): Promise<void>;
   balances(network: string, account: Address): Promise<BalanceSnapshot[]>;
   close(): Promise<void>;
 }

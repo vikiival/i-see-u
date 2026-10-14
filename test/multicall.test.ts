@@ -3,7 +3,7 @@ import { expect, test } from 'vitest';
 import { decodeFunctionData, encodeFunctionResult } from 'viem';
 
 import { MULTICALL3, readErc20Balances, readErc721Owners } from '../src/chains/evm/multicall.ts';
-import type { Address, Hex, RpcClient, RpcStats } from '../src/core/types.ts';
+import type { Address, Hex, RpcClient, RpcRequestOptions, RpcStats } from '../src/core/types.ts';
 import { RpcError } from '../src/rpc/errors.ts';
 
 const aggregate3Abi = [
@@ -61,6 +61,27 @@ class FakeRpc implements RpcClient {
 
   async request<T>(method: string, params: unknown[]): Promise<T> {
     return await this.handler(method, params) as T;
+  }
+
+  stats(): RpcStats {
+    return emptyStats();
+  }
+}
+
+class ValidatingRpc implements RpcClient {
+  attempts = 0;
+  readonly responses: unknown[];
+
+  constructor(responses: unknown[]) {
+    this.responses = responses;
+  }
+
+  async request<T>(_method: string, _params: unknown[], opts?: RpcRequestOptions): Promise<T> {
+    for (const response of this.responses) {
+      this.attempts += 1;
+      if (!opts?.validate || opts.validate(response)) return response as T;
+    }
+    throw new RpcError('transient', 'RPC endpoint returned an invalid result');
   }
 
   stats(): RpcStats {
@@ -134,6 +155,62 @@ test('out-of-gas failures recursively halve and preserve input order', async () 
   const result = await readErc20Balances(rpc, address(50), tokens, blockHash(77n), 4);
   expect(seenSizes).toEqual([4, 2, 1, 1, 2, 1, 1]);
   expect(result).toEqual([100n, 101n, 102n, 103n].map((balance) => ({ status: 'ok', balance })));
+});
+
+test('malformed outer aggregate result is rejected by RPC validation and retried', async () => {
+  const valid = encodeFunctionResult({
+    abi: aggregate3Abi,
+    functionName: 'aggregate3',
+    result: [{
+      success: true,
+      returnData: encodeFunctionResult({ abi: balanceOfAbi, functionName: 'balanceOf', result: 17n }),
+    }],
+  });
+  const rpc = new ValidatingRpc(['0x12', valid]);
+
+  expect(await readErc20Balances(rpc, address(50), [address(10)], blockHash(77n), 4))
+    .toEqual([{ status: 'ok', balance: 17n }]);
+  expect(rpc.attempts).toBe(2);
+});
+
+test('one failed chunk preserves successful chunks and input order', async () => {
+  const tokens = Array.from({ length: 6 }, (_, index) => address(index + 10));
+  const rpc = new FakeRpc((_method, params) => {
+    const calls = callsFrom(params);
+    if (calls[0].target.toLowerCase() === tokens[2]) throw new RpcError('transient', 'upstream unavailable after retries');
+    return encodeFunctionResult({
+      abi: aggregate3Abi,
+      functionName: 'aggregate3',
+      result: calls.map((call) => ({
+        success: true,
+        returnData: encodeFunctionResult({
+          abi: balanceOfAbi,
+          functionName: 'balanceOf',
+          result: BigInt(tokens.indexOf(call.target.toLowerCase() as Address) + 100),
+        }),
+      })),
+    });
+  });
+
+  expect(await readErc20Balances(rpc, address(50), tokens, blockHash(77n), 2)).toEqual([
+    { status: 'ok', balance: 100n },
+    { status: 'ok', balance: 101n },
+    { status: 'error', error: 'upstream unavailable after retries', transient: true },
+    { status: 'error', error: 'upstream unavailable after retries', transient: true },
+    { status: 'ok', balance: 104n },
+    { status: 'ok', balance: 105n },
+  ]);
+});
+
+test('all failed chunks reject with the first error', async () => {
+  const rpc = new FakeRpc((_method, params) => {
+    const first = callsFrom(params)[0].target.toLowerCase();
+    throw new RpcError('transient', `failed ${first}`);
+  });
+  const tokens = [address(10), address(11), address(12), address(13)];
+
+  await expect(readErc20Balances(rpc, address(50), tokens, blockHash(77n), 2))
+    .rejects.toThrow(`failed ${tokens[0]}`);
 });
 
 test('ERC-721 ownerOf results decode and normalize owner addresses', async () => {
