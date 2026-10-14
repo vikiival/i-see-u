@@ -255,8 +255,8 @@ export function createDiscoveryService(deps: DiscoveryDependencies): DiscoverySe
           tailError: tailStatus?.tailError
             ?? (tipTooOld ? `Tail tip is ${Math.round(tipAgeMs! / 1000)} s old` : 'Tail has no complete snapshot yet'),
         }),
-        // A process that never advanced the tail itself (non-leader) reports the shared tip's block time, never 0.
-        lastProgressAt: serveLatest ? tailStatus!.lastAdvanceAt || Number(view.tailTip!.timestamp) * 1000 : cursor.updatedAt,
+        // The shared tip's block time, not process memory: identical in every process, leader or not.
+        lastProgressAt: serveLatest ? Number(view.tailTip!.timestamp) * 1000 : cursor.updatedAt,
         stale: serveLatest ? false : status.stale,
         lagBlocks: latest > served.number ? latest - served.number : 0n,
         followerLagBlocks: head > cursor.number ? head - cursor.number : 0n,

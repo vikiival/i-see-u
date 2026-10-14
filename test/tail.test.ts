@@ -278,19 +278,21 @@ test('a tail tip older than maxTailTipAgeMs is served as finalized with tailErro
   }
 });
 
-test('lastProgressAt is the tip time when the serving process never advanced the tail itself', async () => {
+test('lastProgressAt is the shared tip time, also in a process that loaded but never advanced the tail', async () => {
   const chain = new FakeChain(100n);
   chain.latest = 102n;
   const s = await stack(chain);
   try {
     await s.tail.tick();
     const tip = (await s.store.getTailTip('ethereum'))!;
-    const nonLeader = createTail({ adapter: s.adapter, store: s.store, follower: s.follower });
+    const nonLeader = createTail({ adapter: s.adapter, store: s.store, follower: s.follower, now: () => 1_900_000_000_000 });
+    await nonLeader.load(); // loaded like every server process, never ticked
     const result = await ready({ ...s, discovery: createDiscoveryService({
       adapters: { ethereum: s.adapter }, store: s.store, followers: { ethereum: s.follower }, tails: { ethereum: nonLeader },
     }) });
     expect(result).toMatchObject({ finality: 'latest', blockHeight: 102n });
     expect(result.lastProgressAt).toBe(Number(tip.timestamp) * 1000);
+    expect((await ready(s)).lastProgressAt).toBe(Number(tip.timestamp) * 1000); // the leader reports the same value
   } finally {
     await s.close();
   }
