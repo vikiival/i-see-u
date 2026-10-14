@@ -20,7 +20,7 @@ Times are local (CEST). "We" is Viktor plus AI agents: a Claude orchestrator han
 | 15:54–16:21+ | Squid SDK, Envio and Ponder research | Squid SDK and Ponder rejected. HyperSync benchmarked live and is very promising for backfill |
 | 15:56–16:52 | Shared finalized follower and balance worker | Warm requests make 0 RPC calls. About 51M credits/month for 5k users |
 | 17:00– | HyperSync `LogSource` for backfill | Codex, started from Viktor's main session. Landed as an opt-in, experimental source with per-chunk RPC fallback (76 tests) |
-| evening | Realtime tail with reorg handling (in progress) | Jakub: realtime is part of the brief. Opus designed an unfinalized tail overlay, and Codex is implementing it |
+| 18:00–21:00 | Realtime tail with reorg handling | Jakub: realtime is part of the brief. Opus design, Codex build, Opus audit (9 bugs fixed). Tail lag 0 blocks live; 93 tests |
 
 ---
 
@@ -277,7 +277,7 @@ After the benchmark, Viktor started a Codex worker from his main session to buil
 - **Results:** normal and NFT accounts matched RPC exactly (1 request vs 172 calls).
 - **Open problem:** on the Binance hot wallet, the integrated stream for a 100k-block chunk (about 1M logs) **hung even with a 600 s timeout**, then fell back to RPC. The standalone benchmark had streamed the same wallet in 13 s. The cause is undiagnosed, so HyperSync ships off by default.
 
-## 13. Realtime tail with reorg handling (evening, in progress)
+## 13. Realtime tail with reorg handling (18:00–21:00, landed)
 
 **Trigger:** Jakub said realtime is part of the brief ("skoro realtime"), so reorgs must be handled. The finalized-only answer from section 4 was no longer enough.
 
@@ -314,7 +314,40 @@ After the benchmark, Viktor started a Codex worker from his main session to buil
 - An unhealthy tail degrades to finalized and reports `tailError`.
 - Balances are read at the tip hash.
 
-**Implementation:** a Codex worker (gpt-5.6-sol) is building it from a brief based on this design. Results will be added when it lands.
+**Implementation:**
+- **Codex (gpt-5.6-sol):** built most of the brief: schema and migration 0003, compare-and-append, prune plus hash check inside the follower commit, a single repeatable-read snapshot for base and tail, the merge in the service, the reorg walk, and 10 tests. It **ran out of usage** before reporting.
+- **Opus audit:** checked the work item by item against the brief and **fixed 9 bugs**, each with a test:
+  1. A lagging head exactly at the cursor height wiped the whole tail (`<` instead of `<=`).
+  2. A header that changed mid catch-up, caused by Quicknode's load-balanced nodes, was counted as a depth-0 reorg. It is now retried.
+  3. All three poll offsets fired every slot (about 3 header calls per block live). The remaining offsets are now skipped once the slot's block is in.
+  4. Epoch-boundary finalized polling was missing. `follower.kick()` was added; the 30 s poll became a 390 s fallback.
+  5. Balances were refreshed on every tail block. Now only on a reorg, plus the 60 s sweep.
+  6. Range catch-up did not split on too-large or timeout.
+  7. `eth_call` on a reorged hash ("header not found") was treated as fatal. It is now transient.
+  8. `balanceBlockHash` appeared even with the tail disabled.
+  9. Found live: after an outage the tail fetched up to 500 headers that the follower then pruned. The tail now waits and wakes the follower first.
+- Tests went from 86 to **93**, 16 of them in `tail.test.ts`. Commits: `e27e32d`…`e7e6ede`.
+
+**Live check (Quicknode, Docker Postgres):**
+
+| What | Result |
+|---|---|
+| Tail lag vs `latest` | **0 blocks** in every sample, one block per slot |
+| Rebuild on start | 72 headers plus 1 range `getLogs` for 73 blocks (37.8k transfer rows) |
+| Steady state | about 1.26 header calls and exactly 1 `getLogs` per block |
+| Follower | advanced on the epoch kick (one epoch, 32 blocks) |
+| `?balances=true` (latest) | `blockHeight` = tip, `finalizedBlockHeight` present, 109 tokens, 30 ms. Repeats cost 0 RPC calls |
+| `?finality=finalized` | the old response shape. An invalid value gets 400 |
+| Network outage mid-run (ENOTFOUND) | the tail went unhealthy (lag 487) and served finalized with `tailError`, as designed |
+| Real reorg | none in the window (expected about 4–8 per day) |
+
+**Cost, re-measured:** about **53–54M credits/month** steady state for 5k users, within the Build plan's 80M.
+
+**Open items:**
+- No real reorg observed live yet; reorgs are covered by tests only.
+- The 5k-account acceptance test took 130 s on a loaded machine (load average 15). The same test on the pre-tail commit was even slower, so this is the environment, not a regression.
+- Balances are not refreshed per block for pairs a new block touched; the 60 s sweep remains.
+- A non-leader replica doesn't report live tail health.
 
 ---
 
@@ -341,7 +374,7 @@ After the benchmark, Viktor started a Codex worker from his main session to buil
 
 | Requirement | Status | Notes |
 |---|---|---|
-| ETH mainnet from block 25,933,634 to now, "almost realtime" | ⚠️ → in progress | Today: finalized only, about 13–19 min behind the tip. Jakub asked for realtime with reorgs, and the tail overlay (§13) targets about 3 s behind the tip |
+| ETH mainnet from block 25,933,634 to now, "almost realtime" | ✅ | Realtime tail with reorg handling (§13): 0 blocks behind `latest` live, about 3 s after block time. `?finality=finalized` remains available |
 | Technology choice with reasons | ✅ | REPORT §6 |
 | REST endpoint: ERC-20 tokens the address interacted with | ✅ | `GET /v1/ethereum/accounts/{addr}/erc20` |
 | Balance parameter | ✅ | `?balances=true`. Each token has its own `balanceBlock` |
@@ -358,9 +391,9 @@ After the benchmark, Viktor started a Codex worker from his main session to buil
 
 ## Next
 
-1. **Push the repo** and share it.
-2. **Land the realtime tail (§13),** then live-check it: follow the tip, and observe a real reorg or simulate one.
+1. **Share the repo** (pushed to github.com/vikiival/i-see-u, private: add Jakub and Tali as collaborators).
+2. **Observe a real reorg live** (about 4–8 per day), or replay one against a fork, to back the tail tests with a real event.
 3. **Diagnose the HyperSync Binance stream hang (§12)** before turning `LOG_SOURCE=auto` on by default. Also check the Linux napi build.
-4. **Presentation:** the arc above, the chunk-size table, the cost table, and the path from finalized-only to the realtime tail.
+4. **Presentation:** the arc above, the chunk-size table, the cost table, and the path from finalized-only to the realtime tail with reorgs.
 5. **Tuning:** raise `RPC_MAX_RPS` toward the plan's 50 (normal cold scan about 3.5 s). Verify credits per call and per batch on the Quicknode dashboard.
 6. **Known limits to decide on:** multi-replica state (active set, balance-worker leader), untracking idle accounts, holdings from before the start block, spam flags, and native ETH.
