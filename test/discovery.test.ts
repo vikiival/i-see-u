@@ -7,9 +7,12 @@ import type {
   BlockRef,
   ChainAdapter,
   ChunkScan,
+  DiscoveryResult,
+  FollowerStatus,
   Hex,
   HeadObservation,
   OwnerResult,
+  SyncingResult,
   TransferDirection,
   TransferEvent,
 } from '../src/core/types.ts';
@@ -26,6 +29,7 @@ class FakeAdapter implements ChainAdapter {
   readonly logsMaxRange: bigint = 100n;
   readonly logsMinRange: bigint = 1n;
   readonly scanConcurrency: number = 2;
+  readonly followerMaxRange: bigint = 500n;
   head: BlockRef = {
     number: 110n,
     hash: '0x110' as Hex,
@@ -64,7 +68,15 @@ class FakeAdapter implements ChainAdapter {
     return { aggregate, calls: sent.value.calls + received.value.calls, heavy: this.heavy?.(range) ?? false };
   }
 
-  async erc20Balances(): Promise<BalanceResult[]> {
+  async blockByNumber(number: bigint): Promise<BlockRef> {
+    return { number, hash: `0x${number}` as Hex, timestamp: number * 10n };
+  }
+
+  async scanAllTransfers(): Promise<{ calls: number }> {
+    return { calls: 0 };
+  }
+
+  async erc20BalancePairs(): Promise<BalanceResult[]> {
     return [];
   }
 
@@ -73,16 +85,34 @@ class FakeAdapter implements ChainAdapter {
   }
 }
 
-test('first discovery scans from startBlock and later discovery scans only the gap', async () => {
+/** Follower stub: ready and healthy unless overridden; the store's follower cursor is set to adapter.head. */
+async function setup(adapter: FakeAdapter, status: Partial<FollowerStatus> = {}) {
   const { store } = await createTestStore();
+  await store.initFollowerCursor('ethereum', adapter.head, Date.now());
+  const tracked: Address[] = [];
+  const follower = {
+    status: (): FollowerStatus => ({ ready: true, leader: true, lagBlocks: 0n, lastAdvanceAt: Date.now(), stale: false, ...status }),
+    track: (who: Address) => { tracked.push(who); },
+  };
+  const service = createDiscoveryService({ adapters: { ethereum: adapter }, store, followers: { ethereum: follower }, requestDeadlineMs: 60_000 });
+  return { store, service, tracked };
+}
+
+const ready = (result: DiscoveryResult | SyncingResult): DiscoveryResult => {
+  if (result.status !== 'ready') throw new Error('expected a ready result');
+  return result;
+};
+
+test('first discovery tracks the account and backfills [startBlock, follower cursor]; later ones read only the store', async () => {
   const adapter = new FakeAdapter();
-  const service = createDiscoveryService({ adapters: { ethereum: adapter }, store });
+  const { store, service, tracked } = await setup(adapter);
   try {
-    const first = await service.discover('ethereum', uppercaseAccount);
+    const first = ready(await service.discover('ethereum', uppercaseAccount));
     expect(first.account).toBe(account);
+    expect(tracked).toEqual([account]);
+    expect(await store.getTracking('ethereum', account)).toEqual({ target: 110n, progress: 110n });
     expect(first.blockHeight).toBe(110n);
     expect(first.blockHash).toBe(adapter.head.hash);
-    expect((await store.getCursor('ethereum', account))?.hash).toBe(adapter.head.hash);
     expect(first.finality).toBe('finalized');
     expect(first.scan.newBlocks).toBe(11n);
     expect(first.scan.rpcCalls).toBe(2);
@@ -91,26 +121,26 @@ test('first discovery scans from startBlock and later discovery scans only the g
       { fromBlock: 100n, toBlock: 110n },
     ]);
 
-    adapter.head = { number: 115n, hash: '0x115' as Hex, timestamp: 1_100n };
-    const second = await service.discover('ethereum', account);
-    expect(second.scan.newBlocks).toBe(5n);
-    expect(adapter.calls.slice(2).map((call) => call.range)).toEqual([
-      { fromBlock: 111n, toBlock: 115n },
-      { fromBlock: 111n, toBlock: 115n },
-    ]);
+    // The follower advanced the global cursor: the account is served from the store, without scanning.
+    await store.applyFollowerRange('ethereum', { fromBlock: 111n, toBlock: 115n },
+      { number: 115n, hash: '0x115' as Hex, timestamp: 1_100n }, Date.now(), new Map(), new Set([account]));
+    const second = ready(await service.discover('ethereum', account));
+    expect(second.blockHeight).toBe(115n);
+    expect(second.blockHash).toBe('0x115');
+    expect(second.scan).toEqual({ newBlocks: 0n, rpcCalls: 0, ms: 0 });
+    expect(adapter.calls.length).toBe(2);
   } finally {
     await store.close();
   }
 });
 
 test('concurrent discoveries share one directional scan', async () => {
-  const { store } = await createTestStore();
   const adapter = new FakeAdapter();
   let release = (): void => {};
   adapter.gate = new Promise<void>((resolve) => {
     release = resolve;
   });
-  const service = createDiscoveryService({ adapters: { ethereum: adapter }, store });
+  const { store, service } = await setup(adapter);
   try {
     const first = service.discover('ethereum', account);
     const second = service.discover('ethereum', account);
@@ -126,8 +156,7 @@ test('concurrent discoveries share one directional scan', async () => {
 });
 
 test('unknown network rejects with 404, a malformed address with 400', async () => {
-  const { store } = await createTestStore();
-  const service = createDiscoveryService({ adapters: { ethereum: new FakeAdapter() }, store });
+  const { store, service } = await setup(new FakeAdapter());
   try {
     await expect(service.discover('missing', account)).rejects.toMatchObject({ statusCode: 404 });
     await expect(service.discover('ethereum', 'not-an-address')).rejects.toMatchObject({ statusCode: 400 });
@@ -136,72 +165,65 @@ test('unknown network rejects with 404, a malformed address with 400', async () 
   }
 });
 
-test('a cursor ahead of a lagging head is retained without a scan', async () => {
-  const { store } = await createTestStore();
+test('legacy scan progress above the follower cursor is discarded and rebuilt, not double counted', async () => {
   const adapter = new FakeAdapter();
-  const stored = { number: 120n, hash: '0x120' as Hex, timestamp: 1_200n };
-  await store.finalizeScan('ethereum', account, stored);
-  const service = createDiscoveryService({ adapters: { ethereum: adapter }, store });
+  const { store, service } = await setup(adapter);
+  const token = '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' as Address;
+  const transfer = { standard: 'erc20', token, from: account, to: token, value: 1n, blockNumber: 105n, logIndex: 0, transactionHash: '0x01' } as const;
+  // Pre-follower data scanned through 120, above the follower cursor (110).
+  const legacy = emptyAggregate();
+  addTransfer(legacy, account, transfer);
+  await store.applyScanChunk('ethereum', account, { fromBlock: 100n, toBlock: 120n }, legacy);
+  adapter.handler = async (direction) => ({ events: direction === 'from' ? [transfer] : [], calls: 1 });
   try {
-    const result = await service.discover('ethereum', account);
-    expect(result.blockHeight).toBe(120n);
-    expect(result.blockHash).toBe(stored.hash);
-    expect(result.scan).toEqual({ newBlocks: 0n, rpcCalls: 0, ms: result.scan.ms });
-    expect(adapter.calls.length).toBe(0);
+    const result = ready(await service.discover('ethereum', account));
+    expect(result.blockHeight).toBe(110n);
+    expect(await store.getTracking('ethereum', account)).toEqual({ target: 110n, progress: 110n });
+    expect(result.holdings).toMatchObject([{ token, sentCount: 1, receivedCount: 0 }]);
   } finally {
     await store.close();
   }
 });
 
-test('an excessively old stale finalized head rejects with statusCode 503', async () => {
-  const { store } = await createTestStore();
+test('an unhealthy follower rejects with 503 before tracking or scanning', async () => {
   const adapter = new FakeAdapter();
-  adapter.stale = true;
-  adapter.lastProgressAt = Date.now() - 121_000;
-  const service = createDiscoveryService({ adapters: { ethereum: adapter }, store, maxHeadProgressAgeMs: 120_000 });
+  const { store, service } = await setup(adapter, { unhealthy: 'Follower has not advanced recently enough' });
   try {
-    await expect(service.discover('ethereum', account)).rejects.toMatchObject({ statusCode: 503 });
+    await expect(service.discover('ethereum', account)).rejects.toMatchObject({ statusCode: 503, retryAfterS: 30 });
     expect(adapter.calls.length).toBe(0);
+    expect(await store.getTracking('ethereum', account)).toBeUndefined();
   } finally {
     await store.close();
   }
 });
 
 test('a failed third chunk preserves two committed chunks and the next call resumes there', async () => {
-  const { store } = await createTestStore();
   const adapter = new FakeAdapter();
   Object.defineProperty(adapter, 'logsMaxRange', { value: 2n });
   adapter.head = { number: 109n, hash: '0x109' as Hex, timestamp: 1_090n };
-  await store.finalizeScan('ethereum', account, {
-    number: 99n,
-    hash: '0x99' as Hex,
-    timestamp: 990n,
-  });
+  const { store, service } = await setup(adapter);
   let fail = true;
   adapter.handler = async (direction, range) => {
     if (fail && direction === 'to' && range.fromBlock === 104n) throw new Error('chunk 3 failed');
     return { events: [], calls: 1 };
   };
-  const service = createDiscoveryService({ adapters: { ethereum: adapter }, store });
   try {
     await expect(service.discover('ethereum', account)).rejects.toThrow('chunk 3 failed');
-    expect(await store.getProgress('ethereum', account)).toBe(103n);
-    expect((await store.getCursor('ethereum', account))?.number).toBe(99n);
+    expect(await store.getTracking('ethereum', account)).toEqual({ target: 109n, progress: 103n });
 
     fail = false;
     adapter.calls.length = 0;
-    const result = await service.discover('ethereum', account);
+    const result = ready(await service.discover('ethereum', account));
     expect(adapter.calls[0]?.range).toEqual({ fromBlock: 104n, toBlock: 105n });
     expect(result.blockHeight).toBe(109n);
+    expect(result.blockHash).toBe('0x109');
     expect(await store.getProgress('ethereum', account)).toBe(109n);
-    expect((await store.getCursor('ethereum', account))?.hash).toBe('0x109');
   } finally {
     await store.close();
   }
 });
 
 test('a chunk is not committed when either direction fails', async () => {
-  const { store } = await createTestStore();
   const adapter = new FakeAdapter();
   adapter.head = { number: 100n, hash: '0x100' as Hex, timestamp: 1_000n };
   adapter.handler = async (direction) => {
@@ -220,7 +242,7 @@ test('a chunk is not committed when either direction fails', async () => {
       }],
     };
   };
-  const service = createDiscoveryService({ adapters: { ethereum: adapter }, store });
+  const { store, service } = await setup(adapter);
   try {
     await expect(service.discover('ethereum', account)).rejects.toThrow('received direction failed');
     expect(await store.getProgress('ethereum', account)).toBeUndefined();
@@ -231,7 +253,6 @@ test('a chunk is not committed when either direction fails', async () => {
 });
 
 test('a self-transfer returned by both directions is counted once per side', async () => {
-  const { store } = await createTestStore();
   const adapter = new FakeAdapter();
   adapter.head = { number: 100n, hash: '0x100' as Hex, timestamp: 1_000n };
   const transfer: TransferEvent = {
@@ -245,7 +266,7 @@ test('a self-transfer returned by both directions is counted once per side', asy
     transactionHash: '0x01' as Hex,
   };
   adapter.handler = async () => ({ events: [transfer], calls: 1 });
-  const service = createDiscoveryService({ adapters: { ethereum: adapter }, store });
+  const { store, service } = await setup(adapter);
   try {
     await service.discover('ethereum', account);
     expect((await store.holdings('ethereum', account))[0]).toMatchObject({ sentCount: 1, receivedCount: 1 });
@@ -257,10 +278,10 @@ test('a self-transfer returned by both directions is counted once per side', asy
 const tick = (): Promise<void> => new Promise<void>((resolve) => setImmediate(resolve));
 
 test('a slow first chunk does not idle the other slots; commits stay in order and the buffer is bounded', async () => {
-  const { store } = await createTestStore();
   const adapter = new FakeAdapter();
   Object.defineProperty(adapter, 'logsMaxRange', { value: 2n });
   adapter.head = { number: 113n, hash: '0x113' as Hex, timestamp: 1_130n }; // 7 chunks
+  const { store, service } = await setup(adapter);
   let releaseFirst = (): void => {};
   const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
   let active = 0;
@@ -280,7 +301,6 @@ test('a slow first chunk does not idle the other slots; commits stay in order an
     await apply(network, who, range, chunk);
   };
   const started = () => [...new Set(adapter.calls.map((call) => call.range.fromBlock))];
-  const service = createDiscoveryService({ adapters: { ethereum: adapter }, store });
   try {
     const pending = service.discover('ethereum', account);
     for (let i = 0; i < 20; i += 1) await tick();
@@ -288,7 +308,7 @@ test('a slow first chunk does not idle the other slots; commits stay in order an
     expect(started()).toEqual([100n, 102n, 104n, 106n]);
     expect(committed).toEqual([]);
     releaseFirst();
-    const result = await pending;
+    const result = ready(await pending);
     expect(committed).toEqual([100n, 102n, 104n, 106n, 108n, 110n, 112n]);
     expect(started()).toEqual(committed);
     expect(peakActive).toBeLessThanOrEqual(2);
@@ -300,7 +320,6 @@ test('a slow first chunk does not idle the other slots; commits stay in order an
 });
 
 test('a failed later chunk still commits the earlier ones, then rejects', async () => {
-  const { store } = await createTestStore();
   const adapter = new FakeAdapter();
   Object.defineProperty(adapter, 'logsMaxRange', { value: 2n });
   adapter.head = { number: 109n, hash: '0x109' as Hex, timestamp: 1_090n };
@@ -311,7 +330,7 @@ test('a failed later chunk still commits the earlier ones, then rejects', async 
     if (range.fromBlock === 102n) throw new Error('chunk 1 failed');
     return { events: [], calls: 1 };
   };
-  const service = createDiscoveryService({ adapters: { ethereum: adapter }, store });
+  const { store, service } = await setup(adapter);
   try {
     const pending = service.discover('ethereum', account);
     const assertion = expect(pending).rejects.toThrow('chunk 1 failed');
@@ -328,34 +347,35 @@ test('a failed later chunk still commits the earlier ones, then rejects', async 
 });
 
 test('the range halves after a heavy chunk, doubles after three light ones, and is persisted per account', async () => {
-  const { store } = await createTestStore();
   const adapter = new FakeAdapter();
   Object.defineProperty(adapter, 'logsMaxRange', { value: 8n });
   Object.defineProperty(adapter, 'logsMinRange', { value: 2n });
   Object.defineProperty(adapter, 'scanConcurrency', { value: 1 });
   adapter.head = { number: 135n, hash: '0x135' as Hex, timestamp: 1_350n };
   adapter.heavy = (range) => range.fromBlock === 100n;
+  const heavyAccount = '0xdddddddddddddddddddddddddddddddddddddddd' as Address;
+  const resumedAccount = '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' as Address;
   const sizes = () => adapter.calls
     .filter((call) => call.direction === 'from')
     .map((call) => call.range.toBlock - call.range.fromBlock + 1n);
-  const service = createDiscoveryService({ adapters: { ethereum: adapter }, store });
+  const { store, service } = await setup(adapter);
   try {
     await service.discover('ethereum', account);
     expect(sizes()).toEqual([8n, 4n, 4n, 4n, 8n, 8n]);
     expect(await store.getLogsRange('ethereum', account)).toBe(8n);
 
-    // A heavy account shrinks to the floor, and its next scan starts there.
+    // A heavy account shrinks to the floor, and the range is persisted for its next scan.
     adapter.calls.length = 0;
-    adapter.heavy = () => true;
-    adapter.head = { number: 151n, hash: '0x151' as Hex, timestamp: 1_510n };
-    await service.discover('ethereum', account);
-    expect(sizes()).toEqual([8n, 4n, 2n, 2n]);
-    expect(await store.getLogsRange('ethereum', account)).toBe(2n);
+    adapter.heavy = (range) => range.fromBlock < 116n;
+    await expect(service.discover('ethereum', heavyAccount)).resolves.toMatchObject({ status: 'ready' });
+    expect(sizes().slice(0, 4)).toEqual([8n, 4n, 2n, 2n]);
 
+    // A resumed scan starts at the persisted range.
     adapter.calls.length = 0;
     adapter.heavy = () => false;
-    adapter.head = { number: 155n, hash: '0x155' as Hex, timestamp: 1_550n };
-    await service.discover('ethereum', account);
+    await store.setLogsRange('ethereum', resumedAccount, 2n);
+    await store.applyScanChunk('ethereum', resumedAccount, { fromBlock: 100n, toBlock: 131n }, emptyAggregate());
+    await service.discover('ethereum', resumedAccount);
     expect(sizes()).toEqual([2n, 2n]);
   } finally {
     await store.close();
@@ -363,14 +383,13 @@ test('the range halves after a heavy chunk, doubles after three light ones, and 
 });
 
 test('concurrent heavy results shrink once from their own size, not repeatedly', async () => {
-  const { store } = await createTestStore();
   const adapter = new FakeAdapter();
   Object.defineProperty(adapter, 'logsMaxRange', { value: 8n });
   Object.defineProperty(adapter, 'logsMinRange', { value: 1n });
   Object.defineProperty(adapter, 'scanConcurrency', { value: 4 });
   adapter.head = { number: 131n, hash: '0x131' as Hex, timestamp: 1_310n };
   adapter.heavy = (range) => range.toBlock - range.fromBlock + 1n === 8n;
-  const service = createDiscoveryService({ adapters: { ethereum: adapter }, store });
+  const { store, service } = await setup(adapter);
   try {
     await service.discover('ethereum', account);
     const sizes = adapter.calls

@@ -16,6 +16,8 @@ export interface HeadTracker {
   finalizedHead(): Promise<HeadObservation>;
   /** Highest latest-block number seen by the background refresh in finalizedHead(); never triggers RPC. */
   latestBlockNumber(): bigint | undefined;
+  /** Uncached header of one block by number. */
+  blockByNumber(number: bigint): Promise<BlockRef>;
 }
 
 export function createHeadTracker(
@@ -37,8 +39,8 @@ export function createHeadTracker(
   let inFlight: Promise<HeadObservation> | undefined;
   let latest: bigint | undefined;
 
-  const fetchBlock = async (blockTag: 'finalized' | 'latest'): Promise<BlockRef> => {
-    const block = await client.getBlock({ blockTag });
+  const fetchBlock = async (at: 'finalized' | 'latest' | bigint): Promise<BlockRef> => {
+    const block = await client.getBlock(typeof at === 'bigint' ? { blockNumber: at } : { blockTag: at });
     return { number: block.number, hash: block.hash.toLowerCase() as Hex, timestamp: block.timestamp };
   };
 
@@ -73,5 +75,6 @@ export function createHeadTracker(
       return inFlight;
     },
     latestBlockNumber: () => latest,
+    blockByNumber: (number) => fetchBlock(number),
   };
 }

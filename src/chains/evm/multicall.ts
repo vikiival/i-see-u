@@ -1,6 +1,6 @@
 import { decodeFunctionResult, encodeFunctionData, erc20Abi, erc721Abi, isHex, multicall3Abi } from 'viem';
 
-import type { Address, BalanceResult, Hex, OwnerResult, RpcClient } from '../../core/types.ts';
+import type { Address, BalancePair, BalanceResult, Hex, OwnerResult, RpcClient } from '../../core/types.ts';
 import { RpcError, rpcErrorOf } from '../../rpc/errors.ts';
 
 /** Multicall3 has the same deterministic address on Ethereum and most EVM chains. */
@@ -81,18 +81,31 @@ async function readCalls<T>(
   });
 }
 
-export async function readErc20Balances(
+/** balanceOf for (account, token) pairs of any number of accounts, packed into shared aggregate3 batches. */
+export async function readErc20BalancePairs(
+  rpc: RpcClient,
+  pairs: BalancePair[],
+  blockHash: Hex,
+  batchSize: number,
+): Promise<BalanceResult[]> {
+  const callData = new Map<Address, Hex>();
+  const calls = pairs.map(({ account, token }) => {
+    let data = callData.get(account);
+    if (!data) callData.set(account, data = encodeFunctionData({ abi: erc20Abi, functionName: 'balanceOf', args: [account] }));
+    return { target: token, callData: data };
+  });
+  const results = await readCalls(rpc, calls, blockHash, batchSize, 'balanceOf',
+    (data) => decodeFunctionResult({ abi: erc20Abi, functionName: 'balanceOf', data }));
+  return results.map((r) => r.status === 'ok' ? { status: 'ok', balance: r.value } : r);
+}
+
+export const readErc20Balances = (
   rpc: RpcClient,
   account: Address,
   tokens: Address[],
   blockHash: Hex,
   batchSize: number,
-): Promise<BalanceResult[]> {
-  const callData = encodeFunctionData({ abi: erc20Abi, functionName: 'balanceOf', args: [account] });
-  const results = await readCalls(rpc, tokens.map((target) => ({ target, callData })), blockHash, batchSize, 'balanceOf',
-    (data) => decodeFunctionResult({ abi: erc20Abi, functionName: 'balanceOf', data }));
-  return results.map((r) => r.status === 'ok' ? { status: 'ok', balance: r.value } : r);
-}
+): Promise<BalanceResult[]> => readErc20BalancePairs(rpc, tokens.map((token) => ({ account, token })), blockHash, batchSize);
 
 export async function readErc721Owners(
   rpc: RpcClient,

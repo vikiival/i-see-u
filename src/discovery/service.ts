@@ -1,3 +1,5 @@
+import { createLimiter, unavailable, withDeadline } from '../core/limiter.ts';
+import type { Limiter } from '../core/limiter.ts';
 import type {
   Address,
   BlockRange,
@@ -5,14 +7,27 @@ import type {
   ChunkScan,
   DiscoveryResult,
   DiscoveryService,
+  Follower,
   Store,
+  SyncingResult,
+  Tracking,
 } from '../core/types.ts';
 
 interface DiscoveryDependencies {
   adapters: Record<string, ChainAdapter>;
   store: Store;
-  /** Refuse discovery when finalized progress is older than this. */
-  maxHeadProgressAgeMs?: number;
+  followers: Record<string, Pick<Follower, 'status' | 'track'>>;
+  /** How long a request waits for a cold backfill before answering `syncing`; the backfill continues. */
+  requestDeadlineMs?: number;
+  /** Bounds concurrent (and queued) backfills; beyond it requests get 503 with Retry-After. */
+  backfillLimiter?: Limiter;
+  now?: () => number;
+}
+
+interface BackfillStats {
+  newBlocks: bigint;
+  rpcCalls: number;
+  ms: number;
 }
 
 type ChunkOutcome = ({ ok: true } & ChunkScan) | { ok: false; error: unknown };
@@ -22,32 +37,31 @@ interface ChunkSlot {
   outcome?: ChunkOutcome;
 }
 
-const DEFAULT_MAX_HEAD_PROGRESS_AGE_MS = 1_800_000;
+const DEFAULT_REQUEST_DEADLINE_MS = 10_000;
 /** Consecutive light chunks (at the current range) before the range doubles again. */
 const GROW_AFTER = 3;
 
+const backfilled = (adapter: ChainAdapter, tracking: Tracking): boolean =>
+  tracking.target < adapter.startBlock || (tracking.progress !== undefined && tracking.progress >= tracking.target);
+
 export function createDiscoveryService(deps: DiscoveryDependencies): DiscoveryService {
-  const maxHeadProgressAgeMs = deps.maxHeadProgressAgeMs ?? DEFAULT_MAX_HEAD_PROGRESS_AGE_MS;
-  const inFlight = new Map<string, Promise<DiscoveryResult>>();
+  const now = deps.now ?? Date.now;
+  const requestDeadlineMs = deps.requestDeadlineMs ?? DEFAULT_REQUEST_DEADLINE_MS;
+  const limiter = deps.backfillLimiter ?? createLimiter(4, 64);
+  const inFlight = new Map<string, Promise<BackfillStats>>();
 
-  const scan = async (adapter: ChainAdapter, account: Address): Promise<DiscoveryResult> => {
+  /** Resumable chunked scan of [startBlock, target]: the follower owns every block above target. */
+  const backfill = async (adapter: ChainAdapter, account: Address): Promise<BackfillStats> => {
     const startedAt = Date.now();
-    const head = await adapter.finalizedHead();
-    if (Date.now() - head.lastProgressAt > maxHeadProgressAgeMs) {
-      throw Object.assign(new Error('Finalized chain head has not progressed recently enough'), { statusCode: 503 });
-    }
-
-    const previousCursor = await deps.store.getCursor(adapter.network, account);
-    // Progress is never below the cursor (finalizeScan advances both); above it means uncommitted chunks.
-    const appliedTo = await deps.store.getProgress(adapter.network, account);
-    if (appliedTo !== undefined && appliedTo > (previousCursor?.number ?? -1n) && appliedTo > head.block.number) {
-      throw Object.assign(new Error('Finalized chain head is behind persisted scan progress'), { statusCode: 503 });
-    }
+    const tracking = await deps.store.getTracking(adapter.network, account);
+    if (!tracking) throw new Error(`Account ${account} is not tracked`);
+    const target = tracking.target;
+    const appliedTo = tracking.progress;
     const fromBlock = appliedTo !== undefined && appliedTo >= adapter.startBlock ? appliedTo + 1n : adapter.startBlock;
 
     let newBlocks = 0n;
     let rpcCalls = 0;
-    if (fromBlock <= head.block.number) {
+    if (fromBlock <= target) {
       const { logsMinRange: minRange, logsMaxRange: maxRange, scanConcurrency: concurrency } = adapter;
       const persisted = await deps.store.getLogsRange(adapter.network, account);
       let range = persisted === undefined || persisted > maxRange ? maxRange : persisted < minRange ? minRange : persisted;
@@ -74,9 +88,9 @@ export function createDiscoveryService(deps: DiscoveryDependencies): DiscoverySe
       let wake = (): void => {};
       const settled = (): Promise<void> => new Promise<void>((resolve) => { wake = resolve; });
       const launch = (): void => {
-        while (!stopped && active < concurrency && window.length < 2 * concurrency && nextFrom <= head.block.number) {
+        while (!stopped && active < concurrency && window.length < 2 * concurrency && nextFrom <= target) {
           const end = nextFrom + range - 1n;
-          const slot: ChunkSlot = { range: { fromBlock: nextFrom, toBlock: end < head.block.number ? end : head.block.number } };
+          const slot: ChunkSlot = { range: { fromBlock: nextFrom, toBlock: end < target ? end : target } };
           nextFrom = slot.range.toBlock + 1n;
           window.push(slot);
           active += 1;
@@ -116,50 +130,77 @@ export function createDiscoveryService(deps: DiscoveryDependencies): DiscoverySe
       }
     }
 
-    // A lagging head keeps the newer published pair.
-    if (!previousCursor || head.block.number > previousCursor.number) {
-      await deps.store.finalizeScan(adapter.network, account, head.block);
+    return { newBlocks, rpcCalls, ms: Date.now() - startedAt };
+  };
+
+  const startBackfill = (adapter: ChainAdapter, account: Address): Promise<BackfillStats> => {
+    const key = `${adapter.network}:${account}`;
+    let pending = inFlight.get(key);
+    if (!pending) {
+      pending = limiter.run(() => backfill(adapter, account)).finally(() => inFlight.delete(key));
+      inFlight.set(key, pending);
     }
-    const cursor = (await deps.store.getCursor(adapter.network, account))!;
-    const latest = adapter.cachedLatestBlockNumber?.() ?? head.block.number;
-    const [holdings, nftItems] = await Promise.all([
-      deps.store.holdings(adapter.network, account),
-      deps.store.nftItems(adapter.network, account),
-    ]);
-    return {
-      network: adapter.network,
-      account,
-      fromBlock: adapter.startBlock,
-      blockHeight: cursor.number,
-      blockHash: cursor.hash,
-      blockTimestamp: cursor.timestamp,
-      finality: 'finalized',
-      lastProgressAt: head.lastProgressAt,
-      stale: head.stale,
-      lagBlocks: latest > cursor.number ? latest - cursor.number : 0n,
-      holdings,
-      nftItems,
-      scan: { newBlocks, rpcCalls, ms: Date.now() - startedAt },
-    };
+    return pending;
   };
 
   return {
-    async discover(network: string, input: string): Promise<DiscoveryResult> {
+    async discover(network: string, input: string): Promise<DiscoveryResult | SyncingResult> {
       const adapter = deps.adapters[network];
-      if (!adapter) {
+      const follower = deps.followers[network];
+      if (!adapter || !follower) {
         throw Object.assign(new Error(`Unknown network: ${network}`), { statusCode: 404 });
       }
       const account = adapter.normalizeAddress(input);
       if (!account) throw Object.assign(new Error('Invalid account address'), { statusCode: 400 });
-      const key = `${network}:${account}`;
-      const existing = inFlight.get(key);
-      if (existing) return existing;
 
-      const pending = scan(adapter, account).finally(() => {
-        inFlight.delete(key);
-      });
-      inFlight.set(key, pending);
-      return pending;
+      const status = follower.status();
+      if (status.unhealthy) throw unavailable(status.unhealthy, 30);
+      // Tracked first (target = follower cursor, atomically), then backfilled up to that target.
+      let tracking = await deps.store.getTracking(network, account) ?? await deps.store.trackAccount(network, account, now());
+      follower.track(account);
+
+      let scan: BackfillStats = { newBlocks: 0n, rpcCalls: 0, ms: 0 };
+      if (!backfilled(adapter, tracking)) {
+        const done = await withDeadline(startBackfill(adapter, account), requestDeadlineMs, () => undefined);
+        if (!done) {
+          tracking = await deps.store.getTracking(network, account) ?? tracking;
+          const blocks = (to: bigint | undefined): bigint => to !== undefined && to >= adapter.startBlock ? to - adapter.startBlock + 1n : 0n;
+          return {
+            status: 'syncing',
+            network,
+            account,
+            fromBlock: adapter.startBlock,
+            progressBlocks: blocks(tracking.progress),
+            targetBlocks: blocks(tracking.target),
+            followerLagBlocks: status.lagBlocks,
+          };
+        }
+        scan = done;
+      }
+
+      // Pure database read from here on: no RPC on the request path once the account is backfilled.
+      const view = await deps.store.readAccount(network, account);
+      if (!view) throw unavailable('Follower has no cursor yet', 5);
+      const { cursor } = view;
+      const latest = adapter.cachedLatestBlockNumber?.() ?? cursor.number;
+      const head = status.headNumber ?? cursor.number;
+      return {
+        status: 'ready',
+        network,
+        account,
+        fromBlock: adapter.startBlock,
+        blockHeight: cursor.number,
+        blockHash: cursor.hash,
+        blockTimestamp: cursor.timestamp,
+        finality: 'finalized',
+        lastProgressAt: cursor.updatedAt,
+        stale: status.stale,
+        lagBlocks: latest > cursor.number ? latest - cursor.number : 0n,
+        followerLagBlocks: head > cursor.number ? head - cursor.number : 0n,
+        holdings: view.holdings,
+        nftItems: view.nftItems,
+        scan,
+      };
     },
   };
 }

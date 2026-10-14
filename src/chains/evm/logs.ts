@@ -73,22 +73,17 @@ interface LogsScanStats {
 }
 
 /**
- * Stream every decoded Transfer with `account` on `direction` side into `onTransfer`, without collecting arrays.
+ * Fetch one topic filter over `range` and hand every raw log to `onLog`, without collecting arrays.
  * A too_large error, or a timeout on a multi-block range, splits the range in half (or at the provider's suggestion).
  */
-export async function scanTransfers(
+async function scanLogs(
   rpc: RpcClient,
-  account: Address,
-  direction: TransferDirection,
+  topics: (Hex | null)[],
   range: BlockRange,
-  onTransfer: (event: TransferEvent) => void,
+  onLog: (log: WireLog) => void,
   shouldStop: () => boolean = () => false,
 ): Promise<LogsScanStats> {
   const stats: LogsScanStats = { calls: 0, maxBytes: 0, maxMs: 0, split: false };
-  const accountTopic = pad(account, { size: 32 });
-  const topics = direction === 'from'
-    ? [TRANSFER_TOPIC, accountTopic, null]
-    : [TRANSFER_TOPIC, null, accountTopic];
 
   const fetchRange = async (part: BlockRange): Promise<void> => {
     if (shouldStop()) throw new Error('Chunk scan aborted');
@@ -127,13 +122,55 @@ export async function scanTransfers(
     }
     stats.maxBytes = Math.max(stats.maxBytes, bytes ?? raw.length * APPROX_LOG_BYTES);
     stats.maxMs = Math.max(stats.maxMs, ms);
-    for (const log of raw) {
-      const event = decodeTransferLog(log);
-      if (event) onTransfer(event);
-    }
+    for (const log of raw) onLog(log);
   };
   await fetchRange(range);
   return stats;
+}
+
+/** Stream every decoded Transfer with `account` on `direction` side into `onTransfer`. */
+export async function scanTransfers(
+  rpc: RpcClient,
+  account: Address,
+  direction: TransferDirection,
+  range: BlockRange,
+  onTransfer: (event: TransferEvent) => void,
+  shouldStop: () => boolean = () => false,
+): Promise<LogsScanStats> {
+  const accountTopic = pad(account, { size: 32 });
+  const topics = direction === 'from'
+    ? [TRANSFER_TOPIC, accountTopic, null]
+    : [TRANSFER_TOPIC, null, accountTopic];
+  return scanLogs(rpc, topics, range, (log) => {
+    const event = decodeTransferLog(log);
+    if (event) onTransfer(event);
+  }, shouldStop);
+}
+
+/** The address in a 32-byte indexed topic, lowercase; undefined if the topic is not a padded address. */
+const topicAddress = (topic: unknown): Address | undefined =>
+  typeof topic === 'string' && /^0x0{24}[0-9a-fA-F]{40}$/.test(topic) ? `0x${topic.slice(26).toLowerCase()}` as Address : undefined;
+
+/**
+ * Every Transfer in range, without an address filter (about 450 KB of JSON per mainnet block, so keep ranges at
+ * most ~1k blocks). Logs whose from/to are both rejected by `accept` are skipped before the (costlier) strict decode.
+ */
+export async function scanAllTransfers(
+  rpc: RpcClient,
+  range: BlockRange,
+  onTransfer: (event: TransferEvent) => void,
+  accept?: (address: Address) => boolean,
+): Promise<{ calls: number }> {
+  const { calls } = await scanLogs(rpc, [TRANSFER_TOPIC], range, (log) => {
+    if (accept && Array.isArray(log.topics)) {
+      const from = topicAddress(log.topics[1]);
+      const to = topicAddress(log.topics[2]);
+      if (from && to && !accept(from) && !accept(to)) return;
+    }
+    const event = decodeTransferLog(log);
+    if (event) onTransfer(event);
+  });
+  return { calls };
 }
 
 /** Both directions of one chunk in parallel, folded into one aggregate while decoding. */
