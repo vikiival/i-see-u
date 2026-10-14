@@ -19,7 +19,7 @@ const int = (k: string, d: string): number => {
 
 export const config = {
   port: int('PORT', '3000'),
-  dbPath: env('DB_PATH', 'data/i-see-u.sqlite'),
+  databaseUrl: env('DATABASE_URL', 'postgresql://iseeu:iseeu@localhost:5432/iseeu'),
   rpc: {
     /** Primary first; comma-separated RPC_FALLBACK_URLS are tried after it. */
     urls: [env('RPC_URL'), ...env('RPC_FALLBACK_URLS', '').split(',').filter(Boolean)],

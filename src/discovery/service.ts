@@ -37,9 +37,9 @@ export function createDiscoveryService(deps: DiscoveryDependencies): DiscoverySe
       throw Object.assign(new Error('Finalized chain head has not progressed recently enough'), { statusCode: 503 });
     }
 
-    const previousCursor = deps.store.getCursor(adapter.network, account);
+    const previousCursor = await deps.store.getCursor(adapter.network, account);
     // Progress is never below the cursor (finalizeScan advances both); above it means uncommitted chunks.
-    const appliedTo = deps.store.getProgress(adapter.network, account);
+    const appliedTo = await deps.store.getProgress(adapter.network, account);
     if (appliedTo !== undefined && appliedTo > (previousCursor?.number ?? -1n) && appliedTo > head.block.number) {
       throw Object.assign(new Error('Finalized chain head is behind persisted scan progress'), { statusCode: 503 });
     }
@@ -49,7 +49,7 @@ export function createDiscoveryService(deps: DiscoveryDependencies): DiscoverySe
     let rpcCalls = 0;
     if (fromBlock <= head.block.number) {
       const { logsMinRange: minRange, logsMaxRange: maxRange, scanConcurrency: concurrency } = adapter;
-      const persisted = deps.store.getLogsRange(adapter.network, account);
+      const persisted = await deps.store.getLogsRange(adapter.network, account);
       let range = persisted === undefined || persisted > maxRange ? maxRange : persisted < minRange ? minRange : persisted;
       let lightStreak = 0;
       // Called in completion order: shrink below a heavy chunk's own size, grow after a streak of light ones.
@@ -104,7 +104,7 @@ export function createDiscoveryService(deps: DiscoveryDependencies): DiscoverySe
           }
           if (!outcome.ok) throw outcome.error;
           const { range: done } = window.shift()!;
-          deps.store.applyScanChunk(adapter.network, account, done, outcome.aggregate);
+          await deps.store.applyScanChunk(adapter.network, account, done, outcome.aggregate);
           rpcCalls += outcome.calls;
           newBlocks += done.toBlock - done.fromBlock + 1n;
           launch();
@@ -112,16 +112,20 @@ export function createDiscoveryService(deps: DiscoveryDependencies): DiscoverySe
       } finally {
         stopped = true;
         while (active > 0) await settled();
-        if (range !== persisted) deps.store.setLogsRange(adapter.network, account, range);
+        if (range !== persisted) await deps.store.setLogsRange(adapter.network, account, range);
       }
     }
 
     // A lagging head keeps the newer published pair.
     if (!previousCursor || head.block.number > previousCursor.number) {
-      deps.store.finalizeScan(adapter.network, account, head.block);
+      await deps.store.finalizeScan(adapter.network, account, head.block);
     }
-    const cursor = deps.store.getCursor(adapter.network, account)!;
+    const cursor = (await deps.store.getCursor(adapter.network, account))!;
     const latest = adapter.cachedLatestBlockNumber?.() ?? head.block.number;
+    const [holdings, nftItems] = await Promise.all([
+      deps.store.holdings(adapter.network, account),
+      deps.store.nftItems(adapter.network, account),
+    ]);
     return {
       network: adapter.network,
       account,
@@ -133,8 +137,8 @@ export function createDiscoveryService(deps: DiscoveryDependencies): DiscoverySe
       lastProgressAt: head.lastProgressAt,
       stale: head.stale,
       lagBlocks: latest > cursor.number ? latest - cursor.number : 0n,
-      holdings: deps.store.holdings(adapter.network, account),
-      nftItems: deps.store.nftItems(adapter.network, account),
+      holdings,
+      nftItems,
       scan: { newBlocks, rpcCalls, ms: Date.now() - startedAt },
     };
   };

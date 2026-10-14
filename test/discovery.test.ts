@@ -15,7 +15,7 @@ import type {
 } from '../src/core/types.ts';
 import { addTransfer, emptyAggregate } from '../src/core/aggregate.ts';
 import { createDiscoveryService } from '../src/discovery/service.ts';
-import { openSqliteStore } from '../src/store/sqlite.ts';
+import { createTestStore } from './store-fixture.ts';
 
 const account = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' as Address;
 const uppercaseAccount = `0x${account.slice(2).toUpperCase()}` as Address;
@@ -74,7 +74,7 @@ class FakeAdapter implements ChainAdapter {
 }
 
 test('first discovery scans from startBlock and later discovery scans only the gap', async () => {
-  const store = openSqliteStore(':memory:');
+  const { store } = await createTestStore();
   const adapter = new FakeAdapter();
   const service = createDiscoveryService({ adapters: { ethereum: adapter }, store });
   try {
@@ -82,7 +82,7 @@ test('first discovery scans from startBlock and later discovery scans only the g
     expect(first.account).toBe(account);
     expect(first.blockHeight).toBe(110n);
     expect(first.blockHash).toBe(adapter.head.hash);
-    expect(store.getCursor('ethereum', account)?.hash).toBe(adapter.head.hash);
+    expect((await store.getCursor('ethereum', account))?.hash).toBe(adapter.head.hash);
     expect(first.finality).toBe('finalized');
     expect(first.scan.newBlocks).toBe(11n);
     expect(first.scan.rpcCalls).toBe(2);
@@ -99,12 +99,12 @@ test('first discovery scans from startBlock and later discovery scans only the g
       { fromBlock: 111n, toBlock: 115n },
     ]);
   } finally {
-    store.close();
+    await store.close();
   }
 });
 
 test('concurrent discoveries share one directional scan', async () => {
-  const store = openSqliteStore(':memory:');
+  const { store } = await createTestStore();
   const adapter = new FakeAdapter();
   let release = (): void => {};
   adapter.gate = new Promise<void>((resolve) => {
@@ -121,26 +121,26 @@ test('concurrent discoveries share one directional scan', async () => {
     expect(a).toEqual(b);
     expect(adapter.calls.map((call) => call.direction).sort()).toEqual(['from', 'to']);
   } finally {
-    store.close();
+    await store.close();
   }
 });
 
 test('unknown network rejects with 404, a malformed address with 400', async () => {
-  const store = openSqliteStore(':memory:');
+  const { store } = await createTestStore();
   const service = createDiscoveryService({ adapters: { ethereum: new FakeAdapter() }, store });
   try {
     await expect(service.discover('missing', account)).rejects.toMatchObject({ statusCode: 404 });
     await expect(service.discover('ethereum', 'not-an-address')).rejects.toMatchObject({ statusCode: 400 });
   } finally {
-    store.close();
+    await store.close();
   }
 });
 
 test('a cursor ahead of a lagging head is retained without a scan', async () => {
-  const store = openSqliteStore(':memory:');
+  const { store } = await createTestStore();
   const adapter = new FakeAdapter();
   const stored = { number: 120n, hash: '0x120' as Hex, timestamp: 1_200n };
-  store.finalizeScan('ethereum', account, stored);
+  await store.finalizeScan('ethereum', account, stored);
   const service = createDiscoveryService({ adapters: { ethereum: adapter }, store });
   try {
     const result = await service.discover('ethereum', account);
@@ -149,12 +149,12 @@ test('a cursor ahead of a lagging head is retained without a scan', async () => 
     expect(result.scan).toEqual({ newBlocks: 0n, rpcCalls: 0, ms: result.scan.ms });
     expect(adapter.calls.length).toBe(0);
   } finally {
-    store.close();
+    await store.close();
   }
 });
 
 test('an excessively old stale finalized head rejects with statusCode 503', async () => {
-  const store = openSqliteStore(':memory:');
+  const { store } = await createTestStore();
   const adapter = new FakeAdapter();
   adapter.stale = true;
   adapter.lastProgressAt = Date.now() - 121_000;
@@ -163,16 +163,16 @@ test('an excessively old stale finalized head rejects with statusCode 503', asyn
     await expect(service.discover('ethereum', account)).rejects.toMatchObject({ statusCode: 503 });
     expect(adapter.calls.length).toBe(0);
   } finally {
-    store.close();
+    await store.close();
   }
 });
 
 test('a failed third chunk preserves two committed chunks and the next call resumes there', async () => {
-  const store = openSqliteStore(':memory:');
+  const { store } = await createTestStore();
   const adapter = new FakeAdapter();
   Object.defineProperty(adapter, 'logsMaxRange', { value: 2n });
   adapter.head = { number: 109n, hash: '0x109' as Hex, timestamp: 1_090n };
-  store.finalizeScan('ethereum', account, {
+  await store.finalizeScan('ethereum', account, {
     number: 99n,
     hash: '0x99' as Hex,
     timestamp: 990n,
@@ -185,23 +185,23 @@ test('a failed third chunk preserves two committed chunks and the next call resu
   const service = createDiscoveryService({ adapters: { ethereum: adapter }, store });
   try {
     await expect(service.discover('ethereum', account)).rejects.toThrow('chunk 3 failed');
-    expect(store.getProgress('ethereum', account)).toBe(103n);
-    expect(store.getCursor('ethereum', account)?.number).toBe(99n);
+    expect(await store.getProgress('ethereum', account)).toBe(103n);
+    expect((await store.getCursor('ethereum', account))?.number).toBe(99n);
 
     fail = false;
     adapter.calls.length = 0;
     const result = await service.discover('ethereum', account);
     expect(adapter.calls[0]?.range).toEqual({ fromBlock: 104n, toBlock: 105n });
     expect(result.blockHeight).toBe(109n);
-    expect(store.getProgress('ethereum', account)).toBe(109n);
-    expect(store.getCursor('ethereum', account)?.hash).toBe('0x109');
+    expect(await store.getProgress('ethereum', account)).toBe(109n);
+    expect((await store.getCursor('ethereum', account))?.hash).toBe('0x109');
   } finally {
-    store.close();
+    await store.close();
   }
 });
 
 test('a chunk is not committed when either direction fails', async () => {
-  const store = openSqliteStore(':memory:');
+  const { store } = await createTestStore();
   const adapter = new FakeAdapter();
   adapter.head = { number: 100n, hash: '0x100' as Hex, timestamp: 1_000n };
   adapter.handler = async (direction) => {
@@ -223,15 +223,15 @@ test('a chunk is not committed when either direction fails', async () => {
   const service = createDiscoveryService({ adapters: { ethereum: adapter }, store });
   try {
     await expect(service.discover('ethereum', account)).rejects.toThrow('received direction failed');
-    expect(store.getProgress('ethereum', account)).toBeUndefined();
-    expect(store.holdings('ethereum', account)).toEqual([]);
+    expect(await store.getProgress('ethereum', account)).toBeUndefined();
+    expect(await store.holdings('ethereum', account)).toEqual([]);
   } finally {
-    store.close();
+    await store.close();
   }
 });
 
 test('a self-transfer returned by both directions is counted once per side', async () => {
-  const store = openSqliteStore(':memory:');
+  const { store } = await createTestStore();
   const adapter = new FakeAdapter();
   adapter.head = { number: 100n, hash: '0x100' as Hex, timestamp: 1_000n };
   const transfer: TransferEvent = {
@@ -248,16 +248,16 @@ test('a self-transfer returned by both directions is counted once per side', asy
   const service = createDiscoveryService({ adapters: { ethereum: adapter }, store });
   try {
     await service.discover('ethereum', account);
-    expect(store.holdings('ethereum', account)[0]).toMatchObject({ sentCount: 1, receivedCount: 1 });
+    expect((await store.holdings('ethereum', account))[0]).toMatchObject({ sentCount: 1, receivedCount: 1 });
   } finally {
-    store.close();
+    await store.close();
   }
 });
 
 const tick = (): Promise<void> => new Promise<void>((resolve) => setImmediate(resolve));
 
 test('a slow first chunk does not idle the other slots; commits stay in order and the buffer is bounded', async () => {
-  const store = openSqliteStore(':memory:');
+  const { store } = await createTestStore();
   const adapter = new FakeAdapter();
   Object.defineProperty(adapter, 'logsMaxRange', { value: 2n });
   adapter.head = { number: 113n, hash: '0x113' as Hex, timestamp: 1_130n }; // 7 chunks
@@ -275,9 +275,9 @@ test('a slow first chunk does not idle the other slots; commits stay in order an
   };
   const committed: bigint[] = [];
   const apply = store.applyScanChunk.bind(store);
-  store.applyScanChunk = (network, who, range, chunk) => {
+  store.applyScanChunk = async (network, who, range, chunk) => {
     committed.push(range.fromBlock);
-    apply(network, who, range, chunk);
+    await apply(network, who, range, chunk);
   };
   const started = () => [...new Set(adapter.calls.map((call) => call.range.fromBlock))];
   const service = createDiscoveryService({ adapters: { ethereum: adapter }, store });
@@ -293,14 +293,14 @@ test('a slow first chunk does not idle the other slots; commits stay in order an
     expect(started()).toEqual(committed);
     expect(peakActive).toBeLessThanOrEqual(2);
     expect(result.scan).toMatchObject({ newBlocks: 14n, rpcCalls: 14 });
-    expect(store.getProgress('ethereum', account)).toBe(113n);
+    expect(await store.getProgress('ethereum', account)).toBe(113n);
   } finally {
-    store.close();
+    await store.close();
   }
 });
 
 test('a failed later chunk still commits the earlier ones, then rejects', async () => {
-  const store = openSqliteStore(':memory:');
+  const { store } = await createTestStore();
   const adapter = new FakeAdapter();
   Object.defineProperty(adapter, 'logsMaxRange', { value: 2n });
   adapter.head = { number: 109n, hash: '0x109' as Hex, timestamp: 1_090n };
@@ -319,16 +319,16 @@ test('a failed later chunk still commits the earlier ones, then rejects', async 
     const startedBeforeRelease = new Set(adapter.calls.map((call) => call.range.fromBlock)).size;
     releaseFirst();
     await assertion;
-    expect(store.getProgress('ethereum', account)).toBe(101n);
+    expect(await store.getProgress('ethereum', account)).toBe(101n);
     // Nothing new is started once a chunk has failed.
     expect(new Set(adapter.calls.map((call) => call.range.fromBlock)).size).toBe(startedBeforeRelease);
   } finally {
-    store.close();
+    await store.close();
   }
 });
 
 test('the range halves after a heavy chunk, doubles after three light ones, and is persisted per account', async () => {
-  const store = openSqliteStore(':memory:');
+  const { store } = await createTestStore();
   const adapter = new FakeAdapter();
   Object.defineProperty(adapter, 'logsMaxRange', { value: 8n });
   Object.defineProperty(adapter, 'logsMinRange', { value: 2n });
@@ -342,7 +342,7 @@ test('the range halves after a heavy chunk, doubles after three light ones, and 
   try {
     await service.discover('ethereum', account);
     expect(sizes()).toEqual([8n, 4n, 4n, 4n, 8n, 8n]);
-    expect(store.getLogsRange('ethereum', account)).toBe(8n);
+    expect(await store.getLogsRange('ethereum', account)).toBe(8n);
 
     // A heavy account shrinks to the floor, and its next scan starts there.
     adapter.calls.length = 0;
@@ -350,7 +350,7 @@ test('the range halves after a heavy chunk, doubles after three light ones, and 
     adapter.head = { number: 151n, hash: '0x151' as Hex, timestamp: 1_510n };
     await service.discover('ethereum', account);
     expect(sizes()).toEqual([8n, 4n, 2n, 2n]);
-    expect(store.getLogsRange('ethereum', account)).toBe(2n);
+    expect(await store.getLogsRange('ethereum', account)).toBe(2n);
 
     adapter.calls.length = 0;
     adapter.heavy = () => false;
@@ -358,12 +358,12 @@ test('the range halves after a heavy chunk, doubles after three light ones, and 
     await service.discover('ethereum', account);
     expect(sizes()).toEqual([2n, 2n]);
   } finally {
-    store.close();
+    await store.close();
   }
 });
 
 test('concurrent heavy results shrink once from their own size, not repeatedly', async () => {
-  const store = openSqliteStore(':memory:');
+  const { store } = await createTestStore();
   const adapter = new FakeAdapter();
   Object.defineProperty(adapter, 'logsMaxRange', { value: 8n });
   Object.defineProperty(adapter, 'logsMinRange', { value: 1n });
@@ -377,9 +377,9 @@ test('concurrent heavy results shrink once from their own size, not repeatedly',
       .filter((call) => call.direction === 'from')
       .map((call) => call.range.toBlock - call.range.fromBlock + 1n);
     expect(sizes.slice(0, 4)).toEqual([8n, 8n, 8n, 8n]);
-    expect(store.getProgress('ethereum', account)).toBe(131n);
-    expect(store.getLogsRange('ethereum', account)).toBe(4n);
+    expect(await store.getProgress('ethereum', account)).toBe(131n);
+    expect(await store.getLogsRange('ethereum', account)).toBe(4n);
   } finally {
-    store.close();
+    await store.close();
   }
 });

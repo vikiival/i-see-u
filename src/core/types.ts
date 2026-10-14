@@ -146,7 +146,7 @@ export type RpcErrorKind =
   | 'fatal'; // anything else (bad params, execution reverted)
 
 // ---------------------------------------------------------------------------
-// Storage (src/store). SQLite (node:sqlite) for the PoC; Postgres later behind the same interface.
+// Storage (src/store). PostgreSQL in production, PGlite in tests.
 // ---------------------------------------------------------------------------
 
 export interface Holding {
@@ -168,23 +168,23 @@ export interface NftItem {
 
 export interface Store {
   /** Published finalized cursor: every chunk through this block was applied. */
-  getCursor(network: string, account: Address): BlockRef | undefined;
+  getCursor(network: string, account: Address): Promise<BlockRef | undefined>;
   /** Highest block whose events were applied, even if the finalized cursor is not complete yet. */
-  getProgress(network: string, account: Address): bigint | undefined;
+  getProgress(network: string, account: Address): Promise<bigint | undefined>;
   /**
    * Atomically apply one completed chunk's aggregate and advance progress to range.toBlock.
    * Idempotent: a chunk at or below applied progress is a no-op; one straddling it is rejected.
    */
-  applyScanChunk(network: string, account: Address, range: BlockRange, chunk: ChunkAggregate): void;
+  applyScanChunk(network: string, account: Address, range: BlockRange, chunk: ChunkAggregate): Promise<void>;
   /** Last adaptive getLogs range used for this account, so the next scan of a heavy account starts small. */
-  getLogsRange(network: string, account: Address): bigint | undefined;
-  setLogsRange(network: string, account: Address, range: bigint): void;
+  getLogsRange(network: string, account: Address): Promise<bigint | undefined>;
+  setLogsRange(network: string, account: Address, range: bigint): Promise<void>;
   /** Publish a consistent finalized height/hash pair after every chunk through it was applied. Never moves back. */
-  finalizeScan(network: string, account: Address, scannedTo: BlockRef): void;
+  finalizeScan(network: string, account: Address, scannedTo: BlockRef): Promise<void>;
   /** ERC-20 and ERC-721 summaries, newest first. */
-  holdings(network: string, account: Address): Holding[];
-  nftItems(network: string, account: Address): NftItem[];
-  close(): void;
+  holdings(network: string, account: Address): Promise<Holding[]>;
+  nftItems(network: string, account: Address): Promise<NftItem[]>;
+  close(): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------

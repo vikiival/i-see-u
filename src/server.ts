@@ -6,12 +6,12 @@ import { createEvmAdapter } from './chains/evm/adapter.ts';
 import { config } from './config.ts';
 import { createDiscoveryService } from './discovery/service.ts';
 import { createRpcClient } from './rpc/client.ts';
-import { openSqliteStore } from './store/sqlite.ts';
+import { openPostgresStore } from './store/postgres.ts';
 
 const rpc = createRpcClient(config.rpc);
 const eth = config.ethereum;
 const adapters = { [eth.network]: createEvmAdapter(rpc, { ...eth, chain: mainnet }) };
-const store = openSqliteStore(config.dbPath);
+const store = await openPostgresStore(config.databaseUrl);
 const discovery = createDiscoveryService({
   adapters,
   store,
@@ -30,8 +30,8 @@ let shuttingDown = false;
 const shutdown = () => {
   if (shuttingDown) return;
   shuttingDown = true;
-  server.close((error) => {
-    store.close();
+  server.close(async (error) => {
+    await store.close();
     if (error) {
       console.error('shutdown failed', error);
       process.exitCode = 1;

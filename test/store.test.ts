@@ -1,12 +1,11 @@
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
+import { migrate } from 'drizzle-orm/pglite/migrator';
 import { expect, test } from 'vitest';
 
 import type { Address, BlockRef, Hex, Store, TransferEvent } from '../src/core/types.ts';
 import { addTransfer, emptyAggregate } from '../src/core/aggregate.ts';
-import { openSqliteStore } from '../src/store/sqlite.ts';
+import { withAdvisoryLock } from '../src/store/advisory-lock.ts';
+import { migrationsFolder } from '../src/store/postgres.ts';
+import { createTestStore } from './store-fixture.ts';
 
 const account = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' as Address;
 const other = '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' as Address;
@@ -23,10 +22,10 @@ const aggregateOf = (events: TransferEvent[]) => {
   return aggregate;
 };
 
-const applyScan = (store: Store, events: TransferEvent[], at: BlockRef): void => {
-  const fromBlock = (store.getProgress('ethereum', account) ?? -1n) + 1n;
-  store.applyScanChunk('ethereum', account, { fromBlock: fromBlock < at.number ? fromBlock : at.number, toBlock: at.number }, aggregateOf(events));
-  store.finalizeScan('ethereum', account, at);
+const applyScan = async (store: Store, events: TransferEvent[], at: BlockRef): Promise<void> => {
+  const fromBlock = (await store.getProgress('ethereum', account) ?? -1n) + 1n;
+  await store.applyScanChunk('ethereum', account, { fromBlock: fromBlock < at.number ? fromBlock : at.number, toBlock: at.number }, aggregateOf(events));
+  await store.finalizeScan('ethereum', account, at);
 };
 
 function event(overrides: Partial<TransferEvent> = {}): TransferEvent {
@@ -43,27 +42,27 @@ function event(overrides: Partial<TransferEvent> = {}): TransferEvent {
   };
 }
 
-test('applyScan is idempotent and the cursor is monotonic', () => {
-  const store = openSqliteStore(':memory:');
+test('applyScan is idempotent and the cursor is monotonic', async () => {
+  const { store } = await createTestStore();
   try {
     const events = [event()];
-    applyScan(store, events, block(12n));
-    applyScan(store, events, block(11n));
+    await applyScan(store, events, block(12n));
+    await applyScan(store, events, block(11n));
 
-    const [holding] = store.holdings('ethereum', account);
+    const [holding] = await store.holdings('ethereum', account);
     expect(holding.sentCount).toBe(1);
     expect(holding.receivedCount).toBe(0);
     expect(holding.firstBlock).toBe(10n);
     expect(holding.lastBlock).toBe(10n);
-    expect(store.getCursor('ethereum', account)?.number).toBe(12n);
-    expect(store.getCursor('ethereum', account)?.hash).toBe(block(12n).hash);
+    expect((await store.getCursor('ethereum', account))?.number).toBe(12n);
+    expect((await store.getCursor('ethereum', account))?.hash).toBe(block(12n).hash);
   } finally {
-    store.close();
+    await store.close();
   }
 });
 
-test('NFT held flag only follows the newest block and log index', () => {
-  const store = openSqliteStore(':memory:');
+test('NFT held flag only follows the newest block and log index', async () => {
+  const { store } = await createTestStore();
   try {
     const incoming = event({
       standard: 'erc721',
@@ -93,55 +92,57 @@ test('NFT held flag only follows the newest block and log index', () => {
       transactionHash: '0x04' as Hex,
     });
 
-    applyScan(store, [incoming, olderOutgoing], block(20n));
-    expect(store.nftItems('ethereum', account)[0]?.heldBySeenLogs).toBe(true);
+    await applyScan(store, [incoming, olderOutgoing], block(20n));
+    expect((await store.nftItems('ethereum', account))[0]?.heldBySeenLogs).toBe(true);
 
-    applyScan(store, [newerOutgoing], block(21n));
-    const [item] = store.nftItems('ethereum', account);
+    await applyScan(store, [newerOutgoing], block(21n));
+    const [item] = await store.nftItems('ethereum', account);
     expect(item.heldBySeenLogs).toBe(false);
     expect(item.tokenId).toBe(42n);
     expect(item.lastBlock).toBe(21n);
   } finally {
-    store.close();
+    await store.close();
   }
 });
 
-test('a database from another schema version is dropped and rebuilt', () => {
-  const directory = mkdtempSync(join(tmpdir(), 'i-see-u-store-'));
-  const path = join(directory, 'old.sqlite');
-  const old = new DatabaseSync(path);
-  old.exec(`CREATE TABLE account_cursor (network TEXT, account TEXT, scanned_to INTEGER); INSERT INTO account_cursor VALUES ('ethereum', '${account}', 12);`);
-  old.close();
-
+test('running the Drizzle migrator twice is a no-op', async () => {
+  const { db, store } = await createTestStore();
   try {
-    let store = openSqliteStore(path);
-    expect(store.getCursor('ethereum', account)).toBeUndefined();
-    applyScan(store, [], block(15n));
-    store.close();
-    store = openSqliteStore(path); // same version: kept
-    expect(store.getCursor('ethereum', account)?.hash).toBe(block(15n).hash);
-    store.close();
+    await migrate(db, { migrationsFolder });
+    await applyScan(store, [], block(15n));
+    expect((await store.getCursor('ethereum', account))?.hash).toBe(block(15n).hash);
   } finally {
-    rmSync(directory, { recursive: true, force: true });
+    await store.close();
   }
 });
 
-test('a chunk straddling applied progress is rejected and the logs range round-trips', () => {
-  const store = openSqliteStore(':memory:');
+test('a chunk straddling applied progress is rejected and the logs range round-trips', async () => {
+  const { store } = await createTestStore();
   try {
-    store.applyScanChunk('ethereum', account, { fromBlock: 0n, toBlock: 10n }, aggregateOf([event()]));
-    store.applyScanChunk('ethereum', account, { fromBlock: 0n, toBlock: 10n }, aggregateOf([event()]));
-    expect(store.holdings('ethereum', account)[0]?.sentCount).toBe(1);
-    expect(() => store.applyScanChunk('ethereum', account, { fromBlock: 5n, toBlock: 20n }, aggregateOf([])))
-      .toThrow('overlaps applied progress');
-    expect(store.getProgress('ethereum', account)).toBe(10n);
+    await store.applyScanChunk('ethereum', account, { fromBlock: 0n, toBlock: 10n }, aggregateOf([event()]));
+    await store.applyScanChunk('ethereum', account, { fromBlock: 0n, toBlock: 10n }, aggregateOf([event()]));
+    expect((await store.holdings('ethereum', account))[0]?.sentCount).toBe(1);
+    await expect(store.applyScanChunk('ethereum', account, { fromBlock: 5n, toBlock: 20n }, aggregateOf([])))
+      .rejects.toThrow('overlaps applied progress');
+    expect(await store.getProgress('ethereum', account)).toBe(10n);
 
-    expect(store.getLogsRange('ethereum', account)).toBeUndefined();
-    store.setLogsRange('ethereum', account, 750n);
-    store.setLogsRange('ethereum', account, 1500n);
-    expect(store.getLogsRange('ethereum', account)).toBe(1500n);
+    expect(await store.getLogsRange('ethereum', account)).toBeUndefined();
+    await store.setLogsRange('ethereum', account, 750n);
+    await store.setLogsRange('ethereum', account, 1500n);
+    expect(await store.getLogsRange('ethereum', account)).toBe(1500n);
   } finally {
-    store.close();
+    await store.close();
+  }
+});
+
+test('the advisory-lock helper runs its callback while holding the transaction lock', async () => {
+  const { db, store } = await createTestStore();
+  try {
+    let called = 0;
+    expect(await withAdvisoryLock(db, 42n, async () => ++called)).toBe(1);
+    expect(called).toBe(1);
+  } finally {
+    await store.close();
   }
 });
 
