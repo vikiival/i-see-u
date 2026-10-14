@@ -19,7 +19,8 @@ Times are local (CEST). "We" is Viktor plus AI agents: a Claude orchestrator han
 | 15:42–15:54 | Postgres 18 and Drizzle | SQLite removed. PGlite in tests |
 | 15:54–16:21+ | Squid SDK, Envio and Ponder research | Squid SDK and Ponder rejected. HyperSync benchmarked live and is very promising for backfill |
 | 15:56–16:52 | Shared finalized follower and balance worker | Warm requests make 0 RPC calls. About 51M credits/month for 5k users |
-| 17:00– | HyperSync `LogSource` for backfill (in progress) | Codex, started from Viktor's main session. Pluggable per-account log source with Quicknode fallback |
+| 17:00– | HyperSync `LogSource` for backfill | Codex, started from Viktor's main session. Landed as an opt-in, experimental source with per-chunk RPC fallback (76 tests) |
+| evening | Realtime tail with reorg handling (in progress) | Jakub: realtime is part of the brief. Opus designed an unfinalized tail overlay, and Codex is implementing it |
 
 ---
 
@@ -258,7 +259,7 @@ Viktor: "We should also now set up Postgres. We agreed on that in the report." T
 4. **It owns the app:** its own schema, process and codegen. Balances via `publicClients` would cost one call per request.
 5. **A backfill-only role** is redundant with HyperSync. SQD's fork `@subsquid/ponder` adds a Portal historical source (beta).
 
-## 12. HyperSync backfill source (in progress, from 17:00)
+## 12. HyperSync backfill source (from 17:00, landed)
 
 After the benchmark, Viktor started a Codex worker from his main session to build the HyperSync backfill. The parallel docs work stayed out of its files. **Planned shape** (taken from the work in progress, not yet reviewed or verified):
 - **A new per-account `AccountLogSource` interface** in `src/core/types.ts`, with implementations in `src/sources/`:
@@ -269,7 +270,51 @@ After the benchmark, Viktor started a Codex worker from his main session to buil
 - **Comparison:** `scripts/compare-sources.ts` compares sources side by side. `test/hypersync.test.ts` holds the unit tests.
 - **Unchanged:** the follower and balances stay on Quicknode. HyperSync serves the chain head, so its ranges must be capped at our RPC-finalized block.
 
-Results, test count and live numbers will be added when it lands.
+**Landed** (`9286c4f`…`6f8a812`, 76 tests):
+- **Source selection:** `LOG_SOURCE` defaults to `rpc`. `auto` picks HyperSync only when `HYPERSYNC_API_KEY` is set, and the native addon is imported only when it is selected.
+- **Query:** HyperSync sends one query for both directions and folds pages as they stream in (never `collect()`). It commits 100k-block chunks in order, always ending at the pinned finalized backfill target (exclusive `target + 1`).
+- **Fallback:** any HyperSync failure reruns the whole uncommitted chunk through RPC, so partial vendor data never reaches the store. After two consecutive failures, a 60 s breaker skips HyperSync.
+- **Results:** normal and NFT accounts matched RPC exactly (1 request vs 172 calls).
+- **Open problem:** on the Binance hot wallet, the integrated stream for a 100k-block chunk (about 1M logs) **hung even with a 600 s timeout**, then fell back to RPC. The standalone benchmark had streamed the same wallet in 13 s. The cause is undiagnosed, so HyperSync ships off by default.
+
+## 13. Realtime tail with reorg handling (evening, in progress)
+
+**Trigger:** Jakub said realtime is part of the brief ("skoro realtime"), so reorgs must be handled. The finalized-only answer from section 4 was no longer enough.
+
+**Corrected premise:** "finalized is about 5 min behind" is wrong. Live, `latest − finalized` was **90 blocks**, and the finalized block was **about 18 min old**. Finality trails by two epochs, which is 64–95 slots (about 13–19 min).
+
+**Research (Opus, about 125 Quicknode calls in a live probe):**
+
+| Option | Verdict |
+|---|---|
+| **Tail overlay**: store every decoded Transfer of the unfinalized blocks (finalized, tip] and overlay them at read time | **Chosen.** The finalized base is never touched, so a reorg only deletes and re-ingests tail rows. Accounts tracked mid-tail are covered, and the follower, backfill and handoff are unchanged |
+| Journal plus rollback of the base tables | Rejected. Counts can be subtracted, but `LEAST`/`GREATEST` first/last block and NFT latest-wins cannot be undone without per-row before-images |
+| Quicknode Streams, WebSocket `newHeads` (billed per notification), HyperSync head | Not now. Each adds a vendor to the hot path and conflicts with "new networks with only JSON-RPC". The head source stays pluggable |
+
+**Measured:**
+- **Logs by block hash:** `eth_getLogs({blockHash})` (EIP-234) works on Quicknode, returning the same logs as by-number in 14–84 ms.
+- **Load balancing:** responses carry varying `x-node-id`. By-number queries can therefore return logs from a different fork than the header we just read, so tail logs are fetched by hash, or every `log.blockHash` is verified.
+- **Visibility:** new blocks became visible **2.0–3.8 s** (median 2.6 s) after their timestamp.
+
+**From literature:** about 4–8 reorgs per day post-merge, about 99.7% of them depth 1.
+
+**Reorg algorithm:**
+- **Steady state:** a new head whose parent is our tip is fetched by hash and appended.
+- **Gap:** fetch the missing headers, check that the hash chain links up, then fetch the range and verify each log's block hash.
+- **Parent mismatch:** walk back to the common ancestor (capped at 64 blocks and never below the finalized cursor), rewind, and re-ingest. If no ancestor is found, wipe the tail and serve finalized.
+- **Lagging head:** a lower head from a lagging node is ignored.
+- **Finalization:** when the follower finalizes blocks, it prunes the tail rows at or below the new cursor in the same transaction, so nothing is double counted.
+
+**Cost:** polling aligned to slots (`latest` at +2.5 s, with retries) costs about 1.2 header calls plus 1 `getLogs` per block. That is about 15.8k calls per day, about **+9.5M credits/month**. Polling `finalized` only at epoch boundaries saves about 3.5M. The total becomes **about 57M/month (about 61M with per-block balances)**, within the 80M Build plan.
+
+**API:**
+- `?finality=latest|finalized`, defaulting to `latest`.
+- `blockHeight` becomes the tail tip; `finalizedBlockHeight`/`finalizedBlockHash` are added.
+- Per token, unfinalized sent and received counts are reported.
+- An unhealthy tail degrades to finalized and reports `tailError`.
+- Balances are read at the tip hash.
+
+**Implementation:** a Codex worker (gpt-5.6-sol) is building it from a brief based on this design. Results will be added when it lands.
 
 ---
 
@@ -296,7 +341,7 @@ Results, test count and live numbers will be added when it lands.
 
 | Requirement | Status | Notes |
 |---|---|---|
-| ETH mainnet from block 25,933,634 to now, "almost realtime" | ⚠️ | Finalized only: about 13 min behind the tip, plus up to a 30 s poll. A deliberate trade for zero reorg handling. Scope answer 3 said "a few seconds", so this is the main point to defend or revisit |
+| ETH mainnet from block 25,933,634 to now, "almost realtime" | ⚠️ → in progress | Today: finalized only, about 13–19 min behind the tip. Jakub asked for realtime with reorgs, and the tail overlay (§13) targets about 3 s behind the tip |
 | Technology choice with reasons | ✅ | REPORT §6 |
 | REST endpoint: ERC-20 tokens the address interacted with | ✅ | `GET /v1/ethereum/accounts/{addr}/erc20` |
 | Balance parameter | ✅ | `?balances=true`. Each token has its own `balanceBlock` |
@@ -314,7 +359,8 @@ Results, test count and live numbers will be added when it lands.
 ## Next
 
 1. **Push the repo** and share it.
-2. **Finish the HyperSync backfill source (in progress, §12):** `stream()` with the OR query, `JoinNothing`, `to_block` capped at RPC finalized, Quicknode as fallback, and a canary check against silent empty results. Check the Linux napi build first.
-3. **Presentation:** the arc above, the chunk-size table, the cost table, and the finalized-only trade-off.
-4. **Tuning:** raise `RPC_MAX_RPS` toward the plan's 50 (normal cold scan about 3.5 s). Verify credits per call and per batch on the Quicknode dashboard.
-5. **Known limits to decide on:** multi-replica state (active set, balance-worker leader), untracking idle accounts, holdings from before the start block, spam flags, native ETH, and a realtime tail if 13 min is too slow.
+2. **Land the realtime tail (§13),** then live-check it: follow the tip, and observe a real reorg or simulate one.
+3. **Diagnose the HyperSync Binance stream hang (§12)** before turning `LOG_SOURCE=auto` on by default. Also check the Linux napi build.
+4. **Presentation:** the arc above, the chunk-size table, the cost table, and the path from finalized-only to the realtime tail.
+5. **Tuning:** raise `RPC_MAX_RPS` toward the plan's 50 (normal cold scan about 3.5 s). Verify credits per call and per batch on the Quicknode dashboard.
+6. **Known limits to decide on:** multi-replica state (active set, balance-worker leader), untracking idle accounts, holdings from before the start block, spam flags, and native ETH.
