@@ -54,6 +54,7 @@ export function createFollower(o: FollowerOptions): Follower {
   let ticking: Promise<void> | undefined;
   let loop: Promise<void> | undefined;
   let wake = (): void => {};
+  let kicked = false;
 
   /** Fetch, fold and commit one range; false when it must be refetched because the tracked set grew. */
   const applyRange = async (range: BlockRange, head: BlockRef): Promise<boolean> => {
@@ -124,8 +125,10 @@ export function createFollower(o: FollowerOptions): Follower {
       stopped = false;
       loop = (async () => {
         while (!stopped) {
+          kicked = false;
           await tick();
           if (stopped) break;
+          if (kicked) continue;
           await new Promise<void>((resolve) => {
             const timer = setTimeout(resolve, o.pollMs);
             wake = () => {
@@ -168,6 +171,11 @@ export function createFollower(o: FollowerOptions): Follower {
         stale: lastError !== undefined || lagBlocks > STALE_LAG_BLOCKS || idleMs > o.staleAfterMs,
         unhealthy,
       };
+    },
+
+    kick() {
+      kicked = true;
+      wake();
     },
 
     track(account) {

@@ -5,7 +5,7 @@ import { createEvmAdapter } from '../src/chains/evm/adapter.ts';
 import { TRANSFER_TOPIC } from '../src/chains/evm/logs.ts';
 import { MULTICALL3 } from '../src/chains/evm/multicall.ts';
 import { addTransfer, emptyAggregate } from '../src/core/aggregate.ts';
-import type { Address, BlockRef, ChainAdapter, ChunkAggregate, Hex, RpcClient, TransferEvent } from '../src/core/types.ts';
+import type { Address, BlockHeader, BlockRef, ChainAdapter, ChunkAggregate, Hex, RpcClient, TransferEvent } from '../src/core/types.ts';
 import { RpcError } from '../src/rpc/errors.ts';
 import { createRpcLogSource } from '../src/sources/rpc-logs.ts';
 
@@ -35,9 +35,14 @@ export class FakeChain {
   /** Awaited before answering eth_getLogs (e.g. a gate the test releases). */
   beforeLogs?: (filter: LogFilter) => Promise<void> | void;
   failHead = false;
+  mismatchRangeLogHash = false;
+  readonly unknownBlockOnce = new Set<Hex>();
   /** Every eth_call received, as the decoded aggregate3 call count. */
   multicallSizes: number[] = [];
   private logsPerBlock = new Map<bigint, number>();
+  private headers = new Map<bigint, BlockHeader>();
+  private fork = 0n;
+  private removed = new Set<TransferEvent>();
 
   constructor(finalized: bigint) {
     this.finalized = finalized;
@@ -47,16 +52,53 @@ export class FakeChain {
     return Object.values(this.calls).reduce((a, b) => a + b, 0);
   }
 
-  addTransfer(t: Omit<TransferEvent, 'transactionHash' | 'logIndex' | 'standard'> & Partial<TransferEvent>): TransferEvent {
+  private ensureHeaders(to: bigint): void {
+    for (let number = 0n; number <= to; number += 1n) {
+      if (this.headers.has(number)) continue;
+      this.headers.set(number, {
+        number,
+        hash: blockHash(number),
+        parentHash: number === 0n ? blockHash(0n) : this.headers.get(number - 1n)!.hash,
+        timestamp: number * 12n,
+      });
+    }
+  }
+
+  addTransfer(t: Omit<TransferEvent, 'transactionHash' | 'logIndex' | 'standard' | 'blockHash'> & Partial<TransferEvent>): TransferEvent {
+    this.ensureHeaders(t.blockNumber);
     const event: TransferEvent = {
       standard: 'erc20',
       logIndex: this.logsPerBlock.get(t.blockNumber) ?? 0,
       transactionHash: blockHash(BigInt(this.transfers.length + 1) * 1_000_000n),
+      blockHash: this.headers.get(t.blockNumber)!.hash,
       ...t,
     };
     this.logsPerBlock.set(event.blockNumber, Math.max(this.logsPerBlock.get(event.blockNumber) ?? 0, event.logIndex) + 1);
     this.transfers.push(event);
     return event;
+  }
+
+  addRemovedTransfer(t: Parameters<FakeChain['addTransfer']>[0]): TransferEvent {
+    const event = this.addTransfer(t);
+    this.removed.add(event);
+    return event;
+  }
+
+  /** Replace the last depth blocks at latest (or finalized), including their logs, with a new hash chain. */
+  reorg(depth: number, newLogs: Parameters<FakeChain['addTransfer']>[0][]): void {
+    const head = this.latest ?? this.finalized;
+    const ancestor = head - BigInt(depth);
+    this.ensureHeaders(head);
+    this.transfers = this.transfers.filter((event) => event.blockNumber <= ancestor);
+    this.fork += 1n;
+    let parentHash = this.headers.get(ancestor)!.hash;
+    for (let number = ancestor + 1n; number <= head; number += 1n) {
+      const hash = `0x${(this.fork * 10n ** 12n + number).toString(16).padStart(64, 'c')}` as Hex;
+      this.headers.set(number, { number, hash, parentHash, timestamp: number * 12n });
+      parentHash = hash;
+      this.logsPerBlock.delete(number);
+    }
+    for (const event of newLogs) this.addTransfer(event);
   }
 
   /** What a perfect indexer would hold for `account` from `fromBlock` through `toBlock`. */
@@ -67,7 +109,9 @@ export class FakeChain {
   }
 
   private block(n: bigint) {
-    return { number: hex(n), hash: blockHash(n), parentHash: blockHash(n - 1n), timestamp: hex(n * 12n), transactions: [] };
+    this.ensureHeaders(n);
+    const header = this.headers.get(n)!;
+    return { number: hex(n), hash: header.hash, parentHash: header.parentHash, timestamp: hex(header.timestamp), transactions: [] };
   }
 
   private wireLog(e: TransferEvent) {
@@ -78,9 +122,10 @@ export class FakeChain {
       topics,
       data: e.standard === 'erc721' ? '0x' : pad(hex(e.value), { size: 32 }),
       blockNumber: hex(e.blockNumber),
-      blockHash: blockHash(e.blockNumber),
+      blockHash: e.blockHash,
       transactionHash: e.transactionHash,
       logIndex: hex(e.logIndex),
+      removed: this.removed.has(e),
     };
   }
 
@@ -94,13 +139,28 @@ export class FakeChain {
         return this.block(n) as T;
       }
       if (method === 'eth_getLogs') {
-        const f = params[0] as { fromBlock: Hex; toBlock: Hex; topics: (Hex | null)[] };
-        const filter = { fromBlock: BigInt(f.fromBlock), toBlock: BigInt(f.toBlock), filtered: f.topics.length > 1 };
+        const f = params[0] as { fromBlock?: Hex; toBlock?: Hex; blockHash?: Hex; topics: (Hex | null)[] };
+        let fromBlock: bigint;
+        let toBlock: bigint;
+        if (f.blockHash) {
+          if (this.unknownBlockOnce.delete(f.blockHash)) throw new RpcError('transient', 'unknown block');
+          const header = [...this.headers.values()].find((block) => block.hash === f.blockHash);
+          if (!header) throw new RpcError('transient', 'unknown block');
+          fromBlock = toBlock = header.number;
+        } else {
+          fromBlock = BigInt(f.fromBlock!);
+          toBlock = BigInt(f.toBlock!);
+        }
+        const filter = { fromBlock, toBlock, filtered: f.topics.length > 1 };
         await this.beforeLogs?.(filter);
         const topicOf = (a: Address) => pad(a, { size: 32 });
         return this.transfers.filter((e) => e.blockNumber >= filter.fromBlock && e.blockNumber <= filter.toBlock
+          && (!f.blockHash || e.blockHash === f.blockHash)
           && (!f.topics[1] || f.topics[1] === topicOf(e.from))
-          && (!f.topics[2] || f.topics[2] === topicOf(e.to))).map((e) => this.wireLog(e)) as T;
+          && (!f.topics[2] || f.topics[2] === topicOf(e.to))).map((e, index) => {
+            const log = this.wireLog(e);
+            return this.mismatchRangeLogHash && !f.blockHash && index === 0 ? { ...log, blockHash: blockHash(9_999_999n) } : log;
+          }) as T;
       }
       if (method === 'eth_call') {
         const [{ data }, { blockHash: at }] = params as [{ data: Hex }, { blockHash: Hex }];

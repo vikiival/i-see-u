@@ -51,6 +51,7 @@ const log = (options: {
 }): Log => ({
   address: options.token ?? ERC20,
   blockNumber: options.block,
+  blockHash: hash(options.block),
   logIndex: options.index,
   transactionHash: hash(options.block * 10 + options.index),
   topics: [
@@ -273,7 +274,11 @@ test('a mid-stream failure commits nothing; the next discovery resumes the same 
     network: 'ethereum', startBlock: 10n, accountLogs: source, scanConcurrency: 1, followerMaxRange: 100n,
     normalizeAddress: (value) => /^0x[0-9a-f]{40}$/i.test(value) ? value.toLowerCase() as Address : undefined,
     async finalizedHead() { return { block: { number: 20n, hash: hash(20), timestamp: 200n }, lastProgressAt: 1, stale: false }; },
+    async latestHeader() { return { number: 20n, hash: hash(20), parentHash: hash(19), timestamp: 200n }; },
     async blockByNumber(number) { return { number, hash: hash(Number(number)), timestamp: number * 10n }; },
+    async headerByNumber(number) { return { number, hash: hash(Number(number)), parentHash: hash(Number(number - 1n)), timestamp: number * 10n }; },
+    async transfersInBlock() { return []; },
+    async transfersInRange() { return []; },
     async scanAllTransfers() { return { calls: 0 }; },
     async erc20BalancePairs(): Promise<BalanceResult[]> { return []; },
     async erc721Owners(): Promise<OwnerResult[]> { return []; },

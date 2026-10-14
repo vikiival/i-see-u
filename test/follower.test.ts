@@ -386,3 +386,35 @@ test('a restarted follower serves its persisted cursor after load(), before its 
     await s.close();
   }
 });
+
+test('kick() wakes a follower with a long fallback poll, even when it arrives during a tick', async () => {
+  const chain = new FakeChain(1_000n);
+  const { store } = await createTestStore();
+  const follower = createFollower({
+    adapter: chain.adapter(), store, pollMs: 3_600_000, maxLagBlocks: 96n, staleAfterMs: 1e6, maxNoAdvanceMs: 1e7,
+  });
+  const until = async (done: () => boolean) => { for (let i = 0; i < 200 && !done(); i += 1) await new Promise((r) => setTimeout(r, 5)); };
+  try {
+    follower.start();
+    await until(() => follower.status().cursor?.number === 1_000n);
+    chain.finalized = 1_032n;
+    follower.kick();
+    await until(() => follower.status().cursor?.number === 1_032n);
+    expect(follower.status().cursor?.number).toBe(1_032n);
+
+    const stuck = gate();
+    chain.beforeLogs = () => stuck.opened;
+    chain.finalized = 1_064n;
+    follower.kick();
+    await until(() => follower.status().headNumber === 1_064n);
+    chain.finalized = 1_096n;
+    follower.kick(); // during the tick that is waiting on getLogs
+    chain.beforeLogs = undefined;
+    stuck.release();
+    await until(() => follower.status().cursor?.number === 1_096n);
+    expect(follower.status().cursor?.number).toBe(1_096n);
+  } finally {
+    await follower.stop();
+    await store.close();
+  }
+});

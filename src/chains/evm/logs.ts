@@ -2,7 +2,7 @@ import { decodeEventLog, encodeEventTopics, isAddress, isHex, pad, parseAbiItem 
 
 import { addTransfer, aggregateLogCount, emptyAggregate } from '../../core/aggregate.ts';
 import type { Address, BlockRange, ChunkScan, Hex, RpcClient, TransferDirection, TransferEvent } from '../../core/types.ts';
-import { rpcErrorOf } from '../../rpc/errors.ts';
+import { RpcError, rpcErrorOf } from '../../rpc/errors.ts';
 
 const erc20Transfer = parseAbiItem('event Transfer(address indexed from, address indexed to, uint256 value)');
 const erc721Transfer = parseAbiItem('event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)');
@@ -21,8 +21,10 @@ export interface WireLog {
   topics?: unknown;
   data?: unknown;
   blockNumber?: unknown;
+  blockHash?: unknown;
   transactionHash?: unknown;
   logIndex?: unknown;
+  removed?: unknown;
 }
 
 const quantity = (value: unknown): bigint => {
@@ -32,10 +34,11 @@ const quantity = (value: unknown): bigint => {
 
 /** Decode and normalize an eth_getLogs Transfer entry strictly; malformed/non-Transfer logs are skipped. */
 export function decodeTransferLog(log: WireLog): TransferEvent | undefined {
+  if (log.removed === true) return undefined;
   const { topics } = log;
   if (!Array.isArray(topics) || (topics.length !== 3 && topics.length !== 4)) return undefined;
   if (typeof log.address !== 'string' || !isAddress(log.address, { strict: false })) return undefined;
-  if (!isHex(log.transactionHash) || !isHex(log.data)) return undefined;
+  if (!isHex(log.transactionHash) || !isHex(log.blockHash) || !isHex(log.data)) return undefined;
   try {
     const standard = topics.length === 3 ? 'erc20' : 'erc721';
     const { args } = decodeEventLog({
@@ -54,12 +57,60 @@ export function decodeTransferLog(log: WireLog): TransferEvent | undefined {
       to: to.toLowerCase() as Address,
       value: (value ?? tokenId)!,
       blockNumber: quantity(log.blockNumber),
+      blockHash: log.blockHash.toLowerCase() as Hex,
       logIndex: Number(logIndex),
       transactionHash: log.transactionHash.toLowerCase() as Hex,
     };
   } catch {
     return undefined;
   }
+}
+
+const getLogs = (rpc: RpcClient, filter: Record<string, unknown>): Promise<WireLog[]> => rpc.request('eth_getLogs', [filter], {
+  validate: Array.isArray,
+});
+
+/** EIP-234 block-hash query: one canonical block, never a same-height block from another backend. */
+export async function transfersInBlock(rpc: RpcClient, blockHash: Hex): Promise<TransferEvent[]> {
+  const raw = await getLogs(rpc, { blockHash, topics: [TRANSFER_TOPIC] });
+  const events: TransferEvent[] = [];
+  for (const log of raw) {
+    if (log.removed === true) continue;
+    if (!isHex(log.blockHash) || log.blockHash.toLowerCase() !== blockHash) {
+      throw new RpcError('transient', 'Log block hash does not match requested block');
+    }
+    const event = decodeTransferLog(log);
+    if (event) events.push(event);
+  }
+  return events;
+}
+
+/**
+ * Catch-up by number (splits on too_large/timeout like the follower), accepted only when every log belongs to the
+ * supplied canonical header: a load-balanced node may answer from another fork.
+ */
+export async function transfersInRange(
+  rpc: RpcClient,
+  range: BlockRange,
+  headers: { number: bigint; hash: Hex }[],
+): Promise<TransferEvent[]> {
+  const expected = new Map(headers.map((header) => [header.number, header.hash]));
+  const events: TransferEvent[] = [];
+  await scanLogs(rpc, [TRANSFER_TOPIC], range, (log) => {
+    if (log.removed === true) return;
+    let number: bigint;
+    try {
+      number = quantity(log.blockNumber);
+    } catch {
+      throw new RpcError('transient', 'Log has no valid block number');
+    }
+    if (!isHex(log.blockHash) || expected.get(number) !== log.blockHash.toLowerCase()) {
+      throw new RpcError('transient', `Log block hash does not match header at ${number}`);
+    }
+    const event = decodeTransferLog(log);
+    if (event) events.push(event);
+  });
+  return events;
 }
 
 interface LogsScanStats {

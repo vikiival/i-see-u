@@ -40,7 +40,7 @@ export function classify(httpStatus: number | undefined, error: unknown): RpcErr
   if (/method not (?:available|found)|archive requests? require|please specify an address/.test(message)) return 'unsupported';
 
   if (
-    /timed? ?out|timeout|econnreset|econnrefused|socket hang up|network error|fetch failed|header not found|unknown block/.test(message)
+    /timed? ?out|timeout|econnreset|econnrefused|socket hang up|network error|fetch failed|header not found|header for hash not found|unknown block|block not found/.test(message)
   ) return 'transient';
 
   return 'fatal';

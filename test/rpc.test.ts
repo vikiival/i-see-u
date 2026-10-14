@@ -35,6 +35,7 @@ test('classify recognizes provider, HTTP, and network failures', () => {
     [undefined, { code: 'ECONNRESET' }, 'transient'],
     [undefined, { message: 'header not found' }, 'transient'],
     [undefined, { message: 'unknown block' }, 'transient'],
+    [undefined, { message: 'header for hash not found' }, 'transient'],
     [undefined, { message: 'execution reverted' }, 'fatal'],
     [undefined, { code: -32602, message: 'invalid params' }, 'fatal'],
   ];

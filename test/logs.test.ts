@@ -36,6 +36,7 @@ test('decodeEventLog-based decoding handles ERC-20 and ERC-721 wire logs', () =>
     to: ACCOUNT,
     value: 123n,
     blockNumber: 12n,
+    blockHash: hash(12n),
     logIndex: 1,
     transactionHash: hash(112n),
   });

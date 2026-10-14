@@ -3,7 +3,7 @@ import type { Chain } from 'viem';
 
 import type { AccountLogSource, Address, ChainAdapter, RpcClient } from '../../core/types.ts';
 import { createHeadTracker } from './head.ts';
-import { scanAllTransfers } from './logs.ts';
+import { scanAllTransfers, transfersInBlock, transfersInRange } from './logs.ts';
 import { readErc20BalancePairs, readErc721Owners } from './multicall.ts';
 
 /** Default time a finalized-head observation is shared by all callers before asking the node again. */
@@ -35,8 +35,12 @@ export function createEvmAdapter(rpc: RpcClient, o: EvmAdapterOptions): ChainAda
     followerMaxRange: o.followerMaxRange,
     normalizeAddress: (input) => isAddress(input, { strict: false }) ? input.toLowerCase() as Address : undefined,
     finalizedHead: head.finalizedHead,
+    latestHeader: head.latestHeader,
     cachedLatestBlockNumber: head.latestBlockNumber,
     blockByNumber: head.blockByNumber,
+    headerByNumber: head.blockByNumber,
+    transfersInBlock: (blockHash) => transfersInBlock(rpc, blockHash),
+    transfersInRange: (range, headers) => transfersInRange(rpc, range, headers),
     scanAllTransfers: (range, onTransfer, accept) => scanAllTransfers(rpc, range, onTransfer, accept),
     erc20BalancePairs: (pairs, blockHash) => readErc20BalancePairs(rpc, pairs, blockHash, o.multicallBatch, o.multicall3),
     erc721Owners: (items, blockHash) => readErc721Owners(rpc, items, blockHash, o.multicallBatch, o.multicall3),

@@ -1,14 +1,14 @@
 import { createPublicClient, custom } from 'viem';
 import type { Chain } from 'viem';
 
-import type { BlockRef, HeadObservation, Hex, RpcClient } from '../../core/types.ts';
+import type { BlockHeader, HeadObservation, Hex, RpcClient } from '../../core/types.ts';
 
 const hexPattern = /^0x[0-9a-f]+$/i;
 
 const validBlock = (value: unknown): boolean => {
   if (!value || typeof value !== 'object') return false;
   const block = value as Record<string, unknown>;
-  return ['number', 'hash', 'timestamp'].every(key => typeof block[key] === 'string' && hexPattern.test(block[key]));
+  return ['number', 'hash', 'parentHash', 'timestamp'].every(key => typeof block[key] === 'string' && hexPattern.test(block[key]));
 };
 
 export interface HeadTracker {
@@ -16,8 +16,9 @@ export interface HeadTracker {
   finalizedHead(): Promise<HeadObservation>;
   /** Highest latest-block number seen by the background refresh in finalizedHead(); never triggers RPC. */
   latestBlockNumber(): bigint | undefined;
+  latestHeader(): Promise<BlockHeader>;
   /** Uncached header of one block by number. */
-  blockByNumber(number: bigint): Promise<BlockRef>;
+  blockByNumber(number: bigint): Promise<BlockHeader>;
 }
 
 export function createHeadTracker(
@@ -39,9 +40,14 @@ export function createHeadTracker(
   let inFlight: Promise<HeadObservation> | undefined;
   let latest: bigint | undefined;
 
-  const fetchBlock = async (at: 'finalized' | 'latest' | bigint): Promise<BlockRef> => {
+  const fetchBlock = async (at: 'finalized' | 'latest' | bigint): Promise<BlockHeader> => {
     const block = await client.getBlock(typeof at === 'bigint' ? { blockNumber: at } : { blockTag: at });
-    return { number: block.number, hash: block.hash.toLowerCase() as Hex, timestamp: block.timestamp };
+    return {
+      number: block.number,
+      hash: block.hash.toLowerCase() as Hex,
+      parentHash: block.parentHash.toLowerCase() as Hex,
+      timestamp: block.timestamp,
+    };
   };
 
   const refresh = async (): Promise<HeadObservation> => {
@@ -75,6 +81,7 @@ export function createHeadTracker(
       return inFlight;
     },
     latestBlockNumber: () => latest,
+    latestHeader: () => fetchBlock('latest'),
     blockByNumber: (number) => fetchBlock(number),
   };
 }

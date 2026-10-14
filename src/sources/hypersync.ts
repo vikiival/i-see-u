@@ -51,6 +51,7 @@ const wireLog = (log: Log): WireLog => {
     topics,
     data: log.data,
     blockNumber: integer(log.blockNumber) ? quantity(log.blockNumber) : log.blockNumber,
+    blockHash: log.blockHash,
     transactionHash: log.transactionHash,
     logIndex: integer(log.logIndex) ? quantity(log.logIndex) : log.logIndex,
   };
@@ -99,7 +100,7 @@ export function createHypersyncLogSource(options: HypersyncSourceOptions): Accou
         { include: { topics: [[TRANSFER_TOPIC], [paddedAccount]] } },
         { include: { topics: [[TRANSFER_TOPIC], [], [paddedAccount]] } },
       ],
-      fieldSelection: { log: ['BlockNumber', 'LogIndex', 'TransactionHash', 'Address', 'Topic0', 'Topic1', 'Topic2', 'Topic3', 'Data'] },
+      fieldSelection: { log: ['BlockNumber', 'BlockHash', 'LogIndex', 'TransactionHash', 'Address', 'Topic0', 'Topic1', 'Topic2', 'Topic3', 'Data'] },
     };
     const aggregate = emptyAggregate();
     let stream: HypersyncStream | undefined;

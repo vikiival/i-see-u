@@ -13,6 +13,10 @@ export interface BlockRef {
   timestamp: bigint;
 }
 
+export interface BlockHeader extends BlockRef {
+  parentHash: Hex;
+}
+
 export interface HeadObservation {
   block: BlockRef;
   /** Epoch milliseconds when the head last advanced to a higher block number. */
@@ -34,6 +38,7 @@ export interface TransferEvent {
   /** erc20: amount; erc721: tokenId */
   value: bigint;
   blockNumber: bigint;
+  blockHash: Hex;
   logIndex: number;
   transactionHash: Hex;
 }
@@ -115,10 +120,17 @@ export interface ChainAdapter {
   normalizeAddress(input: string): Address | undefined;
   /** Protocol-finalized head used for durable discovery. */
   finalizedHead(): Promise<HeadObservation>;
+  /** Uncached latest header; invalid/null results fail over inside RpcClient. */
+  latestHeader(): Promise<BlockHeader>;
   /** Highest latest-block number seen by finalizedHead()'s background refresh; never triggers RPC. */
   cachedLatestBlockNumber?(): bigint | undefined;
   /** Header of a (finalized) block by number, for cursors that end below the head. */
   blockByNumber(number: bigint): Promise<BlockRef>;
+  headerByNumber(number: bigint): Promise<BlockHeader>;
+  /** Every Transfer in one canonical block, selected by hash (EIP-234). */
+  transfersInBlock(blockHash: Hex): Promise<TransferEvent[]>;
+  /** One by-number catch-up query, rejected if a log does not match the supplied header chain. */
+  transfersInRange(range: BlockRange, headers: BlockHeader[]): Promise<TransferEvent[]>;
   /**
    * Every Transfer in range, unfiltered by address (the follower's source); callers keep ranges <= followerMaxRange.
    * `accept` pre-filters by the from/to address before decoding. Splits on too_large/timeout like scanChunk.
@@ -194,6 +206,9 @@ export interface Holding {
   lastBlock: bigint;
   sentCount: number;
   receivedCount: number;
+  /** Counts contributed by the unfinalized tail; absent on finalized reads. */
+  unfinalizedSentCount?: number;
+  unfinalizedReceivedCount?: number;
 }
 
 export interface NftItem {
@@ -202,6 +217,13 @@ export interface NftItem {
   /** true if the latest seen Transfer of this tokenId (by block, logIndex) was TO the account. */
   heldBySeenLogs: boolean;
   lastBlock: bigint;
+  /** The winning latest Transfer is still in the reorgable tail. */
+  unfinalized?: boolean;
+}
+
+export interface TailBlock {
+  header: BlockHeader;
+  transfers: TransferEvent[];
 }
 
 /** The follower's global cursor; updatedAt is when it last advanced (epoch ms). */
@@ -228,6 +250,9 @@ export interface AccountView {
   cursor: FollowerCursor;
   holdings: Holding[];
   nftItems: NftItem[];
+  /** Matching rows strictly above cursor, read in the same snapshot as the finalized base. */
+  tailTransfers: TransferEvent[];
+  tailTip?: BlockHeader;
 }
 
 export type FollowerApplyResult = { applied: true } | { applied: false; missing: Address[] };
@@ -257,6 +282,12 @@ export interface Store {
     aggregates: Map<Address, ChunkAggregate>,
     known: ReadonlySet<Address>,
   ): Promise<FollowerApplyResult>;
+  getTailBlocks(network: string): Promise<BlockHeader[]>;
+  getTailTip(network: string): Promise<BlockHeader | undefined>;
+  /** Compare-and-append a contiguous hash chain in one transaction. */
+  appendTailBlocks(network: string, expectedParentHash: Hex, blocks: TailBlock[]): Promise<void>;
+  rewindTail(network: string, aboveNumber: bigint): Promise<void>;
+  wipeTail(network: string): Promise<void>;
   /** Highest backfilled block, even if the backfill has not reached its target yet. */
   getProgress(network: string, account: Address): Promise<bigint | undefined>;
   /**
@@ -310,6 +341,30 @@ export interface Follower {
   status(): FollowerStatus;
   /** Add a just-tracked account to the in-memory set (the store re-checks at commit). */
   track(account: Address): void;
+  /** Tick now instead of waiting for pollMs (the tail saw a new epoch). */
+  kick(): void;
+}
+
+export interface TailStatus {
+  enabled: boolean;
+  tipNumber?: bigint;
+  tipHash?: Hex;
+  latestNumber?: bigint;
+  lagBlocks: bigint;
+  reorgs: number;
+  lastReorgDepth?: bigint;
+  lastAdvanceAt: number;
+  lastError?: string;
+  healthy: boolean;
+  tailError?: string;
+}
+
+export interface Tail {
+  load(): Promise<void>;
+  start(): void;
+  stop(): Promise<void>;
+  tick(): Promise<void>;
+  status(): TailStatus;
 }
 
 // ---------------------------------------------------------------------------
@@ -324,7 +379,10 @@ export interface DiscoveryResult {
   blockHeight: bigint; // follower cursor: data valid up to and including this block
   blockHash: Hex;
   blockTimestamp: bigint;
-  finality: 'finalized';
+  finality: 'latest' | 'finalized';
+  finalizedBlockHeight?: bigint;
+  finalizedBlockHash?: Hex;
+  tailError?: string;
   /** When the follower cursor last advanced (epoch ms). */
   lastProgressAt: number;
   stale: boolean;
@@ -354,5 +412,5 @@ export interface DiscoveryService {
    * Validate network and address, track the account, wait up to the request deadline for its backfill
    * (single-flight per account), then read from the database. Never calls RPC once the account is backfilled.
    */
-  discover(network: string, account: string): Promise<DiscoveryResult | SyncingResult>;
+  discover(network: string, account: string, finality?: 'latest' | 'finalized'): Promise<DiscoveryResult | SyncingResult>;
 }
