@@ -94,6 +94,8 @@ export const config = {
     pollOffsetsMs: intList('TAIL_POLL_OFFSETS_MS', '2500,5000,9000'),
     /** Serve `latest` only while the tail tip block is at most this old (5 slots: up to 4 missed slots). */
     maxTipAgeMs: int('TAIL_MAX_TIP_AGE_MS', '60000'),
+    /** Stop appending this far above the finalized cursor (~3.4 h; normally 64-95): bounds the tail if finality stalls. */
+    maxAheadBlocks: BigInt(int('TAIL_MAX_AHEAD_BLOCKS', '1024')),
   },
   balances: {
     /** Accounts whose balances were requested within this window are refreshed by the shared worker. */

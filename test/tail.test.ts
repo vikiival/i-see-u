@@ -296,6 +296,27 @@ test('lastProgressAt is the tip time when the serving process never advanced the
   }
 });
 
+test('the tail stops appending maxAheadBlocks above the cursor and degrades to finalized', async () => {
+  const chain = new FakeChain(100n);
+  chain.latest = 150n;
+  const s = await stack(chain);
+  try {
+    let wakes = 0;
+    const bounded = createTail({ adapter: s.adapter, store: s.store, follower: s.follower, maxAheadBlocks: 4n, onEpoch: () => { wakes += 1; } });
+    for (let i = 0; i < 3; i += 1) await bounded.tick();
+    const tipNumber = (await s.store.getTailTip('ethereum'))!.number;
+    expect(tipNumber - chain.finalized).toBeLessThanOrEqual(4n);
+    expect(bounded.status()).toMatchObject({ healthy: false, tailError: expect.stringMatching(/finality/) });
+    expect(wakes).toBeGreaterThan(0);
+    const result = await ready({ ...s, discovery: createDiscoveryService({
+      adapters: { ethereum: s.adapter }, store: s.store, followers: { ethereum: s.follower }, tails: { ethereum: bounded },
+    }) });
+    expect(result).toMatchObject({ finality: 'finalized', blockHeight: 100n, tailError: expect.stringMatching(/finality/) });
+  } finally {
+    await s.close();
+  }
+});
+
 test('API finality overlays tail-only tokens and balances at the tip hash; finalized keeps the base shape', async () => {
   const chain = new FakeChain(100n);
   chain.latest = 101n;
