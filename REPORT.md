@@ -1,6 +1,6 @@
 # Token discovery PoC: technology and architecture proposal
 
-Status: proposal, revision 2. No code yet.
+Status: proposal, revision 2. What is implemented is in section 0.1.
 
 What changed since revision 1:
 - The authors clarified that "full indexer" means walking blocks, transactions and native transfers (Blockbook-style account discovery). An index of ERC-20/721 `Transfer` logs only is therefore in scope.
@@ -25,14 +25,22 @@ The PoC was built in phases, so it differs from the target design in sections 1�
 
 | Area | Target design (below) | Implemented now |
 |---|---|---|
-| Discovery | Global ingestion of all Transfer logs | **On-demand per account:** address-filtered `eth_getLogs` in 10k-block chunks (52 calls on first request), then only new blocks |
-| Storage | Postgres | **PostgreSQL 18** via Drizzle ORM; one row per `(account, token)`, no per-transfer rows; generated migrations run at startup |
-| Consistency | Confirmation depth plus reorg rollback | **Finalized model:** only finalized blocks are persisted, and the cursor stores the block hash. Reorg-safe by construction, but about 13 min behind the tip |
-| Realtime | Follower at head | **Next phase:** tail from finalized to head, scanned per request and merged in memory, plus a shared follower |
-| Balances | Cached and invalidated by the follower | **Read per request** via Multicall3 at the response block. No cache yet, so 5k users once a minute does not fit within RPC limits until the follower lands |
+| Discovery | Global ingestion of all Transfer logs | **Hybrid:** a shared finalized follower reads every `Transfer` log once (unfiltered `eth_getLogs`, ≤ 500-block ranges, one call per 32-block epoch at the head) and applies it for **tracked** accounts only. A new account is backfilled once with address-filtered `getLogs` up to the follower cursor at tracking time (handoff target C); the follower owns every block above C. Not a full global index of all holders |
+| Storage | Postgres | **PostgreSQL 18** via Drizzle ORM; one row per `(account, token)`, no per-transfer rows; global `follower_cursor`, `tracked_accounts(backfill_target)`, `balance_snapshots`; generated migrations run at startup |
+| Consistency | Confirmation depth plus reorg rollback | **Finalized only (decided):** only finalized blocks are persisted, cursors store the block hash. Reorg-safe by construction, no realtime tail, about 13 min behind the tip |
+| Single writer | Advisory lock | **Session advisory lock** on a dedicated connection for the follower's lifetime; commits also lock the cursor row and refuse non-contiguous ranges |
+| Balances | Cached and invalidated by the follower | **Shared balance worker:** every minute and on each follower advance, all active (account, token) pairs are re-read at the follower cursor (by hash) in 1,000-call Multicall3 batches and stored with their block. A request serves the snapshot (`balanceBlock` per token); only an account without a snapshot is read on the request path (single-flight) |
+| Request path | DB only | **DB only once backfilled:** zero RPC per request; cold backfills (202 `syncing` past a 10 s deadline), first balance reads and `verifyOwnership` go through bounded limiters (503 + `Retry-After` on overload) |
 | viem / RPC boundary | viem plus a resilient RPC pool | **viem on top of `RpcClient`:** viem provides types, standard ABIs, topic/calldata encoding, strict decoding, and block/call actions. `RpcClient` alone performs HTTP and owns retries, endpoint failover, circuit breakers, unsupported-method memory, error classification, result validation, rate limiting, and per-attempt stats. viem retries and call batching are disabled. Hybrid transport: viem `http()` (one per endpoint, `retryCount: 0`, no batching) does request building, timeouts and response parsing, while `RpcClient` keeps all retry/failover/classification policy, because viem's would retry `-32005` range errors instead of splitting, miss Quicknode `-32010`, not fail over on null results, lack a breaker, ignore a Retry-After cap and hide retried attempts from billing stats; viem's `fallback` is not used |
 
-Measured live on Quicknode (2026-10-14):
+Measured live with the follower (Quicknode, 2026-10-14):
+- Follower advance of one epoch (32 blocks): **1 `eth_getLogs`**, plus 2 `eth_getBlockByNumber` (finalized + latest) per 30 s poll.
+- Balance refresh of 109 active pairs: **1 `eth_call`**, at the new cursor right after the advance (and every 60 s).
+- 10 warm requests (ERC-20 with balances, ERC-721): **0 RPC calls**, 7–12 ms each.
+- Cold backfill of an active account over 257,541 blocks: 172 calls, about 26 s (two 202 `syncing` responses first); 109 tokens.
+- Acceptance test (fake RPC): 5k tracked accounts × 10 tokens → 1 `getLogs` for the epoch, 50 `eth_call` for 50k pairs, then 0 calls for 5k requests.
+
+Measured live on Quicknode before the follower (2026-10-14):
 - Cold scan of an active account: 2.4–2.6 s and 52 calls. Warm scan: 13–19 ms.
 - Binance hot wallet (about 2.5M transfers in the window): 81 s cold, which is mostly client-side JSON parsing.
 - A topic0-only `getLogs` over 1,000 blocks: 701,764 logs, 446 MB, 4 s. There was no result cap on the demo endpoint.
@@ -109,23 +117,25 @@ Open on SQD: whether topic filters need lowercase, 32-byte-padded values, and th
 
 ## 4. Cost (Quicknode credits)
 
-Assumptions: 5k users, about 10 tokens each, 20 credits per call, 7,200 blocks per day.
+Assumptions: 5k users, about 10 tokens each, 20 credits per call, 7,200 blocks per day. Steady-state rows are what the implemented follower and balance worker do (measured call counts in section 0.1).
 
 | Item | Calls | Credits |
 |---|---|---|
-| Global backfill, 256k blocks. Measured on Quicknode: a topic0-only query over 1,000 blocks returns in about 4 s | about 256 once | **about 5k once** |
-| Follower, 1 `getLogs` per finalized epoch (32 blocks) | about 225/day | about 0.14M/month |
-| Head tracking, `finalized` plus `latest` (for lag reporting) about once a minute | about 2.9k/day | about 1.7M/month |
-| Balance worker: full re-read of 50k pairs at 1,000 per Multicall (measured safe up to 2,000), so 50 calls per refresh, once a minute | 72k/day | about 43M/month |
-| **Total** | | **about 45M/month, fits Build (80M)** *(estimate)* |
+| Cold backfill per new account (address-filtered, 3k-block chunks over 257k blocks; measured) | about 172 once per account; 5k accounts ≈ 860k once | **about 17M once** |
+| Follower, 1 unfiltered `getLogs` per finalized epoch (32 blocks; measured) | about 225/day | about 0.14M/month |
+| Head polling, `finalized` plus `latest` every 30 s (`FOLLOWER_POLL_MS`) | about 5.8k/day | about 3.5M/month |
+| Balance worker: 50k active pairs at 1,000 per Multicall, so 50 calls per refresh, every 60 s plus once per follower advance (the timer restarts at each advance, about +10%) | about 79k/day | about 47M/month |
+| First balance read per newly active account | 1 per account activation | small |
+| Request path for backfilled accounts (measured) | 0 | 0 |
+| **Total steady state** | | **about 51M/month, fits Build (80M)** |
 
-*(Correction to revision 2:* the earlier 19M total assumed only "dirty" pairs need re-reading. That assumption is invalid (section 5, balance path), so balances are re-read on a cadence. The balance worker is now the dominant cost. Refreshing only accounts polled in the last few minutes, or every 2 minutes, scales it down linearly. Refreshing every block instead (12 s) would cost about 215M/month, which needs Accelerate.)
+*(Correction to revision 2:* the earlier 19M total assumed only "dirty" pairs need re-reading. That assumption is invalid (section 5, balance path), so balances are re-read on a cadence. The balance worker is the dominant cost. Refreshing only accounts polled in the last few minutes (`ACTIVE_ACCOUNT_TTL_MS`, implemented), or every 2 minutes, scales it down linearly. Refreshing every block instead (12 s) would cost about 215M/month, which needs Accelerate.)
 
-For comparison, one Multicall per user request costs 5k × 60 × 24 × 30 × 20 = **4.3B credits/month**. Batching across accounts is what makes the difference: 5,000 requests a minute become 50 calls a minute.
+For comparison, one Multicall per user request costs 5k × 60 × 24 × 30 × 20 = **4.3B credits/month**, and the pre-follower per-account rescan on each finalized advance added about 1.6k `getLogs` per minute. Batching across accounts is what makes the difference: 5,000 requests a minute become 50 calls a minute.
 
-Bandwidth: about 72 GB for the backfill and about 2 GB/day at head *(estimate)*. Credits don't depend on response size per Quicknode's page, but this is worth confirming.
+Bandwidth: about 14 MB per epoch at head, about 3 GB/day *(estimate)*. Credits don't depend on response size per Quicknode's page, but this is worth confirming.
 
-Storage: tens of millions of `(holder, token)` rows, roughly 2–6 GB in Postgres *(estimate, measure during backfill)*.
+Storage: one row per (tracked account, token) plus one balance snapshot per active pair; for 5k accounts × 10 tokens, about 100k rows *(estimate)*.
 
 ## 5. Design
 
