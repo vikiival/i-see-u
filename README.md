@@ -1,6 +1,6 @@
 # i-see-u: token discovery over plain JSON-RPC (PoC)
 
-For an Ethereum account, returns every ERC-20 contract it sent or received (and, as a bonus, ERC-721 collections and token IDs) from block 25,933,634 to Ethereum's finalized head, optionally with balances labelled with the block they were read at. It needs nothing but a JSON-RPC endpoint: no Blockbook, no indexer service. RPC cost is driven by the block rate and the number of active (account, token) pairs, not by request volume: once an account is backfilled, its requests are pure database reads.
+For an Ethereum account, returns every ERC-20 contract it sent or received (and, as a bonus, ERC-721 collections and token IDs) from block 25,933,634 to Ethereum's finalized head, optionally with balances labelled with the block they were read at. It works with only JSON-RPC; an experimental, opt-in Envio HyperSync source (`LOG_SOURCE=auto|hypersync`) can accelerate cold per-account backfills and falls back to RPC per chunk. No Blockbook or full indexer is required. Once an account is backfilled, requests are pure database reads.
 
 Design notes and measurements: [REPORT.md](REPORT.md).
 
@@ -25,6 +25,10 @@ Optional env (numeric values must be positive integers; invalid values fail at s
 |---|---|---|
 | `DATABASE_URL` | `postgresql://iseeu:iseeu@localhost:5432/iseeu` | PostgreSQL connection |
 | `RPC_FALLBACK_URLS` | | Comma-separated endpoints tried after `RPC_URL` |
+| `LOG_SOURCE` | `rpc` | `rpc`, `auto`, or `hypersync`. HyperSync is experimental and off by default; `auto` enables it only when its key is set |
+| `HYPERSYNC_API_KEY` | | Optional token. When absent, auto mode never imports the native addon and uses RPC only |
+| `HYPERSYNC_URL` | network default (`https://eth.hypersync.xyz`) | HyperSync endpoint override |
+| `HYPERSYNC_MAX_RANGE` / `HYPERSYNC_TIMEOUT_MS` | 100000 / 30000 | Blocks per committed HyperSync chunk and whole-stream timeout |
 | `PORT` | 3000 | HTTP port |
 | `RPC_TIMEOUT_MS` / `RPC_MAX_ATTEMPTS` / `RPC_MAX_RPS` | 15000 / 6 / 20 | Per attempt timeout, attempts per call, client-side rate limit |
 | `ETH_FOLLOWER_MAX_RANGE` | 500 | Blocks per unfiltered follower `getLogs` (about 450 KB of JSON per block; must be at most 1000) |
@@ -41,6 +45,12 @@ Optional env (numeric values must be positive integers; invalid values fail at s
 | `BACKFILL_CONCURRENCY` / `BACKFILL_QUEUE` | 4 / 64 | Concurrent account backfills, and how many more may wait before requests get 503 |
 | `REQUEST_RPC_CONCURRENCY` / `REQUEST_RPC_QUEUE` | 16 / 256 | Same for first balance reads and `verifyOwnership` |
 
+## Data sources
+
+The finalized follower, head reads, Multicall balances and ownership checks always use JSON-RPC. Only the per-account historical backfill is pluggable. The default `LOG_SOURCE=rpc` is the zero-extra-service path. HyperSync is experimental and opt-in: `auto` chooses streaming HyperSync when `HYPERSYNC_API_KEY` is present, and `hypersync` requires a key. HyperSync ORs sent/received filters in one query and RPC reruns a complete chunk after any primary failure, so the store never sees partial vendor data.
+
+HyperSync serves through the unfinalized chain head, but this service queries only through the already pinned finalized backfill target and sends `toBlock = target + 1` because its end is exclusive. The free tier exposed no limit headers in the 2026-10-14 measurements, but 429s, auth failures and vendor outages remain possible and trigger fallback/cooldown. The client is a N-API native addon; it is loaded lazily only when selected, and its streams are closed on completion, timeout and shutdown.
+
 ## API
 
 | Endpoint | Returns |
@@ -48,7 +58,7 @@ Optional env (numeric values must be positive integers; invalid values fail at s
 | `GET /v1/ethereum/accounts/{address}/erc20?balances=true` | `{ status: "ready", blockHeight, blockHash, finality, lastProgressAt, blockTimestamp, dataAgeS, stale, lagBlocks, followerLagBlocks, fromBlock, balancesAtBlockHeight?, tokens: [{ contract, firstSeenBlock, lastSeenBlock, sentCount, receivedCount, balance?, balanceStatus?, balanceBlock? }], scan }` |
 | `GET /v1/ethereum/accounts/{address}/erc721?verifyOwnership=true` | `{ status: "ready", blockHeight, blockHash, …, followerLagBlocks, collections: [{ contract, tokens: [{ tokenId, heldBySeenLogs, owner?, ownedByAccount? }] }] }` |
 | either, while the account's backfill runs | **HTTP 202** `{ status: "syncing", progressBlocks, targetBlocks, followerLagBlocks }` with `Retry-After: 2` |
-| `GET /health` | uptime, follower status (cursor, head, lag, last advance, error), balance worker (active accounts, last refresh), RPC call counts per method, error classes, circuit-breaker state (API key redacted) |
+| `GET /health` | uptime, follower/balance status, per-log-source chunks/requests/logs/fallbacks/last redacted error, and RPC call/error/breaker stats |
 
 Chain quantities are decimal strings; `dataAgeS` is an integer. `blockHeight`/`blockHash` are the follower's cursor: discovery data is complete through that finalized block, and the pair is read in the same repeatable-read transaction as the holdings. `lastProgressAt` is when the cursor last advanced. `lagBlocks` is the latest head minus `blockHeight`; `followerLagBlocks` is the finalized head minus `blockHeight` (normally 0).
 
@@ -58,7 +68,7 @@ Errors: 400 (address/flags), 404 (network), 503 with `Retry-After` when the foll
 
 ## How it works
 
-`RpcClient` is the only component that performs HTTP. It owns error classification, retries, per-endpoint circuit breakers and unsupported-method memory, result validation with failover, rate limiting, and per-attempt statistics. A viem `PublicClient` sits on top through a custom transport with viem retries and call batching disabled. viem supplies RPC/action types, standard ABIs, calldata and topic encoding, strict event/result decoding, and the block/call actions. Inside `RpcClient`, one viem `http()` transport per endpoint (retries and batching off) does the HTTP/JSON-RPC mechanics; viem's retry, `shouldRetry` and `fallback` never run, so every attempt is billed and recorded once.
+`RpcClient` is the only component that performs JSON-RPC HTTP. It owns error classification, retries, per-endpoint circuit breakers and unsupported-method memory, result validation with failover, rate limiting, and per-attempt statistics. A viem `PublicClient` sits on top through a custom transport with viem retries and call batching disabled. viem supplies RPC/action types, standard ABIs, calldata and topic encoding, strict event/result decoding, and the block/call actions. Inside `RpcClient`, one viem `http()` transport per endpoint (retries and batching off) does the HTTP/JSON-RPC mechanics; viem's retry, `shouldRetry` and `fallback` never run, so every attempt is billed and recorded once. The optional HyperSync source uses its own streaming client only for backfill.
 
 Data is **finalized-only**: nothing above Ethereum's finalized tag is stored, so there is no reorg tail and no rollback.
 
@@ -67,7 +77,8 @@ Data is **finalized-only**: nothing above Ethereum's finalized tag is stored, so
    - **Tracked accounts** are kept in an in-memory set loaded from `tracked_accounts`. At commit, the store compares the set the range was decoded against with the table; if an account was tracked in the meantime, nothing is applied and the range is refetched with it included.
    - **Health.** The follower reports its lag (finalized head minus cursor) and when the cursor last advanced. Responses are `stale` after an RPC failure on the last poll, a lag above one epoch, or no advance for `FINALIZED_MAX_NO_PROGRESS_MS`; discovery returns 503 above `FOLLOWER_MAX_LAG_BLOCKS` or after `MAX_HEAD_AGE_MS` without an advance.
 2. **Backfill → follower handoff.** A new account is tracked in one transaction that takes a share lock on the cursor row, inserts the `tracked_accounts` row, and records the cursor C as its `backfill_target`. A follower commit therefore happens entirely before (its blocks are ≤ C) or entirely after (it applies to the account, blocks > C). The backfill then scans [startBlock, C] with the resumable address-filtered scan; the store rejects backfill chunks above C. Counts add, first/last block widen, and the newest ERC-721 transfer wins by (block, logIndex), so the two writers commute and nothing is missed or counted twice across C.
-   - The backfill is `eth_getLogs` on `Transfer` with viem-encoded account topics, both directions per chunk in parallel. Up to `ETH_SCAN_CONCURRENCY` chunks are in flight; completed chunks commit strictly in order, each with its aggregate and `progress_to` in one transaction. After a failure the earlier chunks still commit and the next request resumes at the first incomplete chunk. Each decoded log is folded straight into the chunk aggregate (only self-transfers are deduped, because both directions return them). The chunk range adapts per account (halves after a split, a > 50 MB response, or a slow > 5 MB one; doubles after three light chunks) and is persisted, so an exchange wallet's next scan starts small.
+   - Backfill uses the network's `AccountLogSource`. With a key, `auto` streams both account directions in one HyperSync query, folds pages immediately (never `collect()`), and commits 100k-block chunks in order. Any auth, rate-limit, server, timeout, lagging-height, or malformed-response failure reruns that entire uncommitted chunk through RPC. After two consecutive failures a 60 s breaker skips HyperSync. Without a key, RPC is used directly: two `eth_getLogs` directions per chunk, strict shared decoding, and self-transfer dedupe.
+   - Up to `ETH_SCAN_CONCURRENCY` chunks are in flight; completed chunks commit strictly in order with `progress_to`. A partial stream is never exposed or committed. Direct RPC alone persists its adaptive per-account range (halve on heavy/split, grow after three light chunks). HyperSync uses its fixed large range; an RPC fallback recursively splits provider-limited requests but the composite chunk remains the atomic resume unit.
    - A request waits up to `REQUEST_DEADLINE_MS` for the backfill and otherwise answers **202 `syncing`** with `progressBlocks`/`targetBlocks`; the backfill continues in the background. Concurrent requests share one backfill. Backfills run through a bounded limiter (`BACKFILL_CONCURRENCY`, `BACKFILL_QUEUE`); beyond it requests get 503 with `Retry-After`.
    - Scan progress stored by the pre-follower version is resumed when it is at or below C, and discarded (the account is rebuilt) when it is above C.
 3. **Shared balance worker.** Accounts that requested balances within `ACTIVE_ACCOUNT_TTL_MS` are active. Every `BALANCE_REFRESH_MS` and whenever the follower advances, the worker reads `balanceOf` for every active (account, token) pair at **one block, the follower cursor, pinned by hash** (EIP-1898), packed across accounts into Multicall3 `aggregate3` calls of `ETH_MULTICALL_BATCH`. Results (balance or error) are stored in `balance_snapshots` with the block number and hash they were read at; a snapshot never moves to an older block. "No Transfer, so unchanged" is never assumed (WETH deposits, rebasing tokens). Batches split only on size/gas/revert failures; authentication errors, rate limits and outages propagate.
@@ -87,6 +98,8 @@ src/rpc/                  JSON-RPC client: viem http() per endpoint for transpor
                           (rate_limited / transient / too_large / unsupported / fatal); rpcErrorOf() unwraps viem-wrapped errors
 src/chains/evm/           EVM adapter: logs.ts (typed topics/strict decoding and range splitting), head.ts (finalized head via a
                           viem PublicClient over RpcClient, retries and batching disabled), multicall.ts, adapter.ts
+src/sources/              per-account backfill sources: RPC wrapper, streaming HyperSync, and generic fallback/breaker
+src/networks.ts           network registry: chain/id, start block, HyperSync default and Multicall3 address
 src/store/schema.ts       Drizzle PostgreSQL schema
 src/store/store.ts        async Store queries and transactional upserts, shared by pg and PGlite
 src/store/postgres.ts     pg Pool startup and automatic Drizzle migrations
@@ -99,7 +112,9 @@ src/core/limiter.ts       bounded concurrency and per-request deadlines for requ
 src/api/routes.ts         Hono routes
 ```
 
-A new EVM chain is a config entry plus `createEvmAdapter`. A non-EVM chain implements `ChainAdapter`.
+A new EVM network is one entry in `src/networks.ts`; the generic config/server construction supplies its source and `createEvmAdapter` (give it separate RPC/env wiring when endpoints differ). A non-EVM family implements `ChainAdapter`. A new backfill provider implements the small `AccountLogSource` contract (`name`, preferred chunk range, aggregate-returning `scanAccount`, stats/optional close) and can be composed with `withFallback`; discovery contains no provider switch.
+
+For a live, finalized comparison run `npm run compare:sources -- <address> [fromBlock] [toBlock]`. It loads `.env` without printing secrets and reports chunks, upstream requests, time, logs, ERC-20 tokens, NFT items and aggregate equality. The default full window keeps RPC at its normal 3k-block ranges (about 172 `eth_getLogs` calls); pass a smaller range for a cheaper smoke check.
 
 ## Unreliable RPC
 
@@ -119,6 +134,7 @@ viem's `http()` transport builds requests, enforces the timeout and parses respo
 | Follower falls behind finalized | `followerLagBlocks` grows; `stale` above one epoch, 503 with `Retry-After` above `FOLLOWER_MAX_LAG_BLOCKS` |
 | Finalized (or the follower) stops advancing | `stale` after `FINALIZED_MAX_NO_PROGRESS_MS`, 503 after `MAX_HEAD_AGE_MS`; clears on the next advance |
 | Request-path RPC saturated or slow | Bounded limiters and `REQUEST_DEADLINE_MS`: 202 `syncing` for backfills, 503 with `Retry-After` otherwise |
+| HyperSync failure or timeout | Discard the partial aggregate, close the stream, rerun the whole chunk through RPC; breaker cooldown avoids retrying a dead primary on every later chunk |
 
 ## Limits (PoC)
 
@@ -130,6 +146,9 @@ viem's `http()` transport builds requests, enforces the timeout and parses respo
 - **Freshness of balances.** Balances are at most `BALANCE_REFRESH_MS` (plus one refresh duration) older than the cursor, and every token says which block it was read at. Accounts idle for `ACTIVE_ACCOUNT_TTL_MS` are no longer refreshed; their next request is served from the old snapshot (labelled with its block) and re-activates them.
 - **Tracked accounts are never untracked.** The follower applies logs for every account ever requested; the per-tick cost is independent of their number, but the set and the commit-time check grow with it.
 - **Finality latency.** Durable discovery follows Ethereum's finalized tag, so responses trail the chain tip by roughly 64 blocks (about 13 minutes) plus up to one `FOLLOWER_POLL_MS`. There is no realtime tail (decided: finalized only).
+- **HyperSync boundary.** HyperSync itself serves through the unfinalized chain head, but backfill targets are pinned to the follower's finalized cursor and queries always end exactly at `target + 1` (exclusive). A source below the requested height fails to RPC.
+- **HyperSync is experimental (off by default).** Normal and NFT accounts matched RPC exactly (1 request vs 172 calls), but the stream for a 100k-block chunk of the Binance hot wallet (`0x28c6…`, about 1M logs per chunk) hung and never finished, even with a 600 s timeout. The chunk then fails over to RPC after the timeout. Undiagnosed; until it is fixed, use `LOG_SOURCE=rpc`.
+- **Vendor/native dependency.** HyperSync is an optional hosted vendor/free-tier risk (auth, throttling and availability). Its package is a N-API native addon: it is dynamically imported only when configured; shutdown closes streams and drops the client reference. RPC remains the zero-extra-service path.
 - **Heavy accounts.** An exchange hot wallet can mean about 2.5M logs (about 1.6 GB of JSON) for the window. The scan is then bound by download throughput (about 75 s measured for Binance's hot wallet), and the adaptive range trades RPC calls for smaller responses: about 320-450 calls instead of 172. Every response is still parsed whole by viem, so peak RSS is about 1 GB at concurrency 8, mostly in-flight responses plus GC slack. Each cold scan commits per chunk and resumes after the last committed chunk following a failure.
 - **Concurrency and rate limit.** At the default `RPC_MAX_RPS` of 20, concurrency 8 (16 requests in flight) already saturates the limiter for a normal account: 172 calls take about 8.6 s, and concurrency 16 measured no faster. The limiter is shared with the follower and the balance worker; a live cold backfill on 2026-10-14 took about 26 s for the same 172 calls (so with the default 10 s deadline, the first requests answer 202).
 - **Reorgs.** Durable summaries contain finalized blocks only, making them reorg-safe by construction under Ethereum's finality guarantees. The service does not implement rollback for a consensus-level finality failure.

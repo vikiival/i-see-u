@@ -1,6 +1,6 @@
 # Token discovery PoC: architecture and rationale
 
-Status: describes the system **as built** on branch `poc/token-discovery` (2026-10-14, 66 tests). How we got here, including the dead ends: [PROGRESS.md](PROGRESS.md). Running it, API fields and configuration: [README.md](README.md). Values marked *(estimate)* are derived, not measured.
+Status: describes the system **as built** on branch `poc/token-discovery` (2026-10-14, 76 tests). How we got here, including the dead ends: [PROGRESS.md](PROGRESS.md). Running it, API fields and configuration: [README.md](README.md). Values marked *(estimate)* are derived, not measured.
 
 ## 0. Scope decisions
 
@@ -9,13 +9,21 @@ Answers from the scope round with Jakub and Tali, plus Viktor's later decisions.
 | Question | Decision |
 |---|---|
 | What "not a full indexer" means | Clarified by Jakub and Tali: no Blockbook-style discovery over blocks, transactions and native transfers. An index of `Transfer` logs is in scope. They found no existing service that does token discovery over plain RPC, hence the PoC |
-| Primary data source | Quicknode `eth_getLogs` (premium: 10k-block ranges). SQD and Envio are backfill or backup sources |
+| Primary data source | Quicknode JSON-RPC. Envio HyperSync is an experimental, opt-in backfill source (`LOG_SOURCE=auto|hypersync`) with whole-chunk RPC fallback; off by default after a stream hang on the Binance hot wallet. Follower, heads and balances stay on RPC |
 | Tokens held before block 25,933,634 and untouched since | Out of scope (limit) |
 | Spam tokens | Returned. No filtering |
 | What counts as "interacted" | `Transfer` in or out |
 | Native ETH | Out of scope |
 | ERC-721 (bonus) | Contracts plus the token IDs seen in logs, with optional `ownerOf` verification |
 | Freshness | The scope answer was "a few seconds of lag is fine". **We then chose finalized only, with no rollback.** That puts responses about 64 blocks (about 13 min) behind the tip. It is the main trade-off to defend (§7) |
+
+## 0.1 Implementation status
+
+The per-account backfill now depends on the chain-agnostic `AccountLogSource` contract, not an RPC method on discovery. `src/sources/` contains the unchanged two-direction RPC implementation, a page-streaming HyperSync implementation, and provider-neutral fallback/breaker composition. `src/networks.ts` holds the EVM network facts used by generic server construction. HyperSync is dynamically imported only when configured; every stream closes on completion, timeout, or shutdown.
+
+**HyperSync is unplugged by default (`LOG_SOURCE=rpc`).** Live comparison against RPC: normal account `0x5a52…` 219 logs / 109 tokens and NFT holder `0x6ff0…` 288 logs / 278 items, both identical, in 3 HyperSync requests (0.35–0.8 s) vs 172 Quicknode calls (160–220 s). The Binance hot wallet `0x28c6…` hung inside a 100k-block stream (30 s and 600 s timeouts both hit), although an earlier standalone benchmark streamed the whole window in 13 s. Root cause not yet found; the source stays opt-in until it is.
+
+HyperSync folds pages directly into the same `ChunkAggregate` using the same strict decoder and self-transfer/ERC-721 rules as RPC. Its query end is always the finalized target plus one (exclusive), and a source height below the requested inclusive end fails to RPC. A failed or partial stream cannot be committed; after two consecutive failures, the primary cools down for 60 s. `/health` exposes redacted per-source chunks, requests, logs, failures and fallbacks. Fake-client tests cover pagination, aggregate equivalence, height guards, 401/429/timeout/malformed fallback, cooldown/retry, redaction, and mid-stream resume.
 
 ## 1. Architecture as built
 
@@ -39,7 +47,7 @@ A TypeScript service on Node 26: Hono, viem on our own `RpcClient`, and PostgreS
 ```
 
 1. **Shared finalized follower.** A single follower per network reads **every** `Transfer` log once, with no address filter. It applies only the logs whose `from`/`to` is a tracked account. At the head this is one `getLogs` per finalized epoch (32 blocks, about 17–22k logs, about 10–14 MB), no matter how many accounts are tracked.
-2. **Backfill with handoff.** A new account is tracked and the follower cursor C is read in one transaction. The account is then backfilled once over [25,933,634, C] with address-filtered `getLogs`. The follower owns every block above C. Until the backfill finishes, the API answers `202 syncing`.
+2. **Backfill with handoff.** A new account is tracked and the follower cursor C is read in one transaction. The account is then backfilled once over [25,933,634, C] through HyperSync with per-chunk RPC fallback (or directly through RPC without a key). The follower owns every block above C. Until the backfill finishes, the API answers `202 syncing`.
 3. **Shared balance worker.** Balances of active accounts are re-read on a cadence, batched across all accounts into Multicall3 calls at one block. Every balance carries the block it was read at.
 4. **Request path.** Once an account is backfilled, a request is pure database reads, with **zero RPC calls**.
 
@@ -94,8 +102,8 @@ No source replaces the service. None answers "tokens this address interacted wit
 
 | Source | Finding | Role |
 |---|---|---|
-| Quicknode JSON-RPC | All of §2 | **Primary** for logs, heads and balances |
-| **Envio HyperSync** (live, free token) | One OR query covers sent and received. Normal account: 1 request, 0.6 s, logs identical to Quicknode. Binance: 13.0 s and 580 MB with `@envio-dev/hypersync-client` 1.4.1 `stream()` (napi, loads on Node 26 darwin-arm64); `collect()` peaked at 2.6 GB and sequential JSON took 77 s. Follower epoch: 1 request, 150 ms vs 112 ms on Quicknode, 16,777 logs equal. It **serves the chain head (0 lag vs `latest`)**, so `to_block` must be capped at our finalized block. No rate limit seen at 8 parallel requests | **Next: backfill `LogSource`**, about 5× faster on heavy accounts and about 0 Quicknode credits |
+| Quicknode JSON-RPC | All of §2 | **Primary** for follower, heads and balances; fallback (or explicit source) for account backfills |
+| **Envio HyperSync** (live, free token) | One OR query covers sent and received. Normal account: 1 request, 0.6 s, logs identical to Quicknode's 172 calls. Binance: 2,548,175 logs over about 257k blocks in 13.0 s and 580 MB RSS with `@envio-dev/hypersync-client` 1.4.1 `stream()`; `collect()` peaked at 2.6 GB. It serves the chain head, so queries are capped at our finalized target. No rate-limit headers were observed; 429 remains a handled risk | **Implemented, opt-in (off by default)** for per-account backfill, with RPC whole-chunk fallback; hangs on Binance-size chunks |
 | Envio HyperRPC | 403: our token is not enabled for it. `getLogs` only, no `eth_call` | Possible `RPC_FALLBACK_URLS` entry |
 | Envio HyperIndex | A full framework with a fixed config, its own DB and its own loop | Rejected |
 | SQD Portal | 0 head lag. Topics must be lowercase and 32-byte padded, or it **silently returns 0 logs**. The free tier gives frequent 529s at about 0.1 MB/s. Paid tiers are $99 and $499 | Backup `LogSource` on a paid tier |
@@ -112,6 +120,7 @@ Assumptions: 5k active users with about 10 tokens each (50k pairs), 20 credits p
 | Item | Calls | Credits |
 |---|---|---|
 | Cold backfill per new account (3k chunks over about 257k blocks; measured) | 172 once per account; 5k accounts ≈ 860k | **about 17M once** |
+| Cold backfill with HyperSync healthy (measured normal account) | 1 HyperSync query per 100k-block chunk; 0 Quicknode calls | **0 Quicknode credits** |
 | Follower, 1 unfiltered `getLogs` per finalized epoch (measured) | about 225/day | about 0.14M/month |
 | Head polling, `finalized` + `latest` every 30 s | about 5.8k/day | about 3.5M/month |
 | Balance worker: 50 Multicalls per refresh, every 60 s plus once per follower advance (about +10%) | about 79k/day | about 47M/month |
@@ -136,10 +145,10 @@ Assumptions: 5k active users with about 10 tokens each (50k pairs), 20 credits p
 
 ### Backfill and handoff (`src/discovery/service.ts`)
 - **`trackAccount`:** in one transaction, it takes a share lock on the cursor row, inserts `tracked_accounts`, and stores C as `backfill_target`. The store rejects backfill chunks above C. Counts add, first/last block widen, and the newest ERC-721 transfer wins by (block, logIndex), so the two writers commute.
-- **Scan:** `Transfer` with the account in topic1 and in topic2, run in parallel per chunk. 3k-block chunks, up to 8 in flight. Completed chunks commit strictly in order, each with its `progress_to`, so a failure resumes at the first incomplete chunk.
+- **Scan:** `AccountLogSource` supplies an aggregate for one inclusive range. HyperSync ORs topic1/topic2 in one streaming query; RPC runs the two directions in parallel. Up to 8 chunks are in flight. Completed chunks commit strictly in order, each with `progress_to`, so a failure resumes at the first incomplete chunk.
 - **Aggregation while decoding:** logs go straight into per-token aggregates. Only self-transfers are deduplicated.
 - **Range splitting:** split on "too large" or on a timeout of a multi-block range, using the provider's suggested range when given.
-- **Adaptive per-account range:** it halves after a split, a response over 50 MB, or a slow response over 5 MB, and doubles after three light chunks. The range is persisted in `account_scan_range`.
+- **Source-specific range:** direct RPC halves after a split/heavy response and grows after three light chunks; that range is persisted. HyperSync uses fixed 100k-block chunks. If it falls back, RPC may split internally, while the full composite chunk stays atomic.
 - **Requests during backfill:** a request waits up to 10 s, then gets `202 syncing` with progress. Backfills are bounded (4 concurrent, 64 queued); beyond that the API returns 503 with `Retry-After`.
 
 ### Balances (`src/balances/worker.ts`)
@@ -150,7 +159,7 @@ Assumptions: 5k active users with about 10 tokens each (50k pairs), 20 credits p
 - **Request path:** only a token with no snapshot yet is read on the request path, single-flight per account, through a bounded limiter (16 concurrent, 256 queued).
 
 ### RPC resilience (`src/rpc/`)
-`RpcClient` is the only component that performs HTTP. Details are in README "Unreliable RPC".
+`RpcClient` is the only component that performs JSON-RPC HTTP; HyperSync's optional streaming client is confined to the backfill source. Details are in README "Unreliable RPC".
 - **Error classes:** `rate_limited`, `transient`, `too_large` (carrying the suggested range), `unsupported`, `fatal`.
 - **Retries:** full-jitter backoff. `Retry-After` is honoured but capped at 10 s.
 - **Breakers and failover:** a breaker per endpoint (5 failures, 15 s open). "Method not available" is remembered per endpoint and method for 10 min. Requests fail over across `RPC_FALLBACK_URLS`.
@@ -158,16 +167,16 @@ Assumptions: 5k active users with about 10 tokens each (50k pairs), 20 credits p
 - **Accounting:** a token-bucket limiter (`RPC_MAX_RPS`, shared by follower, backfill and balances), per-attempt stats in `/health`, and API-key redaction.
 
 ### Interfaces (`src/core/types.ts`)
+- **`AccountLogSource`:** chain-agnostic per-account aggregate source with a name, preferred committed range, request/log metadata, stats and optional shutdown. `withFallback` composes providers outside discovery.
 - **`ChainAdapter`** (EVM: `createEvmAdapter`):
   - head and blocks: `finalizedHead`, `blockByNumber`
-  - logs: `scanChunk(account, range)` for the backfill, `scanAllTransfers(range, onTransfer, accept)` for the follower
+  - logs: an `accountLogs` source for backfill; `scanAllTransfers(range, onTransfer, accept)` remains RPC-only for the follower
   - state reads: `erc20BalancePairs(pairs, blockHash)` and `erc721Owners(items, blockHash)`
   - addresses: `normalizeAddress`
 
-  A new EVM chain is a config entry. A non-EVM chain implements the interface.
+  A new EVM chain is a `src/networks.ts` registry entry. A non-EVM chain implements the interface.
 - **`Store`:** async. One implementation serves `pg` and PGlite.
 - **`RpcClient`:** transport and policy.
-- **Not built yet:** splitting log reads out into a `LogSource` (RPC, HyperSync, SQD) behind `scanChunk`/`scanAllTransfers`, as the first step of the HyperSync work.
 
 ### Tables (`src/store/schema.ts`, migrations in `drizzle/`)
 - `follower_cursor(network, block_number, block_hash, block_timestamp, updated_at)`
@@ -220,14 +229,8 @@ At 5k users polling once a minute, the API sees about 83 requests/s. That is tri
 
 ## 8. Next experiments
 
-1. **A `HyperSyncLogSource` for the backfill:**
-   - `stream()` with the OR query and `JoinNothing`, `to_block` capped at RPC finalized
-   - a canary against silent empty results
-   - Quicknode chunking as the fallback
-   - check that the Linux napi build loads before deploying
-
-   Expected: normal accounts in under 1 s, Binance in about 13 s, about 0 Quicknode credits.
-2. **Raise `RPC_MAX_RPS` toward the plan's 50.** This should bring a normal cold scan from about 8.6 s to about 3.5 s, while keeping headroom for the follower and balances.
+1. **Deploy check:** verify the Linux N-API build loads and run `scripts/compare-sources.ts` against a normal and heavy account. Network access was intentionally unavailable during implementation.
+2. **Raise `RPC_MAX_RPS` toward the plan's 50.** This should bring a fallback normal cold scan from about 8.6 s to about 3.5 s, while keeping headroom for the follower and balances.
 3. **Check credits on the Quicknode dashboard:** one 3k `getLogs`, a 3-call batch, and a 1,000-call Multicall.
 4. **A live HTTP load test:** 5k accounts polling once a minute, measuring RPC calls/min and p99 latency.
 5. **Decide the open limits:** shared state for multiple replicas (active set and balance-worker leader in Postgres), untracking idle accounts, spam flags, native ETH, and whether a realtime tail is worth the reorg handling.
