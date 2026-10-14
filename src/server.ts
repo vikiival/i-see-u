@@ -77,6 +77,7 @@ const discovery = createDiscoveryService({
   store,
   followers,
   tails,
+  maxTailTipAgeMs: config.tail.maxTipAgeMs,
   requestDeadlineMs: config.request.deadlineMs,
   backfillLimiter: createLimiter(config.request.backfillConcurrency, config.request.backfillQueue),
 });

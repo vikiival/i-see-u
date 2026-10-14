@@ -92,6 +92,8 @@ export const config = {
     enabled: tailEnabled,
     maxDepth: BigInt(int('TAIL_MAX_DEPTH', '64')),
     pollOffsetsMs: intList('TAIL_POLL_OFFSETS_MS', '2500,5000,9000'),
+    /** Serve `latest` only while the tail tip block is at most this old (5 slots: up to 4 missed slots). */
+    maxTipAgeMs: int('TAIL_MAX_TIP_AGE_MS', '60000'),
   },
   balances: {
     /** Accounts whose balances were requested within this window are refreshed by the shared worker. */

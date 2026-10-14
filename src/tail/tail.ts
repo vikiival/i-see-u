@@ -214,13 +214,7 @@ export function createTail(o: TailOptions): Tail {
         lastAdvanceAt = now();
         epoch = epochOf(tip);
       }
-      if (tip && o.follower.status().leader) {
-        const canonical = await adapter.headerByNumber(tip.number);
-        if (canonical.hash !== tip.hash) {
-          const cursor = await store.getFollowerCursor(network);
-          if (cursor) await handleReorg(canonical, { ...cursor, parentHash: cursor.hash });
-        }
-      }
+      // No re-validation here: leadership is not known yet at startup; the first leader tick checks the stored tip.
     },
     start() {
       if (!stopped) return;

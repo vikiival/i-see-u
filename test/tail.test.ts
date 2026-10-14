@@ -255,6 +255,47 @@ test('restart re-validates a stored tip through the normal reorg path', async ()
   }
 });
 
+test('a tail tip older than maxTailTipAgeMs is served as finalized with tailError', async () => {
+  const chain = new FakeChain(100n);
+  chain.latest = 102n;
+  chain.addTransfer({ token, from: peer, to: account, value: 1n, blockNumber: 102n });
+  const s = await stack(chain);
+  try {
+    await s.tail.tick();
+    const tipMs = 102 * 12 * 1000; // FakeChain timestamps are number * 12 s
+    const at = (nowMs: number) => ready({ ...s, discovery: createDiscoveryService({
+      adapters: { ethereum: s.adapter }, store: s.store, followers: { ethereum: s.follower }, tails: { ethereum: s.tail },
+      maxTailTipAgeMs: 60_000, now: () => nowMs,
+    }) });
+    const old = await at(tipMs + 120_000);
+    expect(old).toMatchObject({ finality: 'finalized', blockHeight: 100n });
+    expect(old.tailError).toMatch(/Tail tip is \d+ s old/);
+    const fresh = await at(tipMs + 30_000);
+    expect(fresh).toMatchObject({ finality: 'latest', blockHeight: 102n });
+    expect(fresh.tailError).toBeUndefined();
+  } finally {
+    await s.close();
+  }
+});
+
+test('lastProgressAt is the tip time when the serving process never advanced the tail itself', async () => {
+  const chain = new FakeChain(100n);
+  chain.latest = 102n;
+  const s = await stack(chain);
+  try {
+    await s.tail.tick();
+    const tip = (await s.store.getTailTip('ethereum'))!;
+    const nonLeader = createTail({ adapter: s.adapter, store: s.store, follower: s.follower });
+    const result = await ready({ ...s, discovery: createDiscoveryService({
+      adapters: { ethereum: s.adapter }, store: s.store, followers: { ethereum: s.follower }, tails: { ethereum: nonLeader },
+    }) });
+    expect(result).toMatchObject({ finality: 'latest', blockHeight: 102n });
+    expect(result.lastProgressAt).toBe(Number(tip.timestamp) * 1000);
+  } finally {
+    await s.close();
+  }
+});
+
 test('API finality overlays tail-only tokens and balances at the tip hash; finalized keeps the base shape', async () => {
   const chain = new FakeChain(100n);
   chain.latest = 101n;

@@ -37,6 +37,7 @@ Optional env (numeric values must be positive integers; invalid values fail at s
 | `TAIL_ENABLED` | true | Persist and serve the reorg-aware near-realtime Transfer tail |
 | `TAIL_MAX_DEPTH` | 64 | Maximum rollback search above the finalized cursor before wiping and rebuilding the tail |
 | `TAIL_POLL_OFFSETS_MS` | `2500,5000,9000` | Poll offsets within each 12 s Ethereum slot |
+| `TAIL_MAX_TIP_AGE_MS` | 60000 | Serve `latest` only while the shared tail tip's block timestamp is at most this old (5 slots); otherwise finalized with `tailError`. Checked in every process, so a stalled leader degrades non-leaders too |
 | `FINALIZED_MAX_NO_PROGRESS_MS` | 1200000 | Responses are `stale` after the follower has not advanced for this long |
 | `MAX_HEAD_AGE_MS` | 1800000 | Discovery returns 503 after the follower has not advanced for this long |
 | `ACTIVE_ACCOUNT_TTL_MS` | 300000 | Accounts that requested balances within this window are refreshed by the balance worker |
