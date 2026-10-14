@@ -11,6 +11,7 @@ import type {
 interface DiscoveryDependencies {
   adapters: Record<string, ChainAdapter>;
   store: Store;
+  /** Refuse discovery when finalized progress is older than this. */
   maxHeadProgressAgeMs?: number;
 }
 
@@ -27,34 +28,22 @@ const GROW_AFTER = 3;
 
 export function createDiscoveryService(deps: DiscoveryDependencies): DiscoveryService {
   const maxHeadProgressAgeMs = deps.maxHeadProgressAgeMs ?? DEFAULT_MAX_HEAD_PROGRESS_AGE_MS;
-  if (!Number.isFinite(maxHeadProgressAgeMs) || maxHeadProgressAgeMs < 0) {
-    throw new Error('maxHeadProgressAgeMs must not be negative');
-  }
   const inFlight = new Map<string, Promise<DiscoveryResult>>();
 
   const scan = async (adapter: ChainAdapter, account: Address): Promise<DiscoveryResult> => {
     const startedAt = Date.now();
-    if (adapter.logsMinRange < 1n || adapter.logsMinRange > adapter.logsMaxRange) {
-      throw new Error('logsMinRange must be between 1 and logsMaxRange');
-    }
-    if (!Number.isInteger(adapter.scanConcurrency) || adapter.scanConcurrency < 1) {
-      throw new Error('scanConcurrency must be a positive integer');
-    }
     const head = await adapter.finalizedHead();
     if (Date.now() - head.lastProgressAt > maxHeadProgressAgeMs) {
       throw Object.assign(new Error('Finalized chain head has not progressed recently enough'), { statusCode: 503 });
     }
 
     const previousCursor = deps.store.getCursor(adapter.network, account);
-    const progressTo = deps.store.getProgress(adapter.network, account);
-    if (progressTo !== undefined && progressTo > (previousCursor?.scannedTo ?? -1n) && progressTo > head.block.number) {
+    // Progress is never below the cursor (finalizeScan advances both); above it means uncommitted chunks.
+    const appliedTo = deps.store.getProgress(adapter.network, account);
+    if (appliedTo !== undefined && appliedTo > (previousCursor?.number ?? -1n) && appliedTo > head.block.number) {
       throw Object.assign(new Error('Finalized chain head is behind persisted scan progress'), { statusCode: 503 });
     }
-    const appliedTo = progressTo !== undefined && progressTo > (previousCursor?.scannedTo ?? -1n)
-      ? progressTo
-      : previousCursor?.scannedTo;
-    const nextBlock = appliedTo === undefined ? adapter.startBlock : appliedTo + 1n;
-    const fromBlock = nextBlock > adapter.startBlock ? nextBlock : adapter.startBlock;
+    const fromBlock = appliedTo !== undefined && appliedTo >= adapter.startBlock ? appliedTo + 1n : adapter.startBlock;
 
     let newBlocks = 0n;
     let rpcCalls = 0;
@@ -127,31 +116,24 @@ export function createDiscoveryService(deps: DiscoveryDependencies): DiscoverySe
       }
     }
 
-    if (!previousCursor || head.block.number > previousCursor.scannedTo) {
+    // A lagging head keeps the newer published pair.
+    if (!previousCursor || head.block.number > previousCursor.number) {
       deps.store.finalizeScan(adapter.network, account, head.block);
     }
-    const cursor = deps.store.getCursor(adapter.network, account);
-    if (!cursor) throw new Error('Scan completed without storing an account cursor');
-    const cachedLatest = adapter.cachedLatestHead?.();
-    const latestKnownNumber = cachedLatest && cachedLatest.block.number > head.block.number
-      ? cachedLatest.block.number
-      : head.block.number;
+    const cursor = deps.store.getCursor(adapter.network, account)!;
+    const latest = adapter.cachedLatestBlockNumber?.() ?? head.block.number;
     return {
       network: adapter.network,
       account,
       fromBlock: adapter.startBlock,
-      blockHeight: cursor.scannedTo,
-      blockHash: cursor.scannedToHash,
-      blockParentHash: cursor.scannedToParentHash,
-      blockTimestamp: cursor.scannedToTimestamp,
+      blockHeight: cursor.number,
+      blockHash: cursor.hash,
+      blockTimestamp: cursor.timestamp,
       finality: 'finalized',
       lastProgressAt: head.lastProgressAt,
       stale: head.stale,
-      lagBlocks: latestKnownNumber > cursor.scannedTo ? latestKnownNumber - cursor.scannedTo : 0n,
-      holdings: [
-        ...deps.store.holdings(adapter.network, account, 'erc20'),
-        ...deps.store.holdings(adapter.network, account, 'erc721'),
-      ],
+      lagBlocks: latest > cursor.number ? latest - cursor.number : 0n,
+      holdings: deps.store.holdings(adapter.network, account),
       nftItems: deps.store.nftItems(adapter.network, account),
       scan: { newBlocks, rpcCalls, ms: Date.now() - startedAt },
     };

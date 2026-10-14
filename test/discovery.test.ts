@@ -29,12 +29,10 @@ class FakeAdapter implements ChainAdapter {
   head: BlockRef = {
     number: 110n,
     hash: '0x110' as Hex,
-    parentHash: '0x109' as Hex,
     timestamp: 1_000n,
   };
   calls: { account: Address; direction: TransferDirection; range: BlockRange }[] = [];
   gate?: Promise<void>;
-  lastResponseAt = Date.now();
   lastProgressAt = Date.now();
   stale = false;
   handler?: (direction: TransferDirection, range: BlockRange) => Promise<{ events: TransferEvent[]; calls: number }>;
@@ -47,14 +45,9 @@ class FakeAdapter implements ChainAdapter {
   async finalizedHead(): Promise<HeadObservation> {
     return {
       block: this.head,
-      lastResponseAt: this.lastResponseAt,
       lastProgressAt: this.lastProgressAt,
       stale: this.stale,
     };
-  }
-
-  async safeHead(): Promise<HeadObservation> {
-    return this.finalizedHead();
   }
 
   async scanChunk(requestedAccount: Address, range: BlockRange): Promise<ChunkScan> {
@@ -89,7 +82,7 @@ test('first discovery scans from startBlock and later discovery scans only the g
     expect(first.account).toBe(account);
     expect(first.blockHeight).toBe(110n);
     expect(first.blockHash).toBe(adapter.head.hash);
-    expect(store.getCursor('ethereum', account)?.scannedToHash).toBe(adapter.head.hash);
+    expect(store.getCursor('ethereum', account)?.hash).toBe(adapter.head.hash);
     expect(first.finality).toBe('finalized');
     expect(first.scan.newBlocks).toBe(11n);
     expect(first.scan.rpcCalls).toBe(2);
@@ -98,7 +91,7 @@ test('first discovery scans from startBlock and later discovery scans only the g
       { fromBlock: 100n, toBlock: 110n },
     ]);
 
-    adapter.head = { number: 115n, hash: '0x115' as Hex, parentHash: '0x114' as Hex, timestamp: 1_100n };
+    adapter.head = { number: 115n, hash: '0x115' as Hex, timestamp: 1_100n };
     const second = await service.discover('ethereum', account);
     expect(second.scan.newBlocks).toBe(5n);
     expect(adapter.calls.slice(2).map((call) => call.range)).toEqual([
@@ -132,11 +125,12 @@ test('concurrent discoveries share one directional scan', async () => {
   }
 });
 
-test('unknown network rejects with statusCode 404', async () => {
+test('unknown network rejects with 404, a malformed address with 400', async () => {
   const store = openSqliteStore(':memory:');
-  const service = createDiscoveryService({ adapters: {}, store });
+  const service = createDiscoveryService({ adapters: { ethereum: new FakeAdapter() }, store });
   try {
     await expect(service.discover('missing', account)).rejects.toMatchObject({ statusCode: 404 });
+    await expect(service.discover('ethereum', 'not-an-address')).rejects.toMatchObject({ statusCode: 400 });
   } finally {
     store.close();
   }
@@ -145,7 +139,7 @@ test('unknown network rejects with statusCode 404', async () => {
 test('a cursor ahead of a lagging head is retained without a scan', async () => {
   const store = openSqliteStore(':memory:');
   const adapter = new FakeAdapter();
-  const stored = { number: 120n, hash: '0x120' as Hex, parentHash: '0x119' as Hex, timestamp: 1_200n };
+  const stored = { number: 120n, hash: '0x120' as Hex, timestamp: 1_200n };
   store.finalizeScan('ethereum', account, stored);
   const service = createDiscoveryService({ adapters: { ethereum: adapter }, store });
   try {
@@ -177,11 +171,10 @@ test('a failed third chunk preserves two committed chunks and the next call resu
   const store = openSqliteStore(':memory:');
   const adapter = new FakeAdapter();
   Object.defineProperty(adapter, 'logsMaxRange', { value: 2n });
-  adapter.head = { number: 109n, hash: '0x109' as Hex, parentHash: '0x108' as Hex, timestamp: 1_090n };
+  adapter.head = { number: 109n, hash: '0x109' as Hex, timestamp: 1_090n };
   store.finalizeScan('ethereum', account, {
     number: 99n,
     hash: '0x99' as Hex,
-    parentHash: '0x98' as Hex,
     timestamp: 990n,
   });
   let fail = true;
@@ -193,7 +186,7 @@ test('a failed third chunk preserves two committed chunks and the next call resu
   try {
     await expect(service.discover('ethereum', account)).rejects.toThrow('chunk 3 failed');
     expect(store.getProgress('ethereum', account)).toBe(103n);
-    expect(store.getCursor('ethereum', account)?.scannedTo).toBe(99n);
+    expect(store.getCursor('ethereum', account)?.number).toBe(99n);
 
     fail = false;
     adapter.calls.length = 0;
@@ -201,7 +194,7 @@ test('a failed third chunk preserves two committed chunks and the next call resu
     expect(adapter.calls[0]?.range).toEqual({ fromBlock: 104n, toBlock: 105n });
     expect(result.blockHeight).toBe(109n);
     expect(store.getProgress('ethereum', account)).toBe(109n);
-    expect(store.getCursor('ethereum', account)?.scannedToHash).toBe('0x109');
+    expect(store.getCursor('ethereum', account)?.hash).toBe('0x109');
   } finally {
     store.close();
   }
@@ -210,7 +203,7 @@ test('a failed third chunk preserves two committed chunks and the next call resu
 test('a chunk is not committed when either direction fails', async () => {
   const store = openSqliteStore(':memory:');
   const adapter = new FakeAdapter();
-  adapter.head = { number: 100n, hash: '0x100' as Hex, parentHash: '0x99' as Hex, timestamp: 1_000n };
+  adapter.head = { number: 100n, hash: '0x100' as Hex, timestamp: 1_000n };
   adapter.handler = async (direction) => {
     if (direction === 'to') throw new Error('received direction failed');
     return {
@@ -231,7 +224,7 @@ test('a chunk is not committed when either direction fails', async () => {
   try {
     await expect(service.discover('ethereum', account)).rejects.toThrow('received direction failed');
     expect(store.getProgress('ethereum', account)).toBeUndefined();
-    expect(store.holdings('ethereum', account, 'erc20')).toEqual([]);
+    expect(store.holdings('ethereum', account)).toEqual([]);
   } finally {
     store.close();
   }
@@ -240,7 +233,7 @@ test('a chunk is not committed when either direction fails', async () => {
 test('a self-transfer returned by both directions is counted once per side', async () => {
   const store = openSqliteStore(':memory:');
   const adapter = new FakeAdapter();
-  adapter.head = { number: 100n, hash: '0x100' as Hex, parentHash: '0x99' as Hex, timestamp: 1_000n };
+  adapter.head = { number: 100n, hash: '0x100' as Hex, timestamp: 1_000n };
   const transfer: TransferEvent = {
     standard: 'erc20',
     token: '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' as Address,
@@ -255,7 +248,7 @@ test('a self-transfer returned by both directions is counted once per side', asy
   const service = createDiscoveryService({ adapters: { ethereum: adapter }, store });
   try {
     await service.discover('ethereum', account);
-    expect(store.holdings('ethereum', account, 'erc20')[0]).toMatchObject({ sentCount: 1, receivedCount: 1 });
+    expect(store.holdings('ethereum', account)[0]).toMatchObject({ sentCount: 1, receivedCount: 1 });
   } finally {
     store.close();
   }
@@ -267,7 +260,7 @@ test('a slow first chunk does not idle the other slots; commits stay in order an
   const store = openSqliteStore(':memory:');
   const adapter = new FakeAdapter();
   Object.defineProperty(adapter, 'logsMaxRange', { value: 2n });
-  adapter.head = { number: 113n, hash: '0x113' as Hex, parentHash: '0x112' as Hex, timestamp: 1_130n }; // 7 chunks
+  adapter.head = { number: 113n, hash: '0x113' as Hex, timestamp: 1_130n }; // 7 chunks
   let releaseFirst = (): void => {};
   const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
   let active = 0;
@@ -310,7 +303,7 @@ test('a failed later chunk still commits the earlier ones, then rejects', async 
   const store = openSqliteStore(':memory:');
   const adapter = new FakeAdapter();
   Object.defineProperty(adapter, 'logsMaxRange', { value: 2n });
-  adapter.head = { number: 109n, hash: '0x109' as Hex, parentHash: '0x108' as Hex, timestamp: 1_090n };
+  adapter.head = { number: 109n, hash: '0x109' as Hex, timestamp: 1_090n };
   let releaseFirst = (): void => {};
   const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
   adapter.handler = async (_direction, range) => {
@@ -340,7 +333,7 @@ test('the range halves after a heavy chunk, doubles after three light ones, and 
   Object.defineProperty(adapter, 'logsMaxRange', { value: 8n });
   Object.defineProperty(adapter, 'logsMinRange', { value: 2n });
   Object.defineProperty(adapter, 'scanConcurrency', { value: 1 });
-  adapter.head = { number: 135n, hash: '0x135' as Hex, parentHash: '0x134' as Hex, timestamp: 1_350n };
+  adapter.head = { number: 135n, hash: '0x135' as Hex, timestamp: 1_350n };
   adapter.heavy = (range) => range.fromBlock === 100n;
   const sizes = () => adapter.calls
     .filter((call) => call.direction === 'from')
@@ -354,14 +347,14 @@ test('the range halves after a heavy chunk, doubles after three light ones, and 
     // A heavy account shrinks to the floor, and its next scan starts there.
     adapter.calls.length = 0;
     adapter.heavy = () => true;
-    adapter.head = { number: 151n, hash: '0x151' as Hex, parentHash: '0x150' as Hex, timestamp: 1_510n };
+    adapter.head = { number: 151n, hash: '0x151' as Hex, timestamp: 1_510n };
     await service.discover('ethereum', account);
     expect(sizes()).toEqual([8n, 4n, 2n, 2n]);
     expect(store.getLogsRange('ethereum', account)).toBe(2n);
 
     adapter.calls.length = 0;
     adapter.heavy = () => false;
-    adapter.head = { number: 155n, hash: '0x155' as Hex, parentHash: '0x154' as Hex, timestamp: 1_550n };
+    adapter.head = { number: 155n, hash: '0x155' as Hex, timestamp: 1_550n };
     await service.discover('ethereum', account);
     expect(sizes()).toEqual([2n, 2n]);
   } finally {
@@ -375,7 +368,7 @@ test('concurrent heavy results shrink once from their own size, not repeatedly',
   Object.defineProperty(adapter, 'logsMaxRange', { value: 8n });
   Object.defineProperty(adapter, 'logsMinRange', { value: 1n });
   Object.defineProperty(adapter, 'scanConcurrency', { value: 4 });
-  adapter.head = { number: 131n, hash: '0x131' as Hex, parentHash: '0x130' as Hex, timestamp: 1_310n };
+  adapter.head = { number: 131n, hash: '0x131' as Hex, timestamp: 1_310n };
   adapter.heavy = (range) => range.toBlock - range.fromBlock + 1n === 8n;
   const service = createDiscoveryService({ adapters: { ethereum: adapter }, store });
   try {

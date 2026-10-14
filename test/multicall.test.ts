@@ -2,8 +2,8 @@ import { expect, test } from 'vitest';
 
 import { decodeFunctionData, encodeFunctionResult } from 'viem';
 
-import { readErc20Balances, readErc721Owners } from '../src/chains/evm/multicall.ts';
-import type { Address, BlockRef, Hex, RpcClient, RpcStats } from '../src/core/types.ts';
+import { MULTICALL3, readErc20Balances, readErc721Owners } from '../src/chains/evm/multicall.ts';
+import type { Address, Hex, RpcClient, RpcStats } from '../src/core/types.ts';
 import { RpcError } from '../src/rpc/errors.ts';
 
 const aggregate3Abi = [
@@ -48,13 +48,7 @@ const ownerOfAbi = [{
 }] as const;
 
 const address = (n: number): Address => `0x${n.toString(16).padStart(40, '0')}` as Address;
-const multicall3 = address(999);
-const at = (number: bigint): BlockRef => ({
-  number,
-  hash: `0x${number.toString(16).padStart(64, 'a')}` as Hex,
-  parentHash: `0x${(number - 1n).toString(16).padStart(64, 'b')}` as Hex,
-  timestamp: 1_000n + number,
-});
+const blockHash = (number: bigint): Hex => `0x${number.toString(16).padStart(64, 'a')}`;
 
 const emptyStats = (): RpcStats => ({ requests: 0, attempts: 0, byMethod: {}, errors: {}, endpoints: [] });
 
@@ -76,7 +70,7 @@ class FakeRpc implements RpcClient {
 
 const callsFrom = (params: unknown[]) => {
   const transaction = params[0] as { to: Address; data: Hex };
-  expect(transaction.to).toBe(multicall3);
+  expect(transaction.to).toBe(MULTICALL3);
   const decoded = decodeFunctionData({ abi: aggregate3Abi, data: transaction.data });
   return decoded.args[0];
 };
@@ -103,10 +97,9 @@ test('ERC-20 calls round-trip through aggregate3 and are pinned to the requested
     });
   });
 
-  const block = at(123n);
-  const result = await readErc20Balances(rpc, account, tokens, block, { multicall3, batchSize: 10 });
+  const result = await readErc20Balances(rpc, account, tokens, blockHash(123n), 10);
   expect(receivedMethod).toBe('eth_call');
-  expect(receivedParams?.[1]).toEqual({ blockHash: block.hash });
+  expect(receivedParams?.[1]).toEqual({ blockHash: blockHash(123n) });
   expect(receivedCalls?.map((call) => call.target.toLowerCase())).toEqual(tokens);
   for (const call of receivedCalls ?? []) {
     expect(call.allowFailure).toBe(true);
@@ -114,9 +107,9 @@ test('ERC-20 calls round-trip through aggregate3 and are pinned to the requested
     expect(inner.args[0].toLowerCase()).toBe(account);
   }
   expect(result).toEqual([
-    { token: tokens[0], status: 'ok', balance: 11n },
-    { token: tokens[1], status: 'error', error: 'inner call failed' },
-    { token: tokens[2], status: 'error', error: 'invalid balanceOf return data' },
+    { status: 'ok', balance: 11n },
+    { status: 'error', error: 'inner call failed' },
+    { status: 'error', error: 'invalid balanceOf return data' },
   ]);
 });
 
@@ -138,24 +131,9 @@ test('out-of-gas failures recursively halve and preserve input order', async () 
     });
   });
 
-  const result = await readErc20Balances(rpc, address(50), tokens, at(77n), { multicall3, batchSize: 4 });
+  const result = await readErc20Balances(rpc, address(50), tokens, blockHash(77n), 4);
   expect(seenSizes).toEqual([4, 2, 1, 1, 2, 1, 1]);
-  expect(result.map((entry) => entry.balance)).toEqual([100n, 101n, 102n, 103n]);
-});
-
-test('a 401 fatal RpcError crosses viem and fails fast after one multicall', async () => {
-  const tokens = [address(20), address(21), address(22), address(23)];
-  let calls = 0;
-  const authError = new RpcError('fatal', 'HTTP 401 unauthorized');
-  const rpc = new FakeRpc(() => {
-    calls += 1;
-    throw authError;
-  });
-
-  await expect(
-    readErc20Balances(rpc, address(50), tokens, at(77n), { multicall3, batchSize: 4 }),
-  ).rejects.toBe(authError);
-  expect(calls).toBe(1);
+  expect(result).toEqual([100n, 101n, 102n, 103n].map((balance) => ({ status: 'ok', balance })));
 });
 
 test('ERC-721 ownerOf results decode and normalize owner addresses', async () => {
@@ -163,7 +141,7 @@ test('ERC-721 ownerOf results decode and normalize owner addresses', async () =>
   const items = [{ token, tokenId: 5n }, { token, tokenId: 9n }];
   const owner = address(88);
   const rpc = new FakeRpc((_method, params) => {
-    expect(params[1]).toEqual({ blockHash: at(500n).hash });
+    expect(params[1]).toEqual({ blockHash: blockHash(500n) });
     const calls = callsFrom(params);
     expect(calls.map((call) => decodeFunctionData({ abi: ownerOfAbi, data: call.callData }).args[0])).toEqual([5n, 9n]);
     return encodeFunctionResult({
@@ -176,6 +154,6 @@ test('ERC-721 ownerOf results decode and normalize owner addresses', async () =>
     });
   });
 
-  expect(await readErc721Owners(rpc, items, at(500n), { multicall3, batchSize: 100 }))
-    .toEqual(items.map((item) => ({ ...item, status: 'ok', owner })));
+  expect(await readErc721Owners(rpc, items, blockHash(500n), 100))
+    .toEqual(items.map(() => ({ status: 'ok', owner })));
 });

@@ -1,5 +1,4 @@
-// Shared contracts. Every module codes against these; change them only in coordination.
-// Runs on Node's native type stripping: no enums, no parameter properties, `import type` for types.
+// Shared contracts. Runs on Node's native type stripping: no enums, no parameter properties, `import type` for types.
 
 export type Hex = `0x${string}`;
 /** Always lowercase 0x-prefixed 20-byte address. */
@@ -10,16 +9,13 @@ export type TokenStandard = 'erc20' | 'erc721';
 export interface BlockRef {
   number: bigint;
   hash: Hex;
-  parentHash: Hex;
   /** Block header timestamp, in Unix seconds. */
   timestamp: bigint;
 }
 
 export interface HeadObservation {
   block: BlockRef;
-  /** Epoch milliseconds of the last successful RPC response for this head kind. */
-  lastResponseAt: number;
-  /** Epoch milliseconds when this head kind last advanced to a higher block number. */
+  /** Epoch milliseconds when the head last advanced to a higher block number. */
   lastProgressAt: number;
   stale: boolean;
 }
@@ -27,17 +23,6 @@ export interface HeadObservation {
 export interface BlockRange {
   fromBlock: bigint;
   toBlock: bigint; // inclusive
-}
-
-/** Raw eth_getLogs entry, as returned by the node. */
-export interface RawLog {
-  address: Address;
-  topics: Hex[];
-  data: Hex;
-  blockNumber: bigint;
-  blockHash: Hex;
-  transactionHash: Hex;
-  logIndex: number;
 }
 
 /** A decoded Transfer(address,address,uint256) log. */
@@ -103,35 +88,21 @@ export interface ChainAdapter {
   normalizeAddress(input: string): Address | undefined;
   /** Protocol-finalized head used for durable discovery. */
   finalizedHead(): Promise<HeadObservation>;
-  /** Confirmation-based head retained for the later realtime tail. */
-  safeHead(): Promise<HeadObservation>;
-  /** Raw latest head if safeHead() has already populated it; never triggers RPC. */
-  cachedLatestHead?(): HeadObservation | undefined;
+  /** Highest latest-block number seen by finalizedHead()'s background refresh; never triggers RPC. */
+  cachedLatestBlockNumber?(): bigint | undefined;
   /**
    * Aggregate every Transfer with `account` on either side within range (both directions).
    * Must handle provider range/result limits internally (adaptive splitting); rejects if either direction fails.
    */
   scanChunk(account: Address, range: BlockRange): Promise<ChunkScan>;
-  /** balanceOf(account) for each token, pinned to one block. Never throws per token. */
-  erc20Balances(account: Address, tokens: Address[], at: BlockRef): Promise<BalanceResult[]>;
-  /** ownerOf(tokenId) for each (token, tokenId), pinned to one block. Never throws per item. */
-  erc721Owners(items: { token: Address; tokenId: bigint }[], at: BlockRef): Promise<OwnerResult[]>;
+  /** balanceOf(account) for each token, in input order, pinned to one block hash. Never throws per token. */
+  erc20Balances(account: Address, tokens: Address[], blockHash: Hex): Promise<BalanceResult[]>;
+  /** ownerOf(tokenId) for each item, in input order, pinned to one block hash. Never throws per item. */
+  erc721Owners(items: { token: Address; tokenId: bigint }[], blockHash: Hex): Promise<OwnerResult[]>;
 }
 
-export interface BalanceResult {
-  token: Address;
-  status: 'ok' | 'error';
-  balance?: bigint;
-  error?: string;
-}
-
-export interface OwnerResult {
-  token: Address;
-  tokenId: bigint;
-  status: 'ok' | 'error';
-  owner?: Address;
-  error?: string;
-}
+export type BalanceResult = { status: 'ok'; balance: bigint } | { status: 'error'; error: string };
+export type OwnerResult = { status: 'ok'; owner: Address } | { status: 'error'; error: string };
 
 // ---------------------------------------------------------------------------
 // Low-level JSON-RPC client (src/rpc). Resilience lives here.
@@ -144,10 +115,6 @@ export interface RpcClient {
 }
 
 export interface RpcRequestOptions {
-  /** Abort after this many ms per attempt (default from config). */
-  timeoutMs?: number;
-  /** Override max attempts across all endpoints. */
-  maxAttempts?: number;
   /** Treat a syntactically successful but unusable result as a transient endpoint failure. */
   validate?: (result: unknown) => boolean;
   /** Throw a timeout (error.timeout) at once instead of retrying it, e.g. so the caller can split a log range. */
@@ -178,22 +145,11 @@ export type RpcErrorKind =
   | 'unsupported' // method not available / archive refused on this endpoint
   | 'fatal'; // anything else (bad params, execution reverted)
 
-export interface RpcErrorShape extends Error {
-  kind: RpcErrorKind;
-  code?: number;
-  /** Suggested sub-range parsed from provider messages like "Try with this block range [0x.., 0x..]". */
-  suggestedRange?: BlockRange;
-  /** Set on transient errors caused by a client, gateway, or provider-side timeout. */
-  timeout?: boolean;
-}
-
 // ---------------------------------------------------------------------------
 // Storage (src/store). SQLite (node:sqlite) for the PoC; Postgres later behind the same interface.
 // ---------------------------------------------------------------------------
 
 export interface Holding {
-  network: string;
-  holder: Address;
   token: Address;
   standard: TokenStandard;
   firstBlock: bigint;
@@ -203,28 +159,16 @@ export interface Holding {
 }
 
 export interface NftItem {
-  network: string;
-  holder: Address;
   token: Address;
   tokenId: bigint;
-  /** true if the latest seen Transfer of this tokenId (by block, logIndex) was TO holder. */
+  /** true if the latest seen Transfer of this tokenId (by block, logIndex) was TO the account. */
   heldBySeenLogs: boolean;
   lastBlock: bigint;
 }
 
-export interface AccountCursor {
-  network: string;
-  account: Address;
-  /** Highest block fully scanned for this account; startBlock - 1 if never scanned. */
-  scannedTo: bigint;
-  scannedToHash: Hex;
-  scannedToParentHash: Hex;
-  scannedToTimestamp: bigint;
-  updatedAt: number; // epoch ms
-}
-
 export interface Store {
-  getCursor(network: string, account: Address): AccountCursor | undefined;
+  /** Published finalized cursor: every chunk through this block was applied. */
+  getCursor(network: string, account: Address): BlockRef | undefined;
   /** Highest block whose events were applied, even if the finalized cursor is not complete yet. */
   getProgress(network: string, account: Address): bigint | undefined;
   /**
@@ -235,9 +179,10 @@ export interface Store {
   /** Last adaptive getLogs range used for this account, so the next scan of a heavy account starts small. */
   getLogsRange(network: string, account: Address): bigint | undefined;
   setLogsRange(network: string, account: Address, range: bigint): void;
-  /** Publish a consistent finalized height/hash pair after every chunk through it was applied. */
+  /** Publish a consistent finalized height/hash pair after every chunk through it was applied. Never moves back. */
   finalizeScan(network: string, account: Address, scannedTo: BlockRef): void;
-  holdings(network: string, account: Address, standard: TokenStandard): Holding[];
+  /** ERC-20 and ERC-721 summaries, newest first. */
+  holdings(network: string, account: Address): Holding[];
   nftItems(network: string, account: Address): NftItem[];
   close(): void;
 }
@@ -252,7 +197,6 @@ export interface DiscoveryResult {
   fromBlock: bigint; // network start block
   blockHeight: bigint; // data valid up to and including this block
   blockHash: Hex;
-  blockParentHash: Hex;
   blockTimestamp: bigint;
   finality: 'finalized';
   lastProgressAt: number;
@@ -264,6 +208,6 @@ export interface DiscoveryResult {
 }
 
 export interface DiscoveryService {
-  /** Bring the account up to finalized head (single-flight per account), then read from store. */
+  /** Validate network and address, bring the account up to finalized head (single-flight per account), then read. */
   discover(network: string, account: string): Promise<DiscoveryResult>;
 }

@@ -10,24 +10,7 @@ import { openSqliteStore } from './store/sqlite.ts';
 
 const rpc = createRpcClient(config.rpc);
 const eth = config.ethereum;
-const adapters = {
-  [eth.network]: createEvmAdapter(rpc, {
-    network: eth.network,
-    chain: mainnet,
-    startBlock: eth.startBlock,
-    confirmations: eth.confirmations,
-    headCacheMs: config.headCacheMs,
-    finalizedMaxNoProgressMs: config.finalizedMaxNoProgressMs,
-    latestMaxNoProgressMs: config.latestMaxNoProgressMs,
-    logsMaxRange: eth.logsMaxRange,
-    logsMinRange: eth.logsMinRange,
-    logsHeavyBytes: eth.logsHeavyBytes,
-    logsHeavyMs: eth.logsHeavyMs,
-    scanConcurrency: eth.scanConcurrency,
-    multicall3: eth.multicall3,
-    multicallBatch: eth.multicallBatch,
-  }),
-};
+const adapters = { [eth.network]: createEvmAdapter(rpc, { ...eth, chain: mainnet }) };
 const store = openSqliteStore(config.dbPath);
 const discovery = createDiscoveryService({
   adapters,

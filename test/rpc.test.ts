@@ -87,21 +87,7 @@ test('client retries on a fallback and opens the failing endpoint breaker', asyn
   expect(client.stats().errors.transient).toBe(5);
 });
 
-test('too-large errors are returned immediately without endpoint retry', async () => {
-  let calls = 0;
-  vi.stubGlobal('fetch', vi.fn(async () => {
-    calls += 1;
-    return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code: -32005, message: 'block range too large' } }), {
-      status: 200,
-      headers: { 'content-type': 'application/json' },
-    });
-  }));
-  const client = createRpcClient({ urls: ['https://only.example/key'], timeoutMs: 1_000, maxAttempts: 4, maxRps: 100 });
-  await expect(client.request('eth_getLogs', [])).rejects.toMatchObject({ kind: 'too_large' });
-  expect(calls).toBe(1);
-});
-
-test('head tracker is single-flight, confirmation-pinned, cached, and stale-aware', async () => {
+test('finalized head is single-flight, cached, records the latest number, and serves stale on failure', async () => {
   let calls = 0;
   let fail = false;
   const rpc: RpcClient = {
@@ -110,7 +96,7 @@ test('head tracker is single-flight, confirmation-pinned, cached, and stale-awar
       if (fail) throw new Error('offline');
       await Promise.resolve();
       const tag = params[0];
-      const number = tag === 'latest' ? '0xa' : String(tag);
+      const number = tag === 'latest' ? '0xa' : '0x8';
       return {
         number,
         hash: `0x${number.slice(2).padStart(64, 'a')}`,
@@ -120,22 +106,21 @@ test('head tracker is single-flight, confirmation-pinned, cached, and stale-awar
     },
     stats: rpcStats,
   };
-  const tracker = createHeadTracker(rpc, { confirmations: 2n, cacheMs: 60_000, chain: mainnet });
-  const [first, concurrent] = await Promise.all([tracker.safeHead(), tracker.safeHead()]);
+  const tracker = createHeadTracker(rpc, { cacheMs: 60_000, maxNoProgressMs: 60_000, chain: mainnet });
+  const [first, concurrent] = await Promise.all([tracker.finalizedHead(), tracker.finalizedHead()]);
   expect(first.block.number).toBe(8n);
   expect(concurrent).toEqual(first);
+  expect(calls, 'one finalized + one background latest').toBe(2);
+  expect(await tracker.finalizedHead()).toEqual(first);
   expect(calls).toBe(2);
-  expect(await tracker.safeHead()).toEqual(first);
-  expect(calls).toBe(2);
-  expect(tracker.latest()?.block.number).toBe(10n);
+  expect(tracker.latestBlockNumber()).toBe(10n);
   expect(first.stale).toBe(false);
 
-  const uncached = createHeadTracker(rpc, { confirmations: 2n, cacheMs: 0, chain: mainnet });
-  const prior = await uncached.safeHead();
+  const uncached = createHeadTracker(rpc, { cacheMs: 0, maxNoProgressMs: 60_000, chain: mainnet });
+  const prior = await uncached.finalizedHead();
   fail = true;
-  const fallback = await uncached.safeHead();
+  const fallback = await uncached.finalizedHead();
   expect(fallback.block).toEqual(prior.block);
-  expect(fallback.lastResponseAt).toBe(prior.lastResponseAt);
   expect(fallback.lastProgressAt).toBe(prior.lastProgressAt);
   expect(fallback.stale).toBe(true);
 });
@@ -156,13 +141,12 @@ test('finalized head never moves backwards and marks a lagging observation stale
     },
     stats: rpcStats,
   };
-  const tracker = createHeadTracker(rpc, { confirmations: 2n, cacheMs: 0, chain: mainnet });
+  const tracker = createHeadTracker(rpc, { cacheMs: 0, maxNoProgressMs: 60_000, chain: mainnet });
   const first = await tracker.finalizedHead();
   number = 9n;
   const lagging = await tracker.finalizedHead();
   expect(lagging.block).toEqual(first.block);
   expect(lagging.lastProgressAt).toBe(first.lastProgressAt);
-  expect(lagging.lastResponseAt).toBeGreaterThanOrEqual(first.lastResponseAt);
   expect(lagging.stale).toBe(true);
   // Recorded rather than asserted in the mock: a throw there would be swallowed by the background 'latest' refresh.
   expect(tags).toContain('finalized');
@@ -190,7 +174,7 @@ test('result validation fails over from a null head response', async () => {
     maxAttempts: 2,
     maxRps: 1_000,
   });
-  const tracker = createHeadTracker(client, { confirmations: 0n, cacheMs: 0, chain: mainnet });
+  const tracker = createHeadTracker(client, { cacheMs: 0, maxNoProgressMs: 60_000, chain: mainnet });
   const observation = await tracker.finalizedHead();
   expect(observation.block.number).toBe(10n);
   expect(called.length).toBe(2);
@@ -214,18 +198,11 @@ test('an unchanged finalized block becomes stale and progress resets on advance'
     },
     stats: rpcStats,
   };
-  const tracker = createHeadTracker(rpc, {
-    confirmations: 0n,
-    cacheMs: 0,
-    chain: mainnet,
-    finalizedMaxNoProgressMs: 100,
-    latestMaxNoProgressMs: 100,
-  });
+  const tracker = createHeadTracker(rpc, { cacheMs: 0, maxNoProgressMs: 100, chain: mainnet });
   const first = await tracker.finalizedHead();
   await vi.advanceTimersByTimeAsync(101);
   const stuck = await tracker.finalizedHead();
   expect(stuck.stale).toBe(true);
-  expect(stuck.lastResponseAt).toBe(1_101);
   expect(stuck.lastProgressAt).toBe(first.lastProgressAt);
 
   number = 11n;
@@ -293,16 +270,6 @@ test('HTTP 401 is fatal: one attempt, no failover', async () => {
   const client = createRpcClient({ urls: ['https://a.example/key', 'https://b.example/key'], timeoutMs: 1_000, maxAttempts: 4, maxRps: 1_000 });
   await expect(client.request('eth_blockNumber', [])).rejects.toMatchObject({ name: 'RpcError', kind: 'fatal', message: 'HTTP 401' });
   expect(urls).toEqual(['https://a.example/key']);
-});
-
-test('a null result rejected by validate fails over to the second endpoint', async () => {
-  const urls = stubFetch(url => json({ jsonrpc: '2.0', id: 1, result: url.startsWith('https://a.example') ? null : { number: '0x1' } }));
-  const client = createRpcClient({ urls: ['https://a.example/key', 'https://b.example/key'], timeoutMs: 1_000, maxAttempts: 2, maxRps: 1_000 });
-  vi.spyOn(Math, 'random').mockReturnValue(0);
-  const block = await client.request('eth_getBlockByNumber', ['finalized', false], { validate: result => result !== null });
-  expect(block).toEqual({ number: '0x1' });
-  expect(urls.map(url => new URL(url).host)).toEqual(['a.example', 'b.example']);
-  expect(client.stats().errors).toEqual({ transient: 1 });
 });
 
 test('endpoint path and key never leak into thrown errors or stats', async () => {

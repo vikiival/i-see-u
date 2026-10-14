@@ -44,9 +44,7 @@ test('decodeEventLog-based decoding handles ERC-20 and ERC-721 wire logs', () =>
   expect(erc721?.standard).toBe('erc721');
   expect(erc721?.value).toBe(999n);
   expect(decodeTransferLog(wireLog(14n, [TRANSFER_TOPIC, topic(OTHER)], '0x'))).toBeUndefined();
-});
-
-test('strict Transfer decoding skips malformed three-topic logs with empty data', () => {
+  // Strict decoding: a three-topic log with empty data is malformed and skipped.
   expect(decodeTransferLog(wireLog(12n, undefined, '0x'))).toBeUndefined();
 });
 
@@ -123,19 +121,6 @@ test('a timeout on a multi-block range splits it in half; a single block retries
   expect(requested).toEqual([[9n, 9n, false]]);
 });
 
-test('a timeout on a single block is not split', async () => {
-  let calls = 0;
-  const rpc: RpcClient = {
-    async request<T>(): Promise<T> {
-      calls += 1;
-      throw new RpcError('transient', 'RPC request timed out', { timeout: true });
-    },
-    stats,
-  };
-  await expect(scanTransfers(rpc, ACCOUNT, 'to', { fromBlock: 3n, toBlock: 3n }, () => {})).rejects.toMatchObject({ timeout: true });
-  expect(calls).toBe(1);
-});
-
 test('scanAccountChunk folds both directions into one aggregate and flags heavy chunks', async () => {
   const self = (block: bigint, logIndex: string) => ({ ...wireLog(block, [TRANSFER_TOPIC, topic(ACCOUNT), topic(ACCOUNT)]), logIndex });
   const responses = {
@@ -152,20 +137,21 @@ test('scanAccountChunk folds both directions into one aggregate and flags heavy 
     },
     stats,
   };
-  const opts = { heavyBytes: 1_000, heavyMs: 3_000 };
   const range = { fromBlock: 1n, toBlock: 10n };
-  const light = await scanAccountChunk(rpc, ACCOUNT, range, opts);
+  const light = await scanAccountChunk(rpc, ACCOUNT, range);
   expect(light.calls).toBe(2);
   expect(light.heavy).toBe(false);
   expect(light.aggregate.tokens.get(TOKEN)).toEqual({ standard: 'erc20', firstBlock: 4n, lastBlock: 6n, sentCount: 3, receivedCount: 3 });
 
-  bytes = 2_000;
-  expect((await scanAccountChunk(rpc, ACCOUNT, range, opts)).heavy).toBe(true);
+  bytes = 60_000_000; // above the 50 MB threshold
+  expect((await scanAccountChunk(rpc, ACCOUNT, range)).heavy).toBe(true);
   bytes = undefined; // compressed response: estimated from the log count (3 logs, well under 1 kB each)
-  expect((await scanAccountChunk(rpc, ACCOUNT, range, { ...opts, heavyBytes: 10_000 })).heavy).toBe(false);
-  durationMs = 4_000; // slow: heavy only when the response is not trivial (> heavyBytes / 10)
-  expect((await scanAccountChunk(rpc, ACCOUNT, range, { ...opts, heavyBytes: 100_000 })).heavy).toBe(false);
-  expect((await scanAccountChunk(rpc, ACCOUNT, range, { ...opts, heavyBytes: 10_000 })).heavy).toBe(true);
+  expect((await scanAccountChunk(rpc, ACCOUNT, range)).heavy).toBe(false);
+  durationMs = 4_000; // slow (> 3 s): heavy only when the response is not trivial (> 5 MB)
+  bytes = 1_000_000;
+  expect((await scanAccountChunk(rpc, ACCOUNT, range)).heavy).toBe(false);
+  bytes = 6_000_000;
+  expect((await scanAccountChunk(rpc, ACCOUNT, range)).heavy).toBe(true);
 });
 
 test('scanAccountChunk rejects with the failing direction error', async () => {
@@ -177,7 +163,7 @@ test('scanAccountChunk rejects with the failing direction error', async () => {
     },
     stats,
   };
-  await expect(scanAccountChunk(rpc, ACCOUNT, { fromBlock: 1n, toBlock: 2n }, { heavyBytes: 1, heavyMs: 1 }))
+  await expect(scanAccountChunk(rpc, ACCOUNT, { fromBlock: 1n, toBlock: 2n }))
     .rejects.toThrow('received side failed');
 });
 

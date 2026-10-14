@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { HttpRequestError, RpcRequestError, TimeoutError, http } from 'viem';
-import type { EIP1193RequestFn, HttpTransport } from 'viem';
+import type { EIP1193RequestFn } from 'viem';
 
 import type { RpcClient, RpcErrorKind, RpcRequestOptions, RpcStats } from '../core/types.ts';
 import { RpcError, classify } from './errors.ts';
@@ -13,8 +13,7 @@ export interface RpcClientOptions {
 }
 
 interface Endpoint {
-  transport: HttpTransport;
-  send: Map<number, EIP1193RequestFn>; // by timeout; viem fixes the timeout per transport instance
+  send: EIP1193RequestFn;
   displayUrl: string;
   failures: number;
   openUntil: number;
@@ -102,21 +101,19 @@ const failureOf = (error: unknown, response: Response | undefined): RpcError => 
 
 export function createRpcClient(options: RpcClientOptions): RpcClient {
   if (options.urls.length === 0) throw new Error('At least one RPC URL is required');
-  if (!(options.timeoutMs > 0)) throw new Error('timeoutMs must be positive');
-  if (!Number.isInteger(options.maxAttempts) || options.maxAttempts < 1) throw new Error('maxAttempts must be a positive integer');
-  if (!(options.maxRps > 0)) throw new Error('maxRps must be positive');
 
   const endpoints: Endpoint[] = options.urls.map(value => {
     const url = new URL(value);
     return {
       // viem does HTTP/JSON-RPC mechanics only: no retries, no batching, no body-size cap (wide getLogs can be 100s of MB).
-      transport: http(url.href, {
+      // config.request is the bare transport function, so viem's buildRequest retry/shouldRetry/error remapping never runs.
+      send: http(url.href, {
         batch: false,
         retryCount: 0,
+        timeout: options.timeoutMs,
         maxResponseBodySize: false,
         onFetchResponse: response => attemptResponse.getStore()?.(response),
-      }),
-      send: new Map(),
+      })({ retryCount: 0 }).config.request,
       displayUrl: redactedUrl(url),
       failures: 0,
       openUntil: 0,
@@ -129,17 +126,6 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
     attempts: 0,
     byMethod: {} as Record<string, number>,
     errors: {} as Record<string, number>,
-  };
-
-  // Calls config.request (the bare transport function), not transport.request, so viem's buildRequest
-  // retry/shouldRetry/error remapping never runs.
-  const sendFor = (endpoint: Endpoint, timeoutMs: number): EIP1193RequestFn => {
-    let send = endpoint.send.get(timeoutMs);
-    if (!send) {
-      send = endpoint.transport({ retryCount: 0, timeout: timeoutMs }).config.request;
-      endpoint.send.set(timeoutMs, send);
-    }
-    return send;
   };
 
   const bucketCapacity = Math.max(1, options.maxRps);
@@ -198,10 +184,7 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
 
   const request = async <T>(method: string, params: unknown[], requestOptions: RpcRequestOptions = {}): Promise<T> => {
     counters.requests += 1;
-    const maxAttempts = requestOptions.maxAttempts ?? options.maxAttempts;
-    const timeoutMs = requestOptions.timeoutMs ?? options.timeoutMs;
-    if (!Number.isInteger(maxAttempts) || maxAttempts < 1) throw new Error('maxAttempts must be a positive integer');
-    if (!(timeoutMs > 0)) throw new Error('timeoutMs must be positive');
+    const { maxAttempts } = options;
 
     let lastError: RpcError | undefined;
     let endpointOffset = 0;
@@ -225,7 +208,7 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
       try {
         const result = await attemptResponse.run(
           value => { response = value; },
-          () => sendFor(endpoint, timeoutMs)({ method, params } as never),
+          () => endpoint.send({ method, params } as never),
         ) as T | undefined;
         if (result === undefined) throw new RpcError('fatal', 'Malformed JSON-RPC response');
         if (requestOptions.validate && !requestOptions.validate(result)) {
@@ -255,7 +238,7 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
 
         if (attempt + 1 < maxAttempts) {
           const cap = Math.min(BACKOFF_CAP_MS, BACKOFF_BASE_MS * 2 ** attempt);
-          const headers = (response as Response | undefined)?.headers ?? (cause instanceof HttpRequestError ? cause.headers : undefined);
+          const headers = response?.headers ?? (cause instanceof HttpRequestError ? cause.headers : undefined);
           // Honour Retry-After, but never hold an API request longer than RETRY_AFTER_CAP_MS per attempt.
           await sleep(Math.max(Math.min(retryAfterMs(headers?.get('retry-after')), RETRY_AFTER_CAP_MS), Math.random() * cap));
         }

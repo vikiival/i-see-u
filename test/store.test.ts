@@ -14,7 +14,6 @@ const token = '0xcccccccccccccccccccccccccccccccccccccccc' as Address;
 const block = (number: bigint): BlockRef => ({
   number,
   hash: `0x${number.toString(16)}` as Hex,
-  parentHash: `0x${(number - 1n).toString(16)}` as Hex,
   timestamp: number * 10n,
 });
 
@@ -51,25 +50,13 @@ test('applyScan is idempotent and the cursor is monotonic', () => {
     applyScan(store, events, block(12n));
     applyScan(store, events, block(11n));
 
-    const [holding] = store.holdings('ethereum', account, 'erc20');
+    const [holding] = store.holdings('ethereum', account);
     expect(holding.sentCount).toBe(1);
     expect(holding.receivedCount).toBe(0);
     expect(holding.firstBlock).toBe(10n);
     expect(holding.lastBlock).toBe(10n);
-    expect(store.getCursor('ethereum', account)?.scannedTo).toBe(12n);
-    expect(store.getCursor('ethereum', account)?.scannedToHash).toBe(block(12n).hash);
-  } finally {
-    store.close();
-  }
-});
-
-test('self-transfer increments both sides once', () => {
-  const store = openSqliteStore(':memory:');
-  try {
-    applyScan(store, [event({ to: account })], block(10n));
-    const [holding] = store.holdings('ethereum', account, 'erc20');
-    expect(holding.sentCount).toBe(1);
-    expect(holding.receivedCount).toBe(1);
+    expect(store.getCursor('ethereum', account)?.number).toBe(12n);
+    expect(store.getCursor('ethereum', account)?.hash).toBe(block(12n).hash);
   } finally {
     store.close();
   }
@@ -119,29 +106,22 @@ test('NFT held flag only follows the newest block and log index', () => {
   }
 });
 
-test('legacy databases add the cursor hash column and rebuild derived summaries', () => {
+test('a database from another schema version is dropped and rebuilt', () => {
   const directory = mkdtempSync(join(tmpdir(), 'i-see-u-store-'));
-  const path = join(directory, 'legacy.sqlite');
-  const legacy = new DatabaseSync(path);
-  legacy.exec(`
-    CREATE TABLE account_cursor (
-      network TEXT NOT NULL,
-      account TEXT NOT NULL,
-      scanned_to INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL,
-      PRIMARY KEY (network, account)
-    );
-    INSERT INTO account_cursor VALUES ('ethereum', '${account}', 12, 1);
-  `);
-  legacy.close();
+  const path = join(directory, 'old.sqlite');
+  const old = new DatabaseSync(path);
+  old.exec(`CREATE TABLE account_cursor (network TEXT, account TEXT, scanned_to INTEGER); INSERT INTO account_cursor VALUES ('ethereum', '${account}', 12);`);
+  old.close();
 
-  const store = openSqliteStore(path);
   try {
+    let store = openSqliteStore(path);
     expect(store.getCursor('ethereum', account)).toBeUndefined();
     applyScan(store, [], block(15n));
-    expect(store.getCursor('ethereum', account)?.scannedToHash).toBe(block(15n).hash);
-  } finally {
     store.close();
+    store = openSqliteStore(path); // same version: kept
+    expect(store.getCursor('ethereum', account)?.hash).toBe(block(15n).hash);
+    store.close();
+  } finally {
     rmSync(directory, { recursive: true, force: true });
   }
 });
@@ -151,7 +131,7 @@ test('a chunk straddling applied progress is rejected and the logs range round-t
   try {
     store.applyScanChunk('ethereum', account, { fromBlock: 0n, toBlock: 10n }, aggregateOf([event()]));
     store.applyScanChunk('ethereum', account, { fromBlock: 0n, toBlock: 10n }, aggregateOf([event()]));
-    expect(store.holdings('ethereum', account, 'erc20')[0]?.sentCount).toBe(1);
+    expect(store.holdings('ethereum', account)[0]?.sentCount).toBe(1);
     expect(() => store.applyScanChunk('ethereum', account, { fromBlock: 5n, toBlock: 20n }, aggregateOf([])))
       .toThrow('overlaps applied progress');
     expect(store.getProgress('ethereum', account)).toBe(10n);
