@@ -62,8 +62,13 @@ export function createDiscoveryService(deps: DiscoveryDependencies): DiscoverySe
     let newBlocks = 0n;
     let rpcCalls = 0;
     if (fromBlock <= target) {
-      const { logsMinRange: minRange, logsMaxRange: maxRange, scanConcurrency: concurrency } = adapter;
-      const persisted = await deps.store.getLogsRange(adapter.network, account);
+      const source = adapter.accountLogs;
+      const maxRange = source.preferredMaxRange;
+      const minRange = source.adaptiveRange?.minRange ?? maxRange;
+      const concurrency = adapter.scanConcurrency;
+      // Per-account adaptive persistence belongs to the source that understands `heavy` (RPC). A fixed-range
+      // HyperSync source deliberately ignores an old RPC range and keeps its large independently committed chunks.
+      const persisted = source.adaptiveRange ? await deps.store.getLogsRange(adapter.network, account) : undefined;
       let range = persisted === undefined || persisted > maxRange ? maxRange : persisted < minRange ? minRange : persisted;
       let lightStreak = 0;
       // Called in completion order: shrink below a heavy chunk's own size, grow after a streak of light ones.
@@ -94,7 +99,7 @@ export function createDiscoveryService(deps: DiscoveryDependencies): DiscoverySe
           nextFrom = slot.range.toBlock + 1n;
           window.push(slot);
           active += 1;
-          adapter.scanChunk(account, slot.range).then(
+          source.scanAccount(account, slot.range).then(
             (value): ChunkOutcome => ({ ok: true, ...value }),
             (error: unknown): ChunkOutcome => ({ ok: false, error }),
           ).then((outcome) => {
@@ -126,7 +131,7 @@ export function createDiscoveryService(deps: DiscoveryDependencies): DiscoverySe
       } finally {
         stopped = true;
         while (active > 0) await settled();
-        if (range !== persisted) await deps.store.setLogsRange(adapter.network, account, range);
+        if (source.adaptiveRange && range !== persisted) await deps.store.setLogsRange(adapter.network, account, range);
       }
     }
 

@@ -201,6 +201,8 @@ export function createApp(deps: RouteDeps, opts: { requestLog?: boolean } = {}):
         },
       }];
     })),
+    logSources: Object.fromEntries(Object.entries(deps.adapters)
+      .map(([network, adapter]) => [network, adapter.accountLogs.stats()])),
     rpc: deps.rpcStats(),
   }));
 

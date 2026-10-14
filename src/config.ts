@@ -1,3 +1,5 @@
+import { networkRegistry } from './networks.ts';
+
 try {
   process.loadEnvFile(new URL('../.env', import.meta.url));
 } catch (error) {
@@ -17,6 +19,30 @@ const int = (k: string, d: string): number => {
   return v;
 };
 
+const choice = <T extends string>(k: string, values: readonly T[], d: T): T => {
+  const value = env(k, d);
+  if (!values.includes(value as T)) throw new Error(`${k} must be one of ${values.join(', ')}`);
+  return value as T;
+};
+
+const evmTuning = {
+  /** Mark the finalized head stale after this long without a higher block number. */
+  finalizedMaxNoProgressMs: int('FINALIZED_MAX_NO_PROGRESS_MS', '1200000'),
+  /** Max block span per address-filtered eth_getLogs call (Quicknode paid: 10k). */
+  logsMaxRange: BigInt(int('ETH_LOGS_MAX_RANGE', '3000')),
+  /** Floor of the adaptive per-account RPC range; heavy accounts shrink towards it. */
+  logsMinRange: BigInt(int('ETH_LOGS_MIN_RANGE', '500')),
+  /** Backfill chunks in flight per account; completed + in flight <= 2x this. */
+  scanConcurrency: int('ETH_SCAN_CONCURRENCY', '8'),
+  /** balanceOf calls per Multicall3 aggregate3 request (measured safe up to ~2000). */
+  multicallBatch: int('ETH_MULTICALL_BATCH', '1000'),
+  /** Max blocks per unfiltered follower getLogs (~450 KB of JSON per block; must stay <= 1000). */
+  followerMaxRange: BigInt(int('ETH_FOLLOWER_MAX_RANGE', '500')),
+};
+const networks = Object.fromEntries(Object.values(networkRegistry)
+  .map((network) => [network.name, { ...network, ...evmTuning }]));
+const ethereum = networks.ethereum;
+
 export const config = {
   port: int('PORT', '3000'),
   databaseUrl: env('DATABASE_URL', 'postgresql://iseeu:iseeu@localhost:5432/iseeu'),
@@ -28,21 +54,15 @@ export const config = {
     /** Client-side cap on outgoing requests per second across all endpoints. */
     maxRps: int('RPC_MAX_RPS', '20'),
   },
-  ethereum: {
-    network: 'ethereum',
-    startBlock: 25_933_634n,
-    /** Mark the finalized head stale after this long without a higher block number. */
-    finalizedMaxNoProgressMs: int('FINALIZED_MAX_NO_PROGRESS_MS', '1200000'),
-    /** Max block span per address-filtered eth_getLogs call (Quicknode paid: 10k). */
-    logsMaxRange: BigInt(int('ETH_LOGS_MAX_RANGE', '3000')),
-    /** Floor of the adaptive per-account range; heavy accounts shrink towards it. */
-    logsMinRange: BigInt(int('ETH_LOGS_MIN_RANGE', '500')),
-    /** Chunks (each 2 getLogs calls) in flight per account scan; completed + in flight <= 2x this. */
-    scanConcurrency: int('ETH_SCAN_CONCURRENCY', '8'),
-    /** balanceOf calls per Multicall3 aggregate3 request (measured safe up to ~2000). */
-    multicallBatch: int('ETH_MULTICALL_BATCH', '1000'),
-    /** Max blocks per unfiltered follower getLogs (~450 KB of JSON per block; must stay <= 1000). */
-    followerMaxRange: BigInt(int('ETH_FOLLOWER_MAX_RANGE', '500')),
+  networks,
+  /** Kept as a compact single-network convenience for the PoC. */
+  ethereum,
+  logSource: choice('LOG_SOURCE', ['auto', 'hypersync', 'rpc'] as const, 'rpc'),
+  hypersync: {
+    apiToken: process.env.HYPERSYNC_API_KEY || undefined,
+    url: process.env.HYPERSYNC_URL || undefined,
+    maxRange: BigInt(int('HYPERSYNC_MAX_RANGE', '100000')),
+    timeoutMs: int('HYPERSYNC_TIMEOUT_MS', '30000'),
   },
   follower: {
     /** How often the follower polls the finalized head (finalized advances ~every 6.4 min). */
@@ -69,9 +89,14 @@ export const config = {
   maxHeadProgressAgeMs: int('MAX_HEAD_AGE_MS', '1800000'),
 };
 
-if (config.ethereum.logsMinRange > config.ethereum.logsMaxRange) {
-  throw new Error('ETH_LOGS_MIN_RANGE must not exceed ETH_LOGS_MAX_RANGE');
+for (const network of Object.values(config.networks)) {
+  if (network.logsMinRange > network.logsMaxRange) {
+    throw new Error('ETH_LOGS_MIN_RANGE must not exceed ETH_LOGS_MAX_RANGE');
+  }
+  if (network.followerMaxRange > 1_000n) {
+    throw new Error('ETH_FOLLOWER_MAX_RANGE must not exceed 1000 (unfiltered responses are ~450 KB per block)');
+  }
 }
-if (config.ethereum.followerMaxRange > 1_000n) {
-  throw new Error('ETH_FOLLOWER_MAX_RANGE must not exceed 1000 (unfiltered responses are ~450 KB per block)');
+if (config.logSource === 'hypersync' && !config.hypersync.apiToken) {
+  throw new Error('LOG_SOURCE=hypersync requires HYPERSYNC_API_KEY');
 }
