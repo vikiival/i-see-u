@@ -47,6 +47,7 @@ Optional env (numeric values must be positive integers; invalid values fail at s
 | `REQUEST_DEADLINE_MS` | 10000 | How long a request waits for RPC work (cold backfill, first balance read, ownership check) |
 | `BACKFILL_CONCURRENCY` / `BACKFILL_QUEUE` | 4 / 64 | Concurrent account backfills, and how many more may wait before requests get 503 |
 | `REQUEST_RPC_CONCURRENCY` / `REQUEST_RPC_QUEUE` | 16 / 256 | Same for first balance reads and `verifyOwnership` |
+| `MAX_VERIFY_OWNERSHIP_ITEMS` | 2000 | `verifyOwnership` is skipped (`ownershipError`, items `ownerStatus: skipped`) above this many held items; results are shared per account and block |
 
 ## Data sources
 

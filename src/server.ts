@@ -88,7 +88,7 @@ for (const tail of Object.values(tails)) tail.start();
 for (const worker of Object.values(balances)) worker.start();
 
 const app = createApp(
-  { discovery, adapters, balances, followers, tails, requestRpc, rpcStats: () => rpc.stats(), startedAt: Date.now() },
+  { discovery, adapters, balances, followers, tails, requestRpc, maxVerifyOwnershipItems: config.request.maxVerifyOwnershipItems, rpcStats: () => rpc.stats(), startedAt: Date.now() },
   { requestLog: process.env.LOG_LEVEL !== 'warn' && process.env.LOG_LEVEL !== 'error' },
 );
 

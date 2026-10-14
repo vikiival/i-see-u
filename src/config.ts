@@ -107,6 +107,8 @@ export const config = {
     /** Concurrent request-path RPC reads (first balance read, ownership), and how many more may wait. */
     rpcConcurrency: int('REQUEST_RPC_CONCURRENCY', '16'),
     rpcQueue: int('REQUEST_RPC_QUEUE', '256'),
+    /** verifyOwnership is skipped (not an error) when an account holds more NFT items than this. */
+    maxVerifyOwnershipItems: int('MAX_VERIFY_OWNERSHIP_ITEMS', '2000'),
   },
   /** Refuse discovery when the follower has not advanced for longer than this. */
   maxHeadProgressAgeMs: int('MAX_HEAD_AGE_MS', '1800000'),

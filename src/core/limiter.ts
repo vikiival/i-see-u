@@ -4,7 +4,7 @@ export const unavailable = (message: string, retryAfterS: number): Error =>
 
 export interface Limiter {
   /** Run fn when a slot is free; rejects with 503 at once when maxActive run and maxQueued already wait. */
-  run<T>(fn: () => Promise<T>): Promise<T>;
+  run<T>(fn: () => Promise<T>, opts?: { deadlineAt?: number }): Promise<T>;
   readonly active: number;
   readonly queued: number;
 }
@@ -21,10 +21,15 @@ export function createLimiter(maxActive: number, maxQueued: number, retryAfterS 
     }
   };
   return {
-    async run<T>(fn: () => Promise<T>): Promise<T> {
+    async run<T>(fn: () => Promise<T>, opts: { deadlineAt?: number } = {}): Promise<T> {
       if (active >= maxActive) {
         if (queue.length >= maxQueued) throw unavailable('Server busy: too many RPC-bound requests in flight', retryAfterS);
         await new Promise<void>((resolve) => queue.push(resolve));
+        // Opt-in: the caller already gave up, so do not spend RPC credits on it.
+        if (opts.deadlineAt !== undefined && Date.now() > opts.deadlineAt) {
+          release();
+          throw unavailable('Request deadline passed while queued', retryAfterS);
+        }
       } else {
         active += 1;
       }
