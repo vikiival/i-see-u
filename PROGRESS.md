@@ -19,6 +19,7 @@ Times are local (CEST). "We" is Viktor plus AI agents: a Claude orchestrator han
 | 15:42–15:54 | Postgres 18 and Drizzle | SQLite removed. PGlite in tests |
 | 15:54–16:21+ | Squid SDK, Envio and Ponder research | Squid SDK and Ponder rejected. HyperSync benchmarked live and is very promising for backfill |
 | 15:56–16:52 | Shared finalized follower and balance worker | Warm requests make 0 RPC calls. About 51M credits/month for 5k users |
+| 17:00– | HyperSync `LogSource` for backfill (in progress) | Codex, started from Viktor's main session. Pluggable per-account log source with Quicknode fallback |
 
 ---
 
@@ -257,6 +258,19 @@ Viktor: "We should also now set up Postgres. We agreed on that in the report." T
 4. **It owns the app:** its own schema, process and codegen. Balances via `publicClients` would cost one call per request.
 5. **A backfill-only role** is redundant with HyperSync. SQD's fork `@subsquid/ponder` adds a Portal historical source (beta).
 
+## 12. HyperSync backfill source (in progress, from 17:00)
+
+After the benchmark, Viktor started a Codex worker from his main session to build the HyperSync backfill. The parallel docs work stayed out of its files. **Planned shape** (taken from the work in progress, not yet reviewed or verified):
+- **A new per-account `AccountLogSource` interface** in `src/core/types.ts`, with implementations in `src/sources/`:
+  - `rpc-logs.ts`: today's Quicknode chunked scan.
+  - `hypersync.ts`: `@envio-dev/hypersync-client` `stream()`, using the sent-or-received OR query. The native addon is loaded only on first use, so tests inject a fake.
+  - `fallback.ts`: per-chunk fallback to RPC with a small breaker. A partial HyperSync result never leaks through.
+- **Config:** `LOG_SOURCE=auto|hypersync|rpc` (default `auto`), `HYPERSYNC_API_KEY`, `HYPERSYNC_URL`, `HYPERSYNC_MAX_RANGE` (100k blocks), `HYPERSYNC_TIMEOUT_MS`.
+- **Comparison:** `scripts/compare-sources.ts` compares sources side by side. `test/hypersync.test.ts` holds the unit tests.
+- **Unchanged:** the follower and balances stay on Quicknode. HyperSync serves the chain head, so its ranges must be capped at our RPC-finalized block.
+
+Results, test count and live numbers will be added when it lands.
+
 ---
 
 ## Mistakes and reversals (the interesting part)
@@ -287,7 +301,7 @@ Viktor: "We should also now set up Postgres. We agreed on that in the report." T
 | REST endpoint: ERC-20 tokens the address interacted with | ✅ | `GET /v1/ethereum/accounts/{addr}/erc20` |
 | Balance parameter | ✅ | `?balances=true`. Each token has its own `balanceBlock` |
 | Block height the data is valid for | ✅ | `blockHeight` + `blockHash` (follower cursor), `balancesAtBlockHeight` |
-| Modular (adapter-style) | ✅ / ⚠️ | `ChainAdapter`, `Store` and `RpcClient` are interfaces, and a new EVM chain is a config entry. A separate `LogSource` (for HyperSync or SQD) is designed but not built |
+| Modular (adapter-style) | ✅ / ⚠️ | `ChainAdapter`, `Store` and `RpcClient` are interfaces, and a new EVM chain is a config entry. A per-account `AccountLogSource` (RPC, HyperSync, with fallback) is in progress (§12) |
 | Scales to 5k users polling every minute | ✅ / ⚠️ | 0 RPC calls per warm request. A fake-RPC acceptance test covers 5k accounts. No live HTTP load test. Single replica only |
 | Unreliable RPC: slow, errors, rate limits, lagging | ✅ | RpcClient classification, backoff, breaker, failover, validate. Follower lag, `stale` and 503 |
 | README and documented limits | ✅ | README "Limits", REPORT §7 |
@@ -300,7 +314,7 @@ Viktor: "We should also now set up Postgres. We agreed on that in the report." T
 ## Next
 
 1. **Push the repo** and share it.
-2. **`HyperSyncLogSource` for backfill:** `stream()` with the OR query, `JoinNothing`, `to_block` capped at RPC finalized, Quicknode as fallback, and a canary check against silent empty results. Check the Linux napi build first.
+2. **Finish the HyperSync backfill source (in progress, §12):** `stream()` with the OR query, `JoinNothing`, `to_block` capped at RPC finalized, Quicknode as fallback, and a canary check against silent empty results. Check the Linux napi build first.
 3. **Presentation:** the arc above, the chunk-size table, the cost table, and the finalized-only trade-off.
 4. **Tuning:** raise `RPC_MAX_RPS` toward the plan's 50 (normal cold scan about 3.5 s). Verify credits per call and per batch on the Quicknode dashboard.
 5. **Known limits to decide on:** multi-replica state (active set, balance-worker leader), untracking idle accounts, holdings from before the start block, spam flags, native ETH, and a realtime tail if 13 min is too slow.
