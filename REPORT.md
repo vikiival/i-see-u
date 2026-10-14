@@ -1,6 +1,6 @@
 # Token discovery PoC: architecture and rationale
 
-Status: describes the system **as built** on branch `poc/token-discovery` (2026-10-14, 76 tests). How we got here, including the dead ends: [PROGRESS.md](PROGRESS.md). Running it, API fields and configuration: [README.md](README.md). Values marked *(estimate)* are derived, not measured.
+Status: describes the system **as built** on branch `poc/token-discovery` (2026-10-14, 92 tests). How we got here, including the dead ends: [PROGRESS.md](PROGRESS.md). Running it, API fields and configuration: [README.md](README.md). Values marked *(estimate)* are derived, not measured.
 
 ## 0. Scope decisions
 
@@ -15,7 +15,7 @@ Answers from the scope round with Jakub and Tali, plus Viktor's later decisions.
 | What counts as "interacted" | `Transfer` in or out |
 | Native ETH | Out of scope |
 | ERC-721 (bonus) | Contracts plus the token IDs seen in logs, with optional `ownerOf` verification |
-| Freshness | The scope answer was "a few seconds of lag is fine". **We then chose finalized only, with no rollback.** That puts responses about 64 blocks (about 13 min) behind the tip. It is the main trade-off to defend (§7) |
+| Freshness | Default responses use a slot-aligned, reorg-aware latest tail, normally a few seconds behind the tip. `finality=finalized` remains available; tail health failure automatically degrades to that roughly 64-block/13-minute base with `tailError` |
 
 ## 0.1 Implementation status
 
@@ -27,29 +27,28 @@ HyperSync folds pages directly into the same `ChunkAggregate` using the same str
 
 ## 1. Architecture as built
 
-A TypeScript service on Node 26: Hono, viem on our own `RpcClient`, and PostgreSQL 18 via Drizzle. Only finalized data is stored, and only for **tracked accounts**: accounts someone has requested.
+A TypeScript service on Node 26: Hono, viem on our own `RpcClient`, and PostgreSQL 18 via Drizzle. Finalized aggregates exist only for **tracked accounts**. A bounded tail journals every unfinalized `Transfer`, so an account first requested mid-tail is covered automatically.
 
 ```
-                         ┌────────────── Quicknode JSON-RPC (+ fallbacks) ──────────────┐
-                         │ 1 unfiltered getLogs per finalized epoch (≤500-block ranges) │
-   finalized head poll ──┤ address-filtered getLogs for one account's backfill          │
-   (every 30 s)          │ Multicall3 aggregate3 balanceOf at the follower block (hash) │
-                         └──────────────▲────────────────▲───────────────▲──────────────┘
-                                        │                │               │
-                            ┌───────────┴───┐  ┌─────────┴──────┐  ┌─────┴───────────┐
-                            │ Follower      │  │ Backfill       │  │ Balance worker  │
-                            │ (1 per net,   │  │ [start, C] per │  │ active accounts,│
-                            │ advisory lock)│  │ new account    │  │ 60 s + advance  │
-                            └───────┬───────┘  └───────┬────────┘  └────────┬────────┘
-                                    └──────────► PostgreSQL 18 ◄────────────┘
-                                                      ▲
-                       GET /v1/ethereum/accounts/{addr}/erc20|erc721  (DB reads only once backfilled)
+                    Quicknode JSON-RPC (+ fallbacks)
+          ┌──────────────────┬────────────────────┬───────────────────┐
+          │ finalized epoch  │ latest slot        │ backfill/balances │
+          ▼                  ▼                    ▼
+   Finalized follower   Reorg-aware tail     Backfill + balance worker
+   holdings/nft_items   all Transfers        account history / state
+          │                  │                    │
+          └──────────────► PostgreSQL 18 ◄────────┘
+                              │
+              repeatable-read finalized base + tail overlay
+                              ▼
+             GET /v1/.../erc20|erc721?finality=latest
 ```
 
-1. **Shared finalized follower.** A single follower per network reads **every** `Transfer` log once, with no address filter. It applies only the logs whose `from`/`to` is a tracked account. At the head this is one `getLogs` per finalized epoch (32 blocks, about 17–22k logs, about 10–14 MB), no matter how many accounts are tracked.
+1. **Shared finalized follower.** A single follower per network reads **every** `Transfer` log once, with no address filter. It applies only the logs whose `from`/`to` is a tracked account. At the head this is one `getLogs` per finalized epoch (32 blocks, about 17–22k logs, about 10–14 MB), no matter how many accounts are tracked. With the tail running, the follower polls `finalized` when the tail tip enters a new epoch (finality only moves at epoch boundaries), with a 390 s fallback timer.
 2. **Backfill with handoff.** A new account is tracked and the follower cursor C is read in one transaction. The account is then backfilled once over [25,933,634, C] through HyperSync with per-chunk RPC fallback (or directly through RPC without a key). The follower owns every block above C. Until the backfill finishes, the API answers `202 syncing`.
-3. **Shared balance worker.** Balances of active accounts are re-read on a cadence, batched across all accounts into Multicall3 calls at one block. Every balance carries the block it was read at.
-4. **Request path.** Once an account is backfilled, a request is pure database reads, with **zero RPC calls**.
+3. **Reorg-aware tail.** While the follower process is leader, it polls at slot +2.5/+5/+9 s. Direct successors use EIP-234 block-hash logs. Catch-up uses one range query only after validating a by-number header chain and every returned `log.blockHash`. A fork walks back by number to the common ancestor (at most `TAIL_MAX_DEPTH` = 64 blocks, never below the finalized cursor), rewinds only `tail_blocks`/`tail_transfers` and re-ingests; without an ancestor it wipes the tail and serves finalized (with `tailError`) until the next tick rebuilds it. The finalized tables never roll back; finalization prunes tail rows ≤ the new cursor in the follower's own commit (wiping the tail if its block at the cursor has another hash).
+4. **Shared balance worker.** Balances of active accounts are re-read every 60 s and right after a tail reorg, batched across accounts at the tail tip hash (or the finalized cursor while the tail is empty or disabled). Every balance carries its block number (and hash with the tail).
+5. **Request path.** Once backfilled, discovery is a repeatable-read database snapshot and normally costs zero RPC calls; only missing balance snapshots or ownership verification read state.
 
 **The key point:** RPC cost depends on the block rate and the number of active (account, token) pairs, not on how many requests users make. 5,000 balance requests a minute become about 50 Multicall calls a minute (§4).
 
@@ -59,7 +58,7 @@ A TypeScript service on Node 26: Hono, viem on our own `RpcClient`, and PostgreS
 |---|---|
 | **Global ingestion**: index every `Transfer` for all holders (REPORT rev 2's recommendation) | The follower already sees every log at the head, so the difference is only the backfill and storage. Global backfill is cheap in credits (about 260 calls of 1k blocks, about 5k credits). But it means downloading about 70–115 GB of JSON *(estimate)* with a streaming parser, and storing about 15–40M (holder, token) rows (1.5–6 GB) *(extrapolated)*. Storage then grows with the chain, not with users. That is closer in spirit to a full indexer, and more than a one-day PoC needed. **Still an option:** if the cold-start `202 syncing` is unacceptable, bootstrap a global table once from HyperSync or SQD and hand over to the same follower. Nothing else would change |
 | **Per-account on demand** (the first build): rescan new blocks on every request | Each request cost about 2 `getLogs` plus a Multicall, about 15k calls/min at 5k users. Under finalized-only it was still about 1.6k `getLogs`/min plus about 5k Multicalls/min. That is what the follower and balance worker replaced |
-| **Realtime tail** with reorg rollback (journal or reversible tail) | Viktor's decision was "only finalized blocks". Finalized blocks cannot reorg, so there is no rollback code, and the cursor hash makes `blockHeight`/`blockHash` consistent by construction. The earlier "delete pairs above the fork" rollback was invalid anyway, because it cannot restore counts or NFT ownership |
+| **Realtime tail** with reorg rollback (journal or reversible tail) | **Chosen and implemented.** The irreversible finalized aggregates stay unchanged. Every decoded unfinalized Transfer is journaled, rewound/re-ingested on a fork, and folded at read time. This avoids the invalid earlier idea of deleting aggregate pairs above a fork, which could not restore counts or NFT ownership |
 | **Indexer frameworks** (Squid SDK, Envio HyperIndex, Ponder, Goldsky) | They own the process, the schema and the filters. None supports a tracked set that grows at runtime with a handoff. Squid and Ponder fetch blocks one by one in RPC mode, at about 15–30× our credits (§3). Hosted pipelines also contradict "new networks with only JSON-RPC" |
 
 ## 2. Measured facts
@@ -122,13 +121,15 @@ Assumptions: 5k active users with about 10 tokens each (50k pairs), 20 credits p
 | Cold backfill per new account (3k chunks over about 257k blocks; measured) | 172 once per account; 5k accounts ≈ 860k | **about 17M once** |
 | Cold backfill with HyperSync healthy (measured normal account) | 1 HyperSync query per 100k-block chunk; 0 Quicknode calls | **0 Quicknode credits** |
 | Follower, 1 unfiltered `getLogs` per finalized epoch (measured) | about 225/day | about 0.14M/month |
-| Head polling, `finalized` + `latest` every 30 s | about 5.8k/day | about 3.5M/month |
-| Balance worker: 50 Multicalls per refresh, every 60 s plus once per follower advance (about +10%) | about 79k/day | about 47M/month |
+| Tail: 1 `latest` header + 1 `getLogs({ blockHash })` per block (measured 1.0 header/block live; budget 1.2 for late/missed blocks) | about 14.4–15.8k/day | about 8.6–9.5M/month |
+| Head polling: `finalized` + `latest` once per epoch (the tail wakes the follower; was every 30 s ≈ 3.5M) | about 450/day | about 0.3M/month |
+| Balance worker: 50 Multicalls per refresh, every 60 s plus once per tail reorg | about 72k/day | about 43M/month |
 | First balance read for a newly active account | 1 per activation | small |
 | Requests for backfilled accounts (measured) | 0 | 0 |
-| **Total steady state** | | **about 51M/month; fits Build (80M)** |
+| **Total steady state** | | **about 52–53M/month; fits Build (80M)** |
 
-- **Balances dominate.** The cost scales linearly with the refresh cadence and the activity window (`BALANCE_REFRESH_MS`, `ACTIVE_ACCOUNT_TTL_MS`). Refreshing every block (12 s) would cost about 215M/month and need the Accelerate plan.
+- **The tail is cheap; balances dominate.** Polling `finalized` at epoch boundaries instead of every 30 s pays for most of the tail. A per-block refresh of only the pairs touched by each block's Transfers (not implemented) would add about 4M *(estimate)*.
+- **Balance cadence.** The cost scales linearly with the refresh cadence and the activity window (`BALANCE_REFRESH_MS`, `ACTIVE_ACCOUNT_TTL_MS`). Refreshing every block (12 s) would cost about 215M/month and need the Accelerate plan.
 - **The naive design** (one Multicall per request) would cost 5k × 60 × 24 × 30 × 20 ≈ **4.3B credits/month**.
 - **The backfill grows with the window**, by about 7,200 blocks a day. HyperSync would make it about 0 credits.
 - **Bandwidth:** about 10–14 MB per epoch, about 3 GB/day at the head *(estimate)*.
@@ -137,7 +138,7 @@ Assumptions: 5k active users with about 10 tokens each (50k pairs), 20 credits p
 ## 5. Design
 
 ### Follower (`src/follower/follower.ts`)
-- **Polling:** it polls the finalized head every 30 s. When finalized is above the global `follower_cursor`, it fetches (cursor, head] unfiltered in ≤ 500-block ranges. Logs whose from/to isn't tracked are dropped before decoding. Each range commits in one transaction with the cursor advance (number, hash, timestamp).
+- **Polling:** it polls the finalized head every `FOLLOWER_POLL_MS` (30 s without the tail; with the tail it is woken at each epoch boundary and 390 s is only a fallback, via `follower.kick()`). When finalized is above the global `follower_cursor`, it fetches (cursor, head] unfiltered in ≤ 500-block ranges. Logs whose from/to isn't tracked are dropped before decoding. Each range commits in one transaction with the cursor advance (number, hash, timestamp).
 - **Exactly one per network:** it holds a session `pg_try_advisory_lock` on a dedicated connection, re-checked every tick. Commits also lock the cursor row and refuse a range that doesn't continue it.
 - **Race with new accounts:** if an account was tracked while a range was being decoded, the commit applies nothing and the range is refetched with that account included.
 - **Startup:** `follower.load()` reads the saved cursor before the server listens, so a restart can serve immediately.
@@ -166,10 +167,18 @@ Assumptions: 5k active users with about 10 tokens each (50k pairs), 20 credits p
 - **Validation:** a `validate` option makes `null` or invalid blocks and logs fail over.
 - **Accounting:** a token-bucket limiter (`RPC_MAX_RPS`, shared by follower, backfill and balances), per-attempt stats in `/health`, and API-key redaction.
 
+### Tail (`src/tail/tail.ts`)
+- **Leader only:** runs while `follower.status().leader`, on timers at slot + `TAIL_POLL_OFFSETS_MS` (2.5/5/9 s; Ethereum slots are 12 s from genesis 1606824023). Once the tip is the current slot's block the rest of the slot is skipped.
+- **Per tick,** H = `latest`: H ≤ cursor, or lower than the tip with a hash we store → lagging node, ignored. H = tip + 1 with `parentHash` = tip → one `getLogs({ blockHash })`. H further ahead → headers tip+1..H by number (≤ `ETH_FOLLOWER_MAX_RANGE`), parent chain verified, one range `getLogs` whose every `log.blockHash` must match. Parent mismatch or same height/other hash → reorg walk (above). Empty tail → anchor at the follower cursor hash.
+- **Store contract:** `appendTailBlocks(network, expectedParentHash, blocks)` is compare-and-append: in one transaction (share lock on the cursor row, `FOR UPDATE` on the tip) it rejects unless the tip hash, or the cursor hash for an empty tail, equals `expectedParentHash`, numbers are contiguous and every transfer carries its block's hash. `rewindTail`/`wipeTail` only delete tail rows.
+- **Restart:** tail rows persist; the stored tip is re-validated against the canonical header (reorg path on mismatch). Wiping is always safe: a rebuild is about 90 headers plus one range `getLogs`.
+- **Health:** `tip`, `latestNumber`, `lagBlocks`, `reorgs`, `lastReorgDepth`, `lastError`, `healthy` in `/health`. Unhealthy after a wipe until rebuilt, after 3 consecutive failed ticks, or with lag and no advance for 36 s; discovery then serves finalized with `tailError`.
+
 ### Interfaces (`src/core/types.ts`)
 - **`AccountLogSource`:** chain-agnostic per-account aggregate source with a name, preferred committed range, request/log metadata, stats and optional shutdown. `withFallback` composes providers outside discovery.
 - **`ChainAdapter`** (EVM: `createEvmAdapter`):
-  - head and blocks: `finalizedHead`, `blockByNumber`
+  - head and blocks: `finalizedHead`, `blockByNumber`, and for the tail `latestHeader`/`headerByNumber` (with `parentHash`)
+  - tail logs: `transfersInBlock(blockHash)` (EIP-234) and `transfersInRange(range, headers)` (hash-verified)
   - logs: an `accountLogs` source for backfill; `scanAllTransfers(range, onTransfer, accept)` remains RPC-only for the follower
   - state reads: `erc20BalancePairs(pairs, blockHash)` and `erc721Owners(items, blockHash)`
   - addresses: `normalizeAddress`
@@ -187,15 +196,18 @@ Assumptions: 5k active users with about 10 tokens each (50k pairs), 20 credits p
 - `nft_items(network, holder, token, token_id, held, last_block, last_log_index)`
 - `balance_snapshots(network, account, token, balance, error, block_number, block_hash)`
 
-No individual transfers are stored.
+- `tail_blocks(network, number, hash, parent_hash, timestamp)` and `tail_transfers(network, block_number, log_index, block_hash, token, standard, from, to, value, token_id, tx_hash)`, indexed by (network, from) and (network, to)
+
+Individual transfers are stored only for the unfinalized tail (about 520 per block, measured 37.8k rows for 73 blocks), and pruned as the follower finalizes them.
 
 ### API (Hono)
 - `GET /v1/ethereum/accounts/{addr}/erc20?balances=true` and `…/erc721?verifyOwnership=true` return:
-  - `blockHeight`/`blockHash`: the follower cursor, read in the same repeatable-read transaction as the holdings
+  - `finality`: `latest` (default with a healthy tail) or `finalized` (`?finality=finalized`, or the fallback with `tailError`)
+  - `blockHeight`/`blockHash`: the tail tip (latest) or the follower cursor, plus `finalizedBlockHeight`/`finalizedBlockHash` for latest. Cursor, holdings, the account's tail transfers and the tail tip come from one repeatable-read transaction, so a concurrent prune cannot double count or drop a transfer. The tail is folded with the same `addTransfer` and merged: counts add, bounds widen, the tail's NFT transfer wins, tail-only tokens are included
   - freshness: `stale`, `lagBlocks`, `followerLagBlocks`, `dataAgeS`
-  - per token: first and last seen block, sent and received counts, and optionally `balance` and `balanceBlock`
+  - per token: first and last seen block, sent and received counts (`unfinalizedSentCount`/`unfinalizedReceivedCount` when the tail contributes), and optionally `balance`, `balanceBlock` and (with the tail) `balanceBlockHash`; NFT items carry `unfinalized: true` when their latest transfer is in the tail
 - During a backfill: `202 syncing` with `Retry-After: 2`.
-- `/health` reports the follower, the balance worker, and RPC stats per method.
+- `/health` reports the follower, the tail, the balance worker, and RPC stats per method.
 
 ## 6. Why this stack
 
@@ -216,7 +228,9 @@ At 5k users polling once a minute, the API sees about 83 requests/s. That is tri
 
 ## 7. Limits and risks
 
-- **Freshness:** responses are about 13 min behind the tip (finalized), plus up to one 30 s poll. A realtime tail would bring back reorg handling. The brief says "almost realtime", so expect this question.
+- **Freshness and reorgs:** default responses trail `latest` by 0–1 blocks (measured live). Mainnet sees roughly 4–8 reorgs a day, about 99.7% of them one block deep ([ethresear.ch: reorg statistics](https://ethresear.ch/t/the-second-slot-itch-statistical-analysis-of-reorgs/16333), [post-Pectra reorg rate](https://ethresear.ch/t/post-pectra-effects-on-ethereum-reorg-rate-propagation-and-block-size/23018)); those only rewind tail rows. Anything deeper than 64 blocks or reaching the finalized cursor degrades to the ~13-minute finalized view until the next tick rebuilds. Unfinalized data can still disappear; clients that need certainty use `finality=finalized`.
+- **Load-balanced RPC:** Quicknode answers from several nodes, so a header or by-number log can come from another fork. Logs are fetched by hash or hash-verified, and a header that changes mid catch-up is retried; a node on a losing fork can still cause a rewind that is undone on the next tick (counted as a reorg).
+- **Tail is leader-only.** Another replica serves the leader's tail from Postgres, but its own tail health is not live. Balances refresh every 60 s, not per block, so they usually trail `blockHeight` by a few blocks (labelled).
 - **Discovery is `Transfer`-only.** Tokens that change balances without `Transfer` (WETH `deposit`, rebasing tokens) and non-standard legacy NFTs (3-topic CryptoKitties-style) are missed or misclassified. ERC-1155 is not supported.
 - **Holdings from before block 25,933,634 are invisible**, by definition of the source of truth.
 - **Spam and address-poisoning tokens are returned.** Many show `balanceStatus: "error"`.
@@ -233,7 +247,7 @@ At 5k users polling once a minute, the API sees about 83 requests/s. That is tri
 2. **Raise `RPC_MAX_RPS` toward the plan's 50.** This should bring a fallback normal cold scan from about 8.6 s to about 3.5 s, while keeping headroom for the follower and balances.
 3. **Check credits on the Quicknode dashboard:** one 3k `getLogs`, a 3-call batch, and a 1,000-call Multicall.
 4. **A live HTTP load test:** 5k accounts polling once a minute, measuring RPC calls/min and p99 latency.
-5. **Decide the open limits:** shared state for multiple replicas (active set and balance-worker leader in Postgres), untracking idle accounts, spam flags, native ETH, and whether a realtime tail is worth the reorg handling.
+5. **Decide the open limits:** shared state for multiple replicas (active set and balance-worker leader in Postgres), untracking idle accounts, spam flags, native ETH, a per-block refresh of the balance pairs touched by each tail block, and tail health shared across replicas.
 
 ## Sources
 
