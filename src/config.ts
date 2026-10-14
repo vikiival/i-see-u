@@ -41,11 +41,37 @@ export const config = {
     scanConcurrency: int('ETH_SCAN_CONCURRENCY', '8'),
     /** balanceOf calls per Multicall3 aggregate3 request (measured safe up to ~2000). */
     multicallBatch: int('ETH_MULTICALL_BATCH', '1000'),
+    /** Max blocks per unfiltered follower getLogs (~450 KB of JSON per block; must stay <= 1000). */
+    followerMaxRange: BigInt(int('ETH_FOLLOWER_MAX_RANGE', '500')),
   },
-  /** Refuse discovery when finalized progress is older than this. */
+  follower: {
+    /** How often the follower polls the finalized head (finalized advances ~every 6.4 min). */
+    pollMs: int('FOLLOWER_POLL_MS', '30000'),
+    /** Discovery returns 503 when the follower is more than this many blocks behind finalized (~3 epochs). */
+    maxLagBlocks: BigInt(int('FOLLOWER_MAX_LAG_BLOCKS', '96')),
+  },
+  balances: {
+    /** Accounts whose balances were requested within this window are refreshed by the shared worker. */
+    activeAccountTtlMs: int('ACTIVE_ACCOUNT_TTL_MS', '300000'),
+    refreshMs: int('BALANCE_REFRESH_MS', '60000'),
+  },
+  request: {
+    /** Per-request deadline for RPC work left on the request path (cold backfill wait, first balance read). */
+    deadlineMs: int('REQUEST_DEADLINE_MS', '10000'),
+    /** Concurrent account backfills, and how many more may wait before requests get 503. */
+    backfillConcurrency: int('BACKFILL_CONCURRENCY', '4'),
+    backfillQueue: int('BACKFILL_QUEUE', '64'),
+    /** Concurrent request-path RPC reads (first balance read, ownership), and how many more may wait. */
+    rpcConcurrency: int('REQUEST_RPC_CONCURRENCY', '16'),
+    rpcQueue: int('REQUEST_RPC_QUEUE', '256'),
+  },
+  /** Refuse discovery when the follower has not advanced for longer than this. */
   maxHeadProgressAgeMs: int('MAX_HEAD_AGE_MS', '1800000'),
 };
 
 if (config.ethereum.logsMinRange > config.ethereum.logsMaxRange) {
   throw new Error('ETH_LOGS_MIN_RANGE must not exceed ETH_LOGS_MAX_RANGE');
+}
+if (config.ethereum.followerMaxRange > 1_000n) {
+  throw new Error('ETH_FOLLOWER_MAX_RANGE must not exceed 1000 (unfiltered responses are ~450 KB per block)');
 }

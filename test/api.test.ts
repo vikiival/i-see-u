@@ -1,9 +1,13 @@
 import { expect, test, vi } from 'vitest';
 
 import { createApp } from '../src/api/routes.ts';
+import type { BalanceWorker } from '../src/balances/worker.ts';
+import { createLimiter } from '../src/core/limiter.ts';
 import { RpcError } from '../src/rpc/errors.ts';
 import type {
   Address,
+  BalanceSnapshot,
+  BlockRef,
   ChainAdapter,
   DiscoveryResult,
   DiscoveryService,
@@ -19,6 +23,7 @@ const erc20 = address(2);
 const erc721 = address(3);
 
 const resultFor = (): DiscoveryResult => ({
+  status: 'ready',
   network: 'ethereum',
   account,
   fromBlock: 25_933_634n,
@@ -29,6 +34,7 @@ const resultFor = (): DiscoveryResult => ({
   lastProgressAt: Date.parse('2026-10-14T12:00:00.000Z'),
   stale: false,
   lagBlocks: 64n,
+  followerLagBlocks: 0n,
   holdings: [
     { token: erc721, standard: 'erc721', firstBlock: 25_933_650n, lastBlock: 26_000_110n, sentCount: 1, receivedCount: 2 },
     { token: erc20, standard: 'erc20', firstBlock: 25_933_640n, lastBlock: 26_000_100n, sentCount: 2, receivedCount: 4 },
@@ -54,6 +60,7 @@ const adapterWith = (overrides: Partial<ChainAdapter> = {}): ChainAdapter => ({
   logsMaxRange: 10_000n,
   logsMinRange: 500n,
   scanConcurrency: 4,
+  followerMaxRange: 500n,
   normalizeAddress(input) {
     return /^0x[0-9a-f]{40}$/i.test(input) ? input.toLowerCase() as Address : undefined;
   },
@@ -66,8 +73,10 @@ const adapterWith = (overrides: Partial<ChainAdapter> = {}): ChainAdapter => ({
     };
   },
   async scanChunk() { return { aggregate: { tokens: new Map(), nfts: new Map(), selfSeen: new Set() }, calls: 0, heavy: false }; },
-  async erc20Balances(_account, tokens) {
-    return tokens.map(() => ({ status: 'ok', balance: 0n }));
+  async blockByNumber(number) { return { number, hash: hash(Number(number)), timestamp: 0n }; },
+  async scanAllTransfers() { return { calls: 0 }; },
+  async erc20BalancePairs(pairs) {
+    return pairs.map(() => ({ status: 'ok', balance: 0n }));
   },
   async erc721Owners(items) {
     return items.map(() => ({ status: 'ok', owner: account }));
@@ -75,15 +84,31 @@ const adapterWith = (overrides: Partial<ChainAdapter> = {}): ChainAdapter => ({
   ...overrides,
 });
 
-const appWith = (discovery: DiscoveryService, adapter = adapterWith()) => createApp({
+const balancesWith = (forAccount: BalanceWorker['forAccount']): BalanceWorker => ({
+  forAccount,
+  refresh: async () => ({ pairs: 0 }),
+  kick() {},
+  start() {},
+  async stop() {},
+  stats: () => ({ activeAccounts: 0 }),
+});
+
+const appWith = (
+  discovery: DiscoveryService,
+  adapter = adapterWith(),
+  balances = balancesWith(async () => []),
+) => createApp({
   discovery,
   adapters: { ethereum: adapter },
+  balances: { ethereum: balances },
+  followers: { ethereum: { status: () => ({ ready: true, leader: true, lagBlocks: 0n, lastAdvanceAt: 0, stale: false }) } },
+  requestRpc: { limiter: createLimiter(2, 2), deadlineMs: 1_000 },
   rpcStats: stats,
   startedAt: Date.now() - 2_500,
 });
 
-test('serializes bigint fields and pins balances to the discovered block hash', async () => {
-  let receivedBlockHash: Hex | undefined;
+test('serializes bigint fields and labels each balance with the block it was read at', async () => {
+  let receivedAt: BlockRef | undefined;
   let receivedAccount: Address | undefined;
   let balanceCalls = 0;
   const discovery: DiscoveryService = {
@@ -92,22 +117,23 @@ test('serializes bigint fields and pins balances to the discovered block hash', 
       return resultFor();
     },
   };
-  const adapter = adapterWith({
-    async erc20Balances(normalizedAccount, tokens, blockHash) {
-      balanceCalls += 1;
-      receivedAccount = normalizedAccount;
-      receivedBlockHash = blockHash;
-      expect(tokens).toEqual([erc20]);
-      return [{ status: 'ok', balance: 987_654_321n }];
-    },
+  const balances = balancesWith(async (normalizedAccount, tokens, at): Promise<BalanceSnapshot[]> => {
+    balanceCalls += 1;
+    receivedAccount = normalizedAccount;
+    receivedAt = at;
+    expect(tokens).toEqual([erc20]);
+    return [{ token: erc20, result: { status: 'ok', balance: 987_654_321n }, blockNumber: 26_000_091n, blockHash: hash(8) }];
   });
-  const app = appWith(discovery, adapter);
+  const app = appWith(discovery, adapterWith(), balances);
 
   const response = await app.request(`/v1/ethereum/accounts/${account}/erc20?balances=true`);
   expect(response.status).toBe(200);
   expect(receivedAccount).toBe(account);
-  expect(receivedBlockHash).toBe(hash(9));
+  expect(receivedAt).toEqual({ number: 26_000_123n, hash: hash(9), timestamp: 1_760_441_940n });
   const body = await response.json();
+  expect(body.status).toBe('ready');
+  expect(body.followerLagBlocks).toBe('0');
+  expect(body.balancesAtBlockHeight).toBe(false);
   expect(body.fromBlock).toBe('25933634');
   expect(body.blockHeight).toBe('26000123');
   expect(body.finality).toBe('finalized');
@@ -125,12 +151,36 @@ test('serializes bigint fields and pins balances to the discovered block hash', 
     receivedCount: 4,
     balance: '987654321',
     balanceStatus: 'ok',
+    balanceBlock: '26000091',
   }]);
 
   const withoutBalances = await app.request(`/v1/ethereum/accounts/${account}/erc20?balances=false`);
   expect(withoutBalances.status).toBe(200);
   expect(balanceCalls).toBe(1);
-  expect((await withoutBalances.json()).tokens[0].balanceStatus).toBeUndefined();
+  const plain = await withoutBalances.json();
+  expect(plain.tokens[0].balanceStatus).toBeUndefined();
+  expect(plain.balancesAtBlockHeight).toBeUndefined();
+});
+
+test('a syncing account answers 202 with progress; overload answers 503 with Retry-After', async () => {
+  const syncing: DiscoveryService = {
+    async discover() {
+      return { status: 'syncing', network: 'ethereum', account, fromBlock: 100n, progressBlocks: 40n, targetBlocks: 120n, followerLagBlocks: 3n };
+    },
+  };
+  const response = await appWith(syncing).request(`/v1/ethereum/accounts/${account}/erc721`);
+  expect(response.status).toBe(202);
+  expect(response.headers.get('retry-after')).toBe('2');
+  expect(await response.json()).toEqual({
+    status: 'syncing', network: 'ethereum', account, fromBlock: '100', progressBlocks: '40', targetBlocks: '120', followerLagBlocks: '3',
+  });
+
+  const busy: DiscoveryService = {
+    async discover() { throw Object.assign(new Error('Server busy'), { statusCode: 503, retryAfterS: 7 }); },
+  };
+  const overloaded = await appWith(busy).request(`/v1/ethereum/accounts/${account}/erc20`);
+  expect(overloaded.status).toBe(503);
+  expect(overloaded.headers.get('retry-after')).toBe('7');
 });
 
 test('verifies only ERC-721 items currently held according to seen logs', async () => {
