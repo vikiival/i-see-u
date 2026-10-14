@@ -192,3 +192,16 @@ test('a non-array eth_getLogs result fails over through RpcClient', async () => 
   expect(urls.map(url => new URL(url).host)).toEqual(['primary.example', 'fallback.example']);
   expect(rpc.stats().errors).toEqual({ transient: 1 });
 });
+
+test('an out-of-range eth_getLogs response is rejected before any log is folded', async () => {
+  const rpc: RpcClient = {
+    async request<T>(): Promise<T> {
+      return [wireLog(7n), wireLog(8n)] as T;
+    },
+    stats,
+  };
+  const events: TransferEvent[] = [];
+  await expect(scanTransfers(rpc, ACCOUNT, 'to', { fromBlock: 7n, toBlock: 7n }, event => events.push(event)))
+    .rejects.toMatchObject({ kind: 'transient', message: 'Log block 8 outside requested range 7-7' });
+  expect(events).toEqual([]);
+});

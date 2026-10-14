@@ -133,12 +133,14 @@ export interface ChainAdapter {
   transfersInRange(range: BlockRange, headers: BlockHeader[]): Promise<TransferEvent[]>;
   /**
    * Every Transfer in range, unfiltered by address (the follower's source); callers keep ranges <= followerMaxRange.
-   * `accept` pre-filters by the from/to address before decoding. Splits on too_large/timeout like scanChunk.
+   * `accept` pre-filters by the from/to address before decoding; `onSkipped` exposes logs skipped by accept,
+   * decodable later. Splits on too_large/timeout like scanChunk.
    */
   scanAllTransfers(
     range: BlockRange,
     onTransfer: (event: TransferEvent) => void,
     accept?: (address: Address) => boolean,
+    onSkipped?: (from: Address, to: Address, decode: () => TransferEvent | undefined) => void,
   ): Promise<{ calls: number }>;
   /** balanceOf for each (account, token) pair, in input order, batched across accounts, pinned to one block hash. */
   erc20BalancePairs(pairs: BalancePair[], blockHash: Hex): Promise<BalanceResult[]>;
