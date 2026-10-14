@@ -297,6 +297,56 @@ test('API finality overlays tail-only tokens and balances at the tip hash; final
   }
 });
 
+test('a reorg refresh replaces balances from a newer orphaned tip', async () => {
+  const chain = new FakeChain(100n);
+  chain.latest = 103n;
+  chain.addTransfer({ token, from: peer, to: account, value: 1n, blockNumber: 103n });
+  chain.balanceOf = (_account, _token, at) => at === blockHash(103n) ? 9n : 4n;
+  const s = await stack(chain);
+  const requestRpc = { limiter: createLimiter(2, 2), deadlineMs: 1_000 };
+  const balances = createBalanceWorker({
+    adapter: s.adapter, store: s.store, activeTtlMs: 300_000, refreshMs: 60_000, requestRpc,
+    tailTip: () => s.store.getTailTip('ethereum'),
+  });
+  const tail = createTail({
+    adapter: s.adapter,
+    store: s.store,
+    follower: s.follower,
+    onAdvance: (_tip, reorg) => { if (reorg) balances.kick({ reorg: true }); },
+  });
+  await tail.load();
+  const discovery = createDiscoveryService({
+    adapters: { ethereum: s.adapter }, store: s.store, followers: { ethereum: s.follower }, tails: { ethereum: tail },
+  });
+  const app = createApp({
+    discovery,
+    adapters: { ethereum: s.adapter },
+    balances: { ethereum: balances },
+    followers: { ethereum: s.follower },
+    tails: { ethereum: tail },
+    requestRpc,
+    rpcStats: () => chain.rpc.stats(),
+    startedAt: 0,
+  });
+  balances.start();
+  try {
+    await tail.tick();
+    const before = await (await app.request(`/v1/ethereum/accounts/${account}/erc20?balances=true`)).json();
+    expect(before.tokens[0]).toMatchObject({ balance: '9', balanceBlock: '103', balanceBlockHash: blockHash(103n) });
+
+    chain.reorg(2, [{ token, from: peer, to: account, value: 1n, blockNumber: 102n }]);
+    chain.latest = 102n;
+    await tail.tick();
+    await balances.refresh();
+    const tip = await s.store.getTailTip('ethereum');
+    const after = await (await app.request(`/v1/ethereum/accounts/${account}/erc20?balances=true`)).json();
+    expect(after.tokens[0]).toMatchObject({ balance: '4', balanceBlock: '102', balanceBlockHash: tip?.hash });
+  } finally {
+    await balances.stop();
+    await s.close();
+  }
+});
+
 test('a lagging head at the cursor height is ignored, not treated as a reorg that wipes the tail', async () => {
   const chain = new FakeChain(100n);
   chain.latest = 102n;

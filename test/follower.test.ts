@@ -8,7 +8,7 @@ import { createDiscoveryService } from '../src/discovery/service.ts';
 import { createFollower } from '../src/follower/follower.ts';
 import { RpcError } from '../src/rpc/errors.ts';
 import { advisoryKey, singleConnectionLeaderLock } from '../src/store/advisory-lock.ts';
-import { address, blockHash, FakeChain, gate } from './fake-chain.ts';
+import { address, blockHash, blockRef, FakeChain, gate } from './fake-chain.ts';
 import { createTestStore } from './store-fixture.ts';
 
 type AdapterOverrides = Parameters<FakeChain['adapter']>[0];
@@ -297,6 +297,72 @@ test('balances: concurrent first requests share one read; different accounts are
     expect(byToken[tokens[0]]).toMatchObject({ balanceStatus: 'error', balanceBlock: '182' });
     expect(byToken[tokens[1]]).toMatchObject({ balance: '20', balanceStatus: 'ok', balanceBlock: '182' });
     expect(chain.calls).toEqual({ eth_call: 1 });
+  } finally {
+    await s.close();
+  }
+});
+
+test('balances: a first read fetches only tokens without snapshots', async () => {
+  const chain = new FakeChain(150n);
+  const account = address(41);
+  const tokens = [address(51), address(52), address(53), address(54)];
+  for (const token of tokens) chain.addTransfer({ token, from: address(99), to: account, value: 1n, blockNumber: 120n });
+  chain.balanceOf = () => 9n;
+  const s = await stack(chain);
+  try {
+    await s.follower.tick();
+    await s.get(`/v1/ethereum/accounts/${account}/erc20`);
+    await s.store.saveBalances('ethereum', blockRef(150n), tokens.slice(0, 3).map((token) => ({
+      account, token, result: { status: 'ok' as const, balance: 7n },
+    })));
+    chain.calls = {};
+    chain.multicallSizes = [];
+
+    const result = await s.get(`/v1/ethereum/accounts/${account}/erc20?balances=true`);
+    expect(result.status).toBe(200);
+    expect(chain.calls).toEqual({ eth_call: 1 });
+    expect(chain.multicallSizes).toEqual([1]);
+    expect(Object.fromEntries(result.body.tokens.map((item: { contract: Address; balance: string }) => [item.contract, item.balance])))
+      .toEqual({ [tokens[0]]: '7', [tokens[1]]: '7', [tokens[2]]: '7', [tokens[3]]: '9' });
+  } finally {
+    await s.close();
+  }
+});
+
+test('balances: a transient failed refresh chunk does not replace its last good snapshot', async () => {
+  const chain = new FakeChain(100n);
+  const account = address(41);
+  const [failedToken, successfulToken] = [address(51), address(52)];
+  for (const token of [failedToken, successfulToken]) {
+    chain.addTransfer({ token, from: address(99), to: account, value: 1n, blockNumber: 100n });
+  }
+  const s = await stack(chain, { adapter: { multicallBatch: 1 } });
+  try {
+    await s.follower.tick();
+    let tracked = await s.get(`/v1/ethereum/accounts/${account}/erc20`);
+    while (tracked.status === 202) tracked = await s.get(`/v1/ethereum/accounts/${account}/erc20`);
+
+    await s.store.saveBalances('ethereum', blockRef(100n), [
+      { account, token: failedToken, result: { status: 'ok', balance: 10n } },
+      { account, token: successfulToken, result: { status: 'ok', balance: 20n } },
+    ]);
+    await s.balances.forAccount(account, [failedToken, successfulToken], blockRef(100n));
+
+    chain.finalized = 101n;
+    await s.follower.tick();
+    chain.balanceOf = () => 21n;
+    chain.beforeMulticall = (targets) => {
+      if (targets[0] === failedToken) throw new RpcError('transient', 'upstream unavailable after retries');
+    };
+
+    expect(await s.balances.refresh()).toEqual({ pairs: 2, block: 101n });
+    const snapshots = Object.fromEntries((await s.store.balances('ethereum', account)).map((row) => [row.token, row]));
+    expect(snapshots[failedToken]).toMatchObject({
+      result: { status: 'ok', balance: 10n }, blockNumber: 100n, blockHash: blockHash(100n),
+    });
+    expect(snapshots[successfulToken]).toMatchObject({
+      result: { status: 'ok', balance: 21n }, blockNumber: 101n, blockHash: blockHash(101n),
+    });
   } finally {
     await s.close();
   }

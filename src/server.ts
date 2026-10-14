@@ -68,7 +68,7 @@ const tails = config.tail.enabled ? Object.fromEntries(Object.values(adapters).m
   maxDepth: config.tail.maxDepth,
   pollOffsetsMs: config.tail.pollOffsetsMs,
   // The 60 s sweep follows the tip; a reorg may have orphaned the block balances were read at, so refresh now.
-  onAdvance: (_tip, reorg) => { if (reorg) balances[adapter.network].kick(); },
+  onAdvance: (_tip, reorg) => { if (reorg) balances[adapter.network].kick({ reorg: true }); },
   onEpoch: () => followers[adapter.network].kick(),
   onError: logError('tail tick'),
 })])) : {};

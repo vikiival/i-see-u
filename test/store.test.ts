@@ -229,6 +229,25 @@ test('balance snapshots keep the block they were read at and never move to an ol
   }
 });
 
+test('a reorg refresh can replace a balance snapshot from a newer orphaned block', async () => {
+  const { store } = await createTestStore();
+  try {
+    const row = (balance: bigint) => ({ account, token, result: { status: 'ok' as const, balance } });
+    await store.saveBalances('ethereum', block(100n), [row(5n)]);
+    await store.saveBalances('ethereum', block(99n), [row(4n)]);
+    expect((await store.balances('ethereum', account))[0]).toMatchObject({
+      result: { status: 'ok', balance: 5n }, blockNumber: 100n, blockHash: block(100n).hash,
+    });
+
+    await store.saveBalances('ethereum', block(99n), [row(4n)], { replaceNewer: true });
+    expect((await store.balances('ethereum', account))[0]).toMatchObject({
+      result: { status: 'ok', balance: 4n }, blockNumber: 99n, blockHash: block(99n).hash,
+    });
+  } finally {
+    await store.close();
+  }
+});
+
 test('the session leader lock is acquired, re-verified and released', async () => {
   const { db, store } = await createTestStore();
   try {
