@@ -6,5 +6,5 @@ try {
   if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
 }
 
-const store = await openPostgresStore(process.env.DATABASE_URL ?? DEV_DATABASE_URL);
+const { store } = await openPostgresStore(process.env.DATABASE_URL ?? DEV_DATABASE_URL);
 await store.close();

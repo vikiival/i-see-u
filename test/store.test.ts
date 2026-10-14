@@ -3,7 +3,7 @@ import { expect, test } from 'vitest';
 
 import type { Address, BlockRef, Hex, Store, TransferEvent } from '../src/core/types.ts';
 import { addTransfer, emptyAggregate } from '../src/core/aggregate.ts';
-import { withAdvisoryLock } from '../src/store/advisory-lock.ts';
+import { advisoryKey, singleConnectionLeaderLock, withAdvisoryLock } from '../src/store/advisory-lock.ts';
 import { migrationsFolder } from '../src/store/postgres.ts';
 import { createTestStore } from './store-fixture.ts';
 
@@ -25,7 +25,6 @@ const aggregateOf = (events: TransferEvent[]) => {
 const applyScan = async (store: Store, events: TransferEvent[], at: BlockRef): Promise<void> => {
   const fromBlock = (await store.getProgress('ethereum', account) ?? -1n) + 1n;
   await store.applyScanChunk('ethereum', account, { fromBlock: fromBlock < at.number ? fromBlock : at.number, toBlock: at.number }, aggregateOf(events));
-  await store.finalizeScan('ethereum', account, at);
 };
 
 function event(overrides: Partial<TransferEvent> = {}): TransferEvent {
@@ -42,7 +41,7 @@ function event(overrides: Partial<TransferEvent> = {}): TransferEvent {
   };
 }
 
-test('applyScan is idempotent and the cursor is monotonic', async () => {
+test('applyScan is idempotent and progress is monotonic', async () => {
   const { store } = await createTestStore();
   try {
     const events = [event()];
@@ -54,8 +53,7 @@ test('applyScan is idempotent and the cursor is monotonic', async () => {
     expect(holding.receivedCount).toBe(0);
     expect(holding.firstBlock).toBe(10n);
     expect(holding.lastBlock).toBe(10n);
-    expect((await store.getCursor('ethereum', account))?.number).toBe(12n);
-    expect((await store.getCursor('ethereum', account))?.hash).toBe(block(12n).hash);
+    expect(await store.getProgress('ethereum', account)).toBe(12n);
   } finally {
     await store.close();
   }
@@ -110,7 +108,8 @@ test('running the Drizzle migrator twice is a no-op', async () => {
   try {
     await migrate(db, { migrationsFolder });
     await applyScan(store, [], block(15n));
-    expect((await store.getCursor('ethereum', account))?.hash).toBe(block(15n).hash);
+    expect(await store.getProgress('ethereum', account)).toBe(15n);
+    expect((await store.initFollowerCursor('ethereum', block(15n), 1))?.hash).toBe(block(15n).hash);
   } finally {
     await store.close();
   }
@@ -167,4 +166,80 @@ test('the chunk aggregate dedupes only self-transfers and keeps the latest ERC-7
   expect(aggregate.tokens.get(other)).toMatchObject({ standard: 'erc721', firstBlock: 29n, lastBlock: 30n, sentCount: 1, receivedCount: 2 });
   expect([...aggregate.nfts.values()]).toEqual([{ token: other, tokenId: 7n, held: false, block: 30n, logIndex: 5 }]);
   expect(aggregate.selfSeen.size).toBe(2);
+});
+
+test('trackAccount pins the backfill target to the follower cursor; the backfill cannot write above it', async () => {
+  const { store } = await createTestStore();
+  try {
+    await expect(store.trackAccount('ethereum', account, 1)).rejects.toMatchObject({ statusCode: 503 });
+    await store.initFollowerCursor('ethereum', block(20n), 1);
+    expect(await store.initFollowerCursor('ethereum', block(30n), 2)).toEqual({ ...block(20n), updatedAt: 1 });
+    expect(await store.trackAccount('ethereum', account, 1)).toEqual({ target: 20n, progress: undefined });
+    await store.applyFollowerRange('ethereum', { fromBlock: 21n, toBlock: 25n }, block(25n), 2, new Map(), new Set([account]));
+    expect(await store.trackAccount('ethereum', account, 3)).toEqual({ target: 20n, progress: undefined }); // idempotent
+    expect(await store.trackAccount('ethereum', other, 3)).toEqual({ target: 25n, progress: undefined });
+    expect(await store.trackedAccounts('ethereum')).toEqual([account, other]);
+
+    await store.applyScanChunk('ethereum', account, { fromBlock: 0n, toBlock: 20n }, aggregateOf([event()]));
+    await expect(store.applyScanChunk('ethereum', account, { fromBlock: 21n, toBlock: 22n }, aggregateOf([])))
+      .rejects.toThrow('beyond backfill target 20');
+    expect(await store.getTracking('ethereum', account)).toEqual({ target: 20n, progress: 20n });
+  } finally {
+    await store.close();
+  }
+});
+
+test('applyFollowerRange continues the cursor only, and applies nothing when a tracked account was not decoded', async () => {
+  const { store } = await createTestStore();
+  try {
+    await store.initFollowerCursor('ethereum', block(20n), 1);
+    await store.trackAccount('ethereum', account, 1);
+    const aggregates = new Map([[account, aggregateOf([event({ blockNumber: 22n })])]]);
+    await expect(store.applyFollowerRange('ethereum', { fromBlock: 22n, toBlock: 25n }, block(25n), 2, aggregates, new Set([account])))
+      .rejects.toThrow('does not continue cursor 20');
+    expect(await store.applyFollowerRange('ethereum', { fromBlock: 21n, toBlock: 25n }, block(25n), 2, aggregates, new Set()))
+      .toEqual({ applied: false, missing: [account] });
+    expect(await store.holdings('ethereum', account)).toEqual([]);
+    expect((await store.getFollowerCursor('ethereum'))?.number).toBe(20n);
+
+    expect(await store.applyFollowerRange('ethereum', { fromBlock: 21n, toBlock: 25n }, block(25n), 2, aggregates, new Set([account])))
+      .toEqual({ applied: true });
+    expect(await store.getFollowerCursor('ethereum')).toEqual({ ...block(25n), updatedAt: 2 });
+    expect((await store.readAccount('ethereum', account))?.holdings).toMatchObject([{ token, sentCount: 1, firstBlock: 22n }]);
+  } finally {
+    await store.close();
+  }
+});
+
+test('balance snapshots keep the block they were read at and never move to an older block', async () => {
+  const { store } = await createTestStore();
+  try {
+    const row = (balance: bigint) => ({ account, token, result: { status: 'ok' as const, balance } });
+    await store.saveBalances('ethereum', block(30n), [row(5n), { account, token: other, result: { status: 'error', error: 'reverted' } }]);
+    await store.saveBalances('ethereum', block(29n), [row(4n)]);
+    expect(await store.balances('ethereum', account)).toEqual(expect.arrayContaining([
+      { token, result: { status: 'ok', balance: 5n }, blockNumber: 30n, blockHash: block(30n).hash },
+      { token: other, result: { status: 'error', error: 'reverted' }, blockNumber: 30n, blockHash: block(30n).hash },
+    ]));
+    await store.saveBalances('ethereum', block(31n), [row(6n)]);
+    expect((await store.balances('ethereum', account)).find((b) => b.token === token)).toMatchObject({ blockNumber: 31n });
+  } finally {
+    await store.close();
+  }
+});
+
+test('the session leader lock is acquired, re-verified and released', async () => {
+  const { db, store } = await createTestStore();
+  try {
+    const lock = singleConnectionLeaderLock(db, advisoryKey('follower:ethereum'));
+    expect(lock.held()).toBe(false);
+    expect(await lock.tryAcquire()).toBe(true);
+    expect(await lock.tryAcquire()).toBe(true);
+    expect(lock.held()).toBe(true);
+    await lock.release();
+    expect(lock.held()).toBe(false);
+    expect(advisoryKey('follower:ethereum')).not.toBe(advisoryKey('follower:base'));
+  } finally {
+    await store.close();
+  }
 });

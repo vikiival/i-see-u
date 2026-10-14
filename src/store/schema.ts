@@ -2,13 +2,38 @@ import { bigint, boolean, integer, pgTable, primaryKey, text } from 'drizzle-orm
 
 import type { TokenStandard } from '../core/types.ts';
 
-export const accountCursor = pgTable('account_cursor', {
+/** Global finalized follower cursor: every Transfer through block_number was applied for every tracked account. */
+export const followerCursor = pgTable('follower_cursor', {
+  network: text().primaryKey(),
+  blockNumber: bigint('block_number', { mode: 'bigint' }).notNull(),
+  blockHash: text('block_hash').notNull(),
+  blockTimestamp: bigint('block_timestamp', { mode: 'bigint' }).notNull(),
+  /** Epoch milliseconds of the last advance (written by the follower's clock). */
+  updatedAt: bigint('updated_at', { mode: 'number' }).notNull(),
+});
+
+/**
+ * Accounts the follower applies Transfers for. backfill_target is the follower cursor read in the same transaction
+ * that inserted the row: the backfill owns blocks <= target (progress in account_scan_progress), the follower > target.
+ */
+export const trackedAccounts = pgTable('tracked_accounts', {
   network: text().notNull(),
   account: text().notNull(),
-  scannedTo: bigint('scanned_to', { mode: 'bigint' }).notNull(),
-  scannedToHash: text('scanned_to_hash').notNull(),
-  scannedToTimestamp: bigint('scanned_to_timestamp', { mode: 'bigint' }).notNull(),
+  backfillTarget: bigint('backfill_target', { mode: 'bigint' }).notNull(),
+  trackedAt: bigint('tracked_at', { mode: 'number' }).notNull(),
 }, (table) => [primaryKey({ columns: [table.network, table.account] })]);
+
+/** Latest balanceOf read per pair, always labelled with the block it was read at (never relabelled). */
+export const balanceSnapshots = pgTable('balance_snapshots', {
+  network: text().notNull(),
+  account: text().notNull(),
+  token: text().notNull(),
+  /** Decimal uint256, null when the read failed. */
+  balance: text(),
+  error: text(),
+  blockNumber: bigint('block_number', { mode: 'bigint' }).notNull(),
+  blockHash: text('block_hash').notNull(),
+}, (table) => [primaryKey({ columns: [table.network, table.account, table.token] })]);
 
 export const accountScanProgress = pgTable('account_scan_progress', {
   network: text().notNull(),

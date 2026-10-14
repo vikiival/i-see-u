@@ -8,6 +8,20 @@
       "when": 1791985673717,
       "tag": "0000_steady_nehzno",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1791986411457,
+      "tag": "0001_overrated_tempest",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1791986415775,
+      "tag": "0002_first_butterfly",
+      "breakpoints": true
     }
   ]
 }

@@ -1,0 +1,1 @@
+DROP TABLE "account_cursor" CASCADE;

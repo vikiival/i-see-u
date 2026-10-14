@@ -85,6 +85,8 @@ export interface ChainAdapter {
   /** Floor for the adaptive per-account chunk range. */
   readonly logsMinRange: bigint;
   readonly scanConcurrency: number;
+  /** Max block span of one unfiltered (all-Transfer) getLogs call made by the follower. */
+  readonly followerMaxRange: bigint;
   normalizeAddress(input: string): Address | undefined;
   /** Protocol-finalized head used for durable discovery. */
   finalizedHead(): Promise<HeadObservation>;
@@ -95,10 +97,26 @@ export interface ChainAdapter {
    * Must handle provider range/result limits internally (adaptive splitting); rejects if either direction fails.
    */
   scanChunk(account: Address, range: BlockRange): Promise<ChunkScan>;
-  /** balanceOf(account) for each token, in input order, pinned to one block hash. Never throws per token. */
-  erc20Balances(account: Address, tokens: Address[], blockHash: Hex): Promise<BalanceResult[]>;
+  /** Header of a (finalized) block by number, for cursors that end below the head. */
+  blockByNumber(number: bigint): Promise<BlockRef>;
+  /**
+   * Every Transfer in range, unfiltered by address (the follower's source); callers keep ranges <= followerMaxRange.
+   * `accept` pre-filters by the from/to address before decoding. Splits on too_large/timeout like scanChunk.
+   */
+  scanAllTransfers(
+    range: BlockRange,
+    onTransfer: (event: TransferEvent) => void,
+    accept?: (address: Address) => boolean,
+  ): Promise<{ calls: number }>;
+  /** balanceOf for each (account, token) pair, in input order, batched across accounts, pinned to one block hash. */
+  erc20BalancePairs(pairs: BalancePair[], blockHash: Hex): Promise<BalanceResult[]>;
   /** ownerOf(tokenId) for each item, in input order, pinned to one block hash. Never throws per item. */
   erc721Owners(items: { token: Address; tokenId: bigint }[], blockHash: Hex): Promise<OwnerResult[]>;
+}
+
+export interface BalancePair {
+  account: Address;
+  token: Address;
 }
 
 export type BalanceResult = { status: 'ok'; balance: bigint } | { status: 'error'; error: string };
@@ -166,25 +184,110 @@ export interface NftItem {
   lastBlock: bigint;
 }
 
+/** The follower's global cursor; updatedAt is when it last advanced (epoch ms). */
+export interface FollowerCursor extends BlockRef {
+  updatedAt: number;
+}
+
+/** Backfill handoff state: the backfill owns blocks <= target, the follower everything above. */
+export interface Tracking {
+  target: bigint;
+  /** Highest backfilled block, undefined before the first chunk. */
+  progress?: bigint;
+}
+
+export interface BalanceSnapshot {
+  token: Address;
+  result: BalanceResult;
+  blockNumber: bigint;
+  blockHash: Hex;
+}
+
+/** Per-account data read in one snapshot, consistent with the follower cursor. */
+export interface AccountView {
+  cursor: FollowerCursor;
+  holdings: Holding[];
+  nftItems: NftItem[];
+}
+
+export type FollowerApplyResult = { applied: true } | { applied: false; missing: Address[] };
+
 export interface Store {
-  /** Published finalized cursor: every chunk through this block was applied. */
-  getCursor(network: string, account: Address): Promise<BlockRef | undefined>;
-  /** Highest block whose events were applied, even if the finalized cursor is not complete yet. */
+  getFollowerCursor(network: string): Promise<FollowerCursor | undefined>;
+  /** Create the cursor at `block` unless one exists; returns the stored cursor. */
+  initFollowerCursor(network: string, block: BlockRef, at: number): Promise<FollowerCursor>;
+  /**
+   * Mark an account tracked (idempotent). The insert and the read of the follower cursor (= backfill target) happen in
+   * one transaction under a share lock on the cursor row, so a follower commit is either fully before it (and its blocks
+   * are <= target) or fully after it (and applies to the account). Legacy progress above the cursor is discarded.
+   */
+  trackAccount(network: string, account: Address, at: number): Promise<Tracking>;
+  getTracking(network: string, account: Address): Promise<Tracking | undefined>;
+  trackedAccounts(network: string): Promise<Address[]>;
+  /**
+   * Apply one follower range for the accounts in `aggregates` and advance the cursor to `to`, in one transaction that
+   * locks the cursor row. Rejects unless the cursor is at range.fromBlock - 1. Applies nothing (applied: false) when an
+   * account is tracked in the database but missing from `known`, the set the range was decoded against.
+   */
+  applyFollowerRange(
+    network: string,
+    range: BlockRange,
+    to: BlockRef,
+    at: number,
+    aggregates: Map<Address, ChunkAggregate>,
+    known: ReadonlySet<Address>,
+  ): Promise<FollowerApplyResult>;
+  /** Highest backfilled block, even if the backfill has not reached its target yet. */
   getProgress(network: string, account: Address): Promise<bigint | undefined>;
   /**
-   * Atomically apply one completed chunk's aggregate and advance progress to range.toBlock.
-   * Idempotent: a chunk at or below applied progress is a no-op; one straddling it is rejected.
+   * Atomically apply one backfill chunk's aggregate and advance progress to range.toBlock.
+   * Idempotent: a chunk at or below applied progress is a no-op; one straddling it, or one beyond the account's
+   * backfill target (the follower's side), is rejected.
    */
   applyScanChunk(network: string, account: Address, range: BlockRange, chunk: ChunkAggregate): Promise<void>;
   /** Last adaptive getLogs range used for this account, so the next scan of a heavy account starts small. */
   getLogsRange(network: string, account: Address): Promise<bigint | undefined>;
   setLogsRange(network: string, account: Address, range: bigint): Promise<void>;
-  /** Publish a consistent finalized height/hash pair after every chunk through it was applied. Never moves back. */
-  finalizeScan(network: string, account: Address, scannedTo: BlockRef): Promise<void>;
+  /** Cursor, holdings and NFT items read in one repeatable-read transaction. Undefined without a follower cursor. */
+  readAccount(network: string, account: Address): Promise<AccountView | undefined>;
   /** ERC-20 and ERC-721 summaries, newest first. */
   holdings(network: string, account: Address): Promise<Holding[]>;
   nftItems(network: string, account: Address): Promise<NftItem[]>;
+  /** Every ERC-20 (account, token) pair of these accounts. */
+  erc20Pairs(network: string, accounts: Address[]): Promise<BalancePair[]>;
+  /** Upsert balance snapshots read at `block`; a row never moves to an older block. */
+  saveBalances(network: string, block: BlockRef, rows: (BalancePair & { result: BalanceResult })[]): Promise<void>;
+  balances(network: string, account: Address): Promise<BalanceSnapshot[]>;
   close(): Promise<void>;
+}
+
+/** Health of one network's follower, computed in memory (never triggers RPC). */
+export interface FollowerStatus {
+  /** A cursor exists, so accounts can be tracked and served. */
+  ready: boolean;
+  /** This process holds the follower lock and advances the cursor. */
+  leader: boolean;
+  cursor?: FollowerCursor;
+  /** Highest finalized head number the follower has seen. */
+  headNumber?: bigint;
+  /** Finalized head minus cursor, from the follower's last head poll. */
+  lagBlocks: bigint;
+  /** When the cursor last advanced (epoch ms); 0 before the first cursor read. */
+  lastAdvanceAt: number;
+  lastError?: string;
+  stale: boolean;
+  /** Why discovery must refuse (503), if it must. */
+  unhealthy?: string;
+}
+
+export interface Follower {
+  start(): void;
+  stop(): Promise<void>;
+  /** One poll: read the finalized head, apply every range up to it (when leader). */
+  tick(): Promise<void>;
+  status(): FollowerStatus;
+  /** Add a just-tracked account to the in-memory set (the store re-checks at commit). */
+  track(account: Address): void;
 }
 
 // ---------------------------------------------------------------------------
@@ -192,22 +295,42 @@ export interface Store {
 // ---------------------------------------------------------------------------
 
 export interface DiscoveryResult {
+  status: 'ready';
   network: string;
   account: Address;
   fromBlock: bigint; // network start block
-  blockHeight: bigint; // data valid up to and including this block
+  blockHeight: bigint; // follower cursor: data valid up to and including this block
   blockHash: Hex;
   blockTimestamp: bigint;
   finality: 'finalized';
+  /** When the follower cursor last advanced (epoch ms). */
   lastProgressAt: number;
   stale: boolean;
+  /** Latest head minus blockHeight. */
   lagBlocks: bigint;
+  /** Finalized head minus blockHeight. */
+  followerLagBlocks: bigint;
   holdings: Holding[];
   nftItems: NftItem[];
+  /** Backfill work this request waited for (zero when served from the database). */
   scan: { newBlocks: bigint; rpcCalls: number; ms: number };
 }
 
+/** The account's backfill has not reached its target yet. */
+export interface SyncingResult {
+  status: 'syncing';
+  network: string;
+  account: Address;
+  fromBlock: bigint;
+  progressBlocks: bigint;
+  targetBlocks: bigint;
+  followerLagBlocks: bigint;
+}
+
 export interface DiscoveryService {
-  /** Validate network and address, bring the account up to finalized head (single-flight per account), then read. */
-  discover(network: string, account: string): Promise<DiscoveryResult>;
+  /**
+   * Validate network and address, track the account, wait up to the request deadline for its backfill
+   * (single-flight per account), then read from the database. Never calls RPC once the account is backfilled.
+   */
+  discover(network: string, account: string): Promise<DiscoveryResult | SyncingResult>;
 }
