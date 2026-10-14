@@ -1,0 +1,26 @@
+{
+  "name": "i-see-u",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Token discovery PoC over plain JSON-RPC",
+  "scripts": {
+    "start": "node src/server.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "dependencies": {
+    "@hono/node-server": "^2.1.5",
+    "hono": "^4.13.13",
+    "viem": "^2.57.6"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.4"
+  }
+}
