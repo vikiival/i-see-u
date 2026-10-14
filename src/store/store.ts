@@ -15,6 +15,7 @@ import type {
   TransferEvent,
   Tracking,
 } from '../core/types.ts';
+import { unavailable } from '../core/limiter.ts';
 import * as schema from './schema.ts';
 
 export type StoreDatabase = PgDatabase<any, typeof schema>;
@@ -208,8 +209,14 @@ export function createStore(db: StoreDatabase, close: () => Promise<void> = asyn
           await tx.delete(p).where(and(eq(p.network, network), eq(p.account, account)));
           progress = undefined;
         }
-        await tx.insert(schema.trackedAccounts).values({ network, account, backfillTarget: cursor.number, trackedAt: at });
-        return { target: cursor.number, progress };
+        const inserted = await tx.insert(schema.trackedAccounts)
+          .values({ network, account, backfillTarget: cursor.number, trackedAt: at })
+          .onConflictDoNothing().returning({ target: schema.trackedAccounts.backfillTarget });
+        if (inserted.length > 0) return { target: cursor.number, progress };
+        // A concurrent first request won the insert: serve its target.
+        const winner = await getTarget(tx, network, account);
+        if (winner === undefined) throw unavailable('Account tracking raced; retry', 1);
+        return { target: winner, progress: await getProgress(tx, network, account) };
       });
     },
 
@@ -421,6 +428,7 @@ export function createStore(db: StoreDatabase, close: () => Promise<void> = asyn
       const pairs: BalancePair[] = [];
       const seen = new Set<string>();
       await inBatches(accounts, async (batch) => {
+        const members = new Set<string>(batch);
         const rows = await db.select({ account: schema.holdings.holder, token: schema.holdings.token })
           .from(schema.holdings).where(and(
             eq(schema.holdings.network, network),
@@ -442,7 +450,7 @@ export function createStore(db: StoreDatabase, close: () => Promise<void> = asyn
           or(inArray(schema.tailTransfers.from, batch), inArray(schema.tailTransfers.to, batch)),
         ));
         for (const row of tail) for (const account of [row.from, row.to]) {
-          if (!batch.includes(account as Address)) continue;
+          if (!members.has(account)) continue;
           const key = `${account}:${row.token}`;
           if (!seen.has(key)) pairs.push({ account: account as Address, token: row.token as Address });
           seen.add(key);
