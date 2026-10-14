@@ -1,4 +1,4 @@
-import { bigint, boolean, integer, pgTable, primaryKey, text } from 'drizzle-orm/pg-core';
+import { bigint, boolean, index, integer, pgTable, primaryKey, text } from 'drizzle-orm/pg-core';
 
 import type { TokenStandard } from '../core/types.ts';
 
@@ -11,6 +11,33 @@ export const followerCursor = pgTable('follower_cursor', {
   /** Epoch milliseconds of the last advance (written by the follower's clock). */
   updatedAt: bigint('updated_at', { mode: 'number' }).notNull(),
 });
+
+/** Reorgable block journal above follower_cursor. Finalized aggregates never depend on these rows. */
+export const tailBlocks = pgTable('tail_blocks', {
+  network: text().notNull(),
+  number: bigint({ mode: 'bigint' }).notNull(),
+  hash: text().notNull(),
+  parentHash: text('parent_hash').notNull(),
+  timestamp: bigint({ mode: 'bigint' }).notNull(),
+}, (table) => [primaryKey({ columns: [table.network, table.number] })]);
+
+export const tailTransfers = pgTable('tail_transfers', {
+  network: text().notNull(),
+  blockNumber: bigint('block_number', { mode: 'bigint' }).notNull(),
+  logIndex: integer('log_index').notNull(),
+  blockHash: text('block_hash').notNull(),
+  token: text().notNull(),
+  standard: text().$type<TokenStandard>().notNull(),
+  from: text().notNull(),
+  to: text().notNull(),
+  value: text().notNull(),
+  tokenId: text('token_id'),
+  txHash: text('tx_hash').notNull(),
+}, (table) => [
+  primaryKey({ columns: [table.network, table.blockNumber, table.logIndex] }),
+  index('tail_transfers_network_from_idx').on(table.network, table.from),
+  index('tail_transfers_network_to_idx').on(table.network, table.to),
+]);
 
 /**
  * Accounts the follower applies Transfers for. backfill_target is the follower cursor read in the same transaction

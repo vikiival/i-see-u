@@ -35,6 +35,7 @@ function event(overrides: Partial<TransferEvent> = {}): TransferEvent {
     to: other,
     value: 1n,
     blockNumber: 10n,
+    blockHash: block(10n).hash,
     logIndex: 0,
     transactionHash: '0x01' as Hex,
     ...overrides,
