@@ -26,7 +26,7 @@ The PoC was built in phases, so it differs from the target design in sections 1â
 | Area | Target design (below) | Implemented now |
 |---|---|---|
 | Discovery | Global ingestion of all Transfer logs | **On-demand per account:** address-filtered `eth_getLogs` in 10k-block chunks (52 calls on first request), then only new blocks |
-| Storage | Postgres | **SQLite** (`node:sqlite`) behind the same `Store` interface; one row per `(account, token)`, no per-transfer rows |
+| Storage | Postgres | **PostgreSQL 18** via Drizzle ORM; one row per `(account, token)`, no per-transfer rows; generated migrations run at startup |
 | Consistency | Confirmation depth plus reorg rollback | **Finalized model:** only finalized blocks are persisted, and the cursor stores the block hash. Reorg-safe by construction, but about 13 min behind the tip |
 | Realtime | Follower at head | **Next phase:** tail from finalized to head, scanned per request and merged in memory, plus a shared follower |
 | Balances | Cached and invalidated by the follower | **Read per request** via Multicall3 at the response block. No cache yet, so 5k users once a minute does not fit within RPC limits until the follower lands |

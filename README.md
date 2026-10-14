@@ -8,15 +8,18 @@ Design notes and measurements: [REPORT.md](REPORT.md).
 
 ```sh
 npm install
-echo 'RPC_URL=https://<your-endpoint>' > .env   # Quicknode paid plan recommended (10k-block getLogs)
-npm start                                        # http://localhost:3000
-npm test                                         # unit tests, no network
-npm run test:watch                               # watch mode
+cp .env.example .env                # replace RPC_URL with your endpoint
+docker compose up -d postgres       # PostgreSQL 18 on 127.0.0.1:5432
+npm start                            # migrates the database, then serves http://localhost:3000
+npm test                             # PGlite tests; no Docker or network needed
+npm run test:watch                   # watch mode
 ```
 
-The project-root `.env` file is loaded with Node's `process.loadEnvFile()`; existing environment variables take precedence.
+The project-root `.env` file is loaded with Node's `process.loadEnvFile()`; existing environment variables take precedence. The development `DATABASE_URL` default matches `docker-compose.yml`, so copying `.env.example` is enough. The database is a derived cache, but migrations preserve it across schema-compatible releases.
 
-Optional env: `RPC_FALLBACK_URLS` (comma-separated), `PORT`, `DB_PATH` (default `data/i-see-u.sqlite`), `FINALIZED_MAX_NO_PROGRESS_MS` (finalized head is marked stale after this long without a higher block, default 1200000), `MAX_HEAD_AGE_MS` (maximum finalized no-progress age accepted by discovery, default 1800000), `ETH_LOGS_MAX_RANGE` (default 3000), `ETH_LOGS_MIN_RANGE` (floor of the adaptive range, default 500), `ETH_SCAN_CONCURRENCY` (chunks in flight per scan, default 8), `RPC_TIMEOUT_MS` (per attempt, default 15000), `RPC_MAX_ATTEMPTS` (default 6), `ETH_MULTICALL_BATCH` (default 1000), `RPC_MAX_RPS` (default 20). Numeric values must be positive integers; invalid values fail at startup.
+After changing `src/store/schema.ts`, run `npm run db:generate` and commit the generated SQL and metadata in `drizzle/`. `npm run db:migrate` applies pending migrations without starting the API; `npm start` does the same automatically.
+
+Optional env: `DATABASE_URL` (default `postgresql://iseeu:iseeu@localhost:5432/iseeu`), `RPC_FALLBACK_URLS` (comma-separated), `PORT`, `FINALIZED_MAX_NO_PROGRESS_MS` (finalized head is marked stale after this long without a higher block, default 1200000), `MAX_HEAD_AGE_MS` (maximum finalized no-progress age accepted by discovery, default 1800000), `ETH_LOGS_MAX_RANGE` (default 3000), `ETH_LOGS_MIN_RANGE` (floor of the adaptive range, default 500), `ETH_SCAN_CONCURRENCY` (chunks in flight per scan, default 8), `RPC_TIMEOUT_MS` (per attempt, default 15000), `RPC_MAX_ATTEMPTS` (default 6), `ETH_MULTICALL_BATCH` (default 1000), `RPC_MAX_RPS` (default 20). Numeric values must be positive integers; invalid values fail at startup.
 
 ## API
 
@@ -37,7 +40,7 @@ Chain quantities are decimal strings; `dataAgeS` is an integer. `blockHeight` an
    - **Aggregated while decoding.** Each decoded log of either direction is folded straight into a per-chunk aggregate: per token the standard, first/last block and sent/received counts; per ERC-721 `(token, tokenId)` the latest `(block, logIndex, held)`. No per-transfer arrays are built, sorted, or concatenated. Only a self-transfer (`from == to == account`) is returned by both queries, so only those are deduped by `(txHash, logIndex)`.
    - **Adaptive range per account.** A scan starts at the account's persisted range, else `ETH_LOGS_MAX_RANGE`. A chunk is heavy if it had to be split, a response exceeded 50 MB, or it was slower than 3 s while larger than 5 MB (a slow small response is provider latency, which a smaller range would only multiply). A heavy chunk sets the range to half its own size (floor `ETH_LOGS_MIN_RANGE`), so a window of heavy results shrinks once, not once per result. Three consecutive light chunks at the current range double it again, up to the maximum. The last range is stored per account, so the next scan of an exchange wallet starts small. Response size is the uncompressed `Content-Length` from `RpcClient`'s per-attempt hook; Quicknode compresses large responses without one, so it is then estimated at 640 bytes per log, without re-serializing.
 3. **Classification.** A `Transfer` log with 3 topics is decoded strictly with the ERC-20 event ABI. With 4 topics it is decoded with the ERC-721 variant, where `tokenId` is indexed. Malformed logs are skipped.
-4. **Storage.** One row per `(account, token)` with first and last block and sent/received counts, plus ERC-721 token IDs. Individual transfers are never stored. Resumable `progress_to` is separate from the published finalized cursor, whose height, hash, and timestamp stay consistent; both only move forward. The database is a derived cache: one with a different schema version (`PRAGMA user_version`) is dropped and rebuilt on open.
+4. **Storage.** PostgreSQL 18 stores one row per `(account, token)` with first and last block and sent/received counts, plus ERC-721 token IDs. Individual transfers are never stored. Resumable `progress_to` is separate from the published finalized cursor, whose height, hash, and timestamp stay consistent; both only move forward. Every chunk is one transaction, and Drizzle migrations run before the server starts.
 5. **Balances.** Multicall3 `aggregate3` with `allowFailure`, using viem's exported ABIs for encoding and decoding. The outer `eth_call` uses the EIP-1898 `{ blockHash }` parameter from the finalized cursor, so a provider cannot resolve the read against a different block at the same height. Batches contain up to 1,000 inner calls and split only size/gas/revert failures; authentication, malformed responses, rate limits, outages, and unsupported calls propagate immediately.
 
 `lagBlocks` uses the highest `latest` block number cached by head tracking. Reading it from discovery never triggers another RPC; when none is available, lag is computed against the finalized observation (normally zero).
@@ -52,7 +55,11 @@ src/rpc/                  JSON-RPC client: viem http() per endpoint for transpor
                           (rate_limited / transient / too_large / unsupported / fatal); rpcErrorOf() unwraps viem-wrapped errors
 src/chains/evm/           EVM adapter: logs.ts (typed topics/strict decoding and range splitting), head.ts (finalized head via a
                           viem PublicClient over RpcClient, retries and batching disabled), multicall.ts, adapter.ts
-src/store/sqlite.ts       Store implementation (node:sqlite; Postgres would sit behind the same interface)
+src/store/schema.ts       Drizzle PostgreSQL schema
+src/store/store.ts        async Store queries and transactional upserts, shared by pg and PGlite
+src/store/postgres.ts     pg Pool startup and automatic Drizzle migrations
+src/store/advisory-lock.ts transaction-scoped PostgreSQL advisory-lock helper for the future follower
+drizzle/                  generated, commit-ready SQL migrations and metadata
 src/discovery/service.ts  cursor-based incremental scan, single-flight
 src/api/routes.ts         Hono routes
 ```
@@ -87,3 +94,4 @@ viem's `http()` transport builds requests, enforces the timeout and parses respo
 - **Concurrency and rate limit.** At the default `RPC_MAX_RPS` of 20, concurrency 8 (16 requests in flight) already saturates the limiter for a normal account: 172 calls take about 8.6 s, and concurrency 16 measured no faster.
 - **Reorgs.** Durable summaries contain finalized blocks only, making them reorg-safe by construction under Ethereum's finality guarantees. The service does not implement rollback for a consensus-level finality failure.
 - **No balance cache yet.** Balances are read on every request. Request coalescing is in-process, so multiple replicas would need Redis.
+- **PostgreSQL required at runtime.** The API does not fall back to embedded storage. Tests use PGlite and exercise the same generated migrations without Docker.
