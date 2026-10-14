@@ -137,14 +137,14 @@ export function createTail(o: TailOptions): Tail {
     reorgs += 1;
     lastReorgDepth = oldTip.number - (ancestor?.number ?? cursor.number);
     if (!ancestor) {
-      await store.wipeTail(network);
+      await store.wipeTail(network, oldTip.hash);
       tip = undefined;
       tailError = `Tail reorg has no common ancestor within ${maxDepth} blocks above the finalized cursor`;
       lastError = tailError;
       o.onAdvance?.(cursor, true);
       return;
     }
-    await store.rewindTail(network, ancestor.number);
+    await store.rewindTail(network, ancestor.number, oldTip.hash);
     tip = ancestor;
     lastAdvanceAt = now();
     if (head.number > ancestor.number) await append(ancestor, head, true);

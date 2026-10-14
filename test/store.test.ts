@@ -5,6 +5,7 @@ import type { Address, BlockRef, Hex, Store, TransferEvent } from '../src/core/t
 import { addTransfer, emptyAggregate } from '../src/core/aggregate.ts';
 import { advisoryKey, singleConnectionLeaderLock, withAdvisoryLock } from '../src/store/advisory-lock.ts';
 import { migrationsFolder } from '../src/store/postgres.ts';
+import { TailConflictError } from '../src/store/store.ts';
 import { createTestStore } from './store-fixture.ts';
 
 const account = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' as Address;
@@ -207,6 +208,27 @@ test('applyFollowerRange continues the cursor only, and applies nothing when a t
       .toEqual({ applied: true });
     expect(await store.getFollowerCursor('ethereum')).toEqual({ ...block(25n), updatedAt: 2 });
     expect((await store.readAccount('ethereum', account))?.holdings).toMatchObject([{ token, sentCount: 1, firstBlock: 22n }]);
+  } finally {
+    await store.close();
+  }
+});
+
+test('rewindTail/wipeTail with a stale expected tip throw TailConflictError and delete nothing', async () => {
+  const { store } = await createTestStore();
+  try {
+    await store.initFollowerCursor('ethereum', block(20n), 1);
+    const header = (number: bigint) => ({ ...block(number), parentHash: block(number - 1n).hash });
+    await store.appendTailBlocks('ethereum', block(20n).hash, [21n, 22n, 23n].map((n) => ({ header: header(n), transfers: [] })));
+    const stale = block(22n).hash; // another writer already moved the tip past what this one observed
+    await expect(store.rewindTail('ethereum', 21n, stale)).rejects.toBeInstanceOf(TailConflictError);
+    await expect(store.wipeTail('ethereum', stale)).rejects.toBeInstanceOf(TailConflictError);
+    expect((await store.getTailBlocks('ethereum')).map((b) => b.number)).toEqual([21n, 22n, 23n]);
+
+    await store.rewindTail('ethereum', 21n, block(23n).hash);
+    expect((await store.getTailBlocks('ethereum')).map((b) => b.number)).toEqual([21n]);
+    await store.wipeTail('ethereum', block(21n).hash);
+    expect(await store.getTailBlocks('ethereum')).toEqual([]);
+    await expect(store.rewindTail('ethereum', 20n, block(21n).hash)).rejects.toBeInstanceOf(TailConflictError);
   } finally {
     await store.close();
   }
