@@ -66,6 +66,7 @@ const tails = config.tail.enabled ? Object.fromEntries(Object.values(adapters).m
   store,
   follower: followers[adapter.network],
   maxDepth: config.tail.maxDepth,
+  maxAheadBlocks: config.tail.maxAheadBlocks,
   pollOffsetsMs: config.tail.pollOffsetsMs,
   // The 60 s sweep follows the tip; a reorg may have orphaned the block balances were read at, so refresh now.
   onAdvance: (_tip, reorg) => { if (reorg) balances[adapter.network].kick(); },
@@ -77,6 +78,7 @@ const discovery = createDiscoveryService({
   store,
   followers,
   tails,
+  maxTailTipAgeMs: config.tail.maxTipAgeMs,
   requestDeadlineMs: config.request.deadlineMs,
   backfillLimiter: createLimiter(config.request.backfillConcurrency, config.request.backfillQueue),
 });

@@ -13,6 +13,8 @@ export interface TailOptions {
   store: Store;
   follower: Pick<Follower, 'status'>;
   maxDepth?: bigint;
+  /** Stop appending this many blocks above the finalized cursor (finality stalled): bounds rows and overlay cost. */
+  maxAheadBlocks?: bigint;
   pollOffsetsMs?: number[];
   staleAfterMs?: number;
   errorThreshold?: number;
@@ -49,6 +51,7 @@ const messageOf = (error: unknown): string => (error instanceof Error ? error.me
 export function createTail(o: TailOptions): Tail {
   const now = o.now ?? Date.now;
   const maxDepth = o.maxDepth ?? 64n;
+  const maxAheadBlocks = o.maxAheadBlocks ?? 1024n;
   const offsets = [...(o.pollOffsetsMs ?? [2_500, 5_000, 9_000])].sort((a, b) => a - b);
   const staleAfterMs = o.staleAfterMs ?? 3 * SLOT_MS;
   const errorThreshold = o.errorThreshold ?? 3;
@@ -74,10 +77,11 @@ export function createTail(o: TailOptions): Tail {
     o.onEpoch?.();
   };
 
-  const append = async (anchor: BlockHeader, head: BlockHeader, reorg = false): Promise<void> => {
-    const end = anchor.number + adapter.followerMaxRange < head.number
+  const append = async (anchor: BlockHeader, head: BlockHeader, cursorNumber: bigint, reorg = false): Promise<void> => {
+    let end = anchor.number + adapter.followerMaxRange < head.number
       ? anchor.number + adapter.followerMaxRange
       : head.number;
+    if (end > cursorNumber + maxAheadBlocks) end = cursorNumber + maxAheadBlocks; // never past the finality-stall bound
     const headers: BlockHeader[] = [];
     let parent = anchor;
     for (let number = anchor.number + 1n; number <= end; number += 1n) {
@@ -137,17 +141,17 @@ export function createTail(o: TailOptions): Tail {
     reorgs += 1;
     lastReorgDepth = oldTip.number - (ancestor?.number ?? cursor.number);
     if (!ancestor) {
-      await store.wipeTail(network);
+      await store.wipeTail(network, oldTip.hash);
       tip = undefined;
       tailError = `Tail reorg has no common ancestor within ${maxDepth} blocks above the finalized cursor`;
       lastError = tailError;
       o.onAdvance?.(cursor, true);
       return;
     }
-    await store.rewindTail(network, ancestor.number);
+    await store.rewindTail(network, ancestor.number, oldTip.hash);
     tip = ancestor;
     lastAdvanceAt = now();
-    if (head.number > ancestor.number) await append(ancestor, head, true);
+    if (head.number > ancestor.number) await append(ancestor, head, cursor.number, true);
     else if (tip) o.onAdvance?.(tip, true);
   };
 
@@ -165,12 +169,19 @@ export function createTail(o: TailOptions): Tail {
       }
       const anchor: BlockHeader = { ...cursor, parentHash: cursor.hash };
       tip = await store.getTailTip(network);
+      const ahead = (tip?.number ?? cursor.number) - cursor.number;
+      if (ahead >= maxAheadBlocks) {
+        // Finality is not moving while latest is: degrade to finalized instead of growing the tail without bound.
+        tailError = `Tail is ${ahead} blocks above the finalized cursor; finality may be stalled`;
+        o.onEpoch?.();
+        return;
+      }
       const head = await adapter.latestHeader();
       if (latestNumber === undefined || head.number > latestNumber) latestNumber = head.number;
 
       if (head.number <= cursor.number) return; // lagging fallback endpoint
       if (!tip) {
-        if (head.number > cursor.number) await append(anchor, head);
+        if (head.number > cursor.number) await append(anchor, head, cursor.number);
       } else if (head.number < tip.number) {
         const stored = (await store.getTailBlocks(network)).find((block) => block.number === head.number);
         if (stored?.hash !== head.hash) await handleReorg(head, anchor);
@@ -178,7 +189,7 @@ export function createTail(o: TailOptions): Tail {
         if (head.hash !== tip.hash) await handleReorg(head, anchor);
       } else {
         try {
-          await append(tip, head);
+          await append(tip, head, cursor.number);
         } catch (error) {
           if ((error as { chainMismatch?: unknown }).chainMismatch === true) await handleReorg(head, anchor);
           else throw error;
@@ -214,13 +225,7 @@ export function createTail(o: TailOptions): Tail {
         lastAdvanceAt = now();
         epoch = epochOf(tip);
       }
-      if (tip && o.follower.status().leader) {
-        const canonical = await adapter.headerByNumber(tip.number);
-        if (canonical.hash !== tip.hash) {
-          const cursor = await store.getFollowerCursor(network);
-          if (cursor) await handleReorg(canonical, { ...cursor, parentHash: cursor.hash });
-        }
-      }
+      // No re-validation here: leadership is not known yet at startup; the first leader tick checks the stored tip.
     },
     start() {
       if (!stopped) return;

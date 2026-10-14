@@ -24,6 +24,11 @@ interface DiscoveryDependencies {
   requestDeadlineMs?: number;
   /** Bounds concurrent (and queued) backfills; beyond it requests get 503 with Retry-After. */
   backfillLimiter?: Limiter;
+  /**
+   * Serve `latest` only while the shared tail tip's own block timestamp is at most this old (undefined: no check).
+   * Every process reads the same tip, so a stalled leader degrades all of them, not just itself.
+   */
+  maxTailTipAgeMs?: number;
   now?: () => number;
 }
 
@@ -193,7 +198,10 @@ export function createDiscoveryService(deps: DiscoveryDependencies): DiscoverySe
       const { cursor } = view;
       const tailStatus = (deps.tails && Object.hasOwn(deps.tails, network) ? deps.tails[network] : undefined)?.status();
       const wantsLatest = requestedFinality !== 'finalized' && tailStatus !== undefined;
-      const serveLatest = wantsLatest && tailStatus.healthy && view.tailTip !== undefined;
+      const tipAgeMs = view.tailTip && now() - Number(view.tailTip.timestamp) * 1000;
+      const tipTooOld = wantsLatest && deps.maxTailTipAgeMs !== undefined && tipAgeMs !== undefined
+        && tipAgeMs > deps.maxTailTipAgeMs;
+      const serveLatest = wantsLatest && tailStatus.healthy && view.tailTip !== undefined && !tipTooOld;
       let holdings = view.holdings;
       let nftItems = view.nftItems;
       if (serveLatest) {
@@ -244,8 +252,12 @@ export function createDiscoveryService(deps: DiscoveryDependencies): DiscoverySe
         blockTimestamp: served.timestamp,
         finality: serveLatest ? 'latest' : 'finalized',
         ...(serveLatest && { finalizedBlockHeight: cursor.number, finalizedBlockHash: cursor.hash }),
-        ...(wantsLatest && !serveLatest && { tailError: tailStatus?.tailError ?? 'Tail has no complete snapshot yet' }),
-        lastProgressAt: serveLatest ? tailStatus!.lastAdvanceAt : cursor.updatedAt,
+        ...(wantsLatest && !serveLatest && {
+          tailError: tailStatus?.tailError
+            ?? (tipTooOld ? `Tail tip is ${Math.round(tipAgeMs! / 1000)} s old` : 'Tail has no complete snapshot yet'),
+        }),
+        // The shared tip's block time, not process memory: identical in every process, leader or not.
+        lastProgressAt: serveLatest ? Number(view.tailTip!.timestamp) * 1000 : cursor.updatedAt,
         stale: serveLatest ? false : status.stale,
         lagBlocks: latest > served.number ? latest - served.number : 0n,
         followerLagBlocks: head > cursor.number ? head - cursor.number : 0n,

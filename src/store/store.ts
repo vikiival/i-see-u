@@ -325,8 +325,13 @@ export function createStore(db: StoreDatabase, close: () => Promise<void> = asyn
       });
     },
 
-    async rewindTail(network, aboveNumber) {
+    async rewindTail(network, aboveNumber, expectedTipHash) {
       await db.transaction(async (tx) => {
+        // Fenced like appendTailBlocks: a concurrent tail writer (failover) must not lose rows it just appended.
+        const tip = await getTailTip(tx, network, 'update');
+        if (tip?.hash !== expectedTipHash) {
+          throw new TailConflictError(`Tail tip changed from ${expectedTipHash} to ${tip?.hash}`);
+        }
         await tx.delete(schema.tailTransfers).where(and(
           eq(schema.tailTransfers.network, network), gt(schema.tailTransfers.blockNumber, aboveNumber),
         ));
@@ -336,8 +341,14 @@ export function createStore(db: StoreDatabase, close: () => Promise<void> = asyn
       });
     },
 
-    async wipeTail(network) {
-      await db.transaction((tx) => wipeTail(tx, network));
+    async wipeTail(network, expectedTipHash) {
+      await db.transaction(async (tx) => {
+        const tip = await getTailTip(tx, network, 'update');
+        if (expectedTipHash !== undefined && tip?.hash !== expectedTipHash) {
+          throw new TailConflictError(`Tail tip changed from ${expectedTipHash} to ${tip?.hash}`);
+        }
+        await wipeTail(tx, network);
+      });
     },
 
     getProgress: (network, account) => getProgress(db, network, account),

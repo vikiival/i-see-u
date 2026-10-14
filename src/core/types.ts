@@ -288,8 +288,10 @@ export interface Store {
   getTailTip(network: string): Promise<BlockHeader | undefined>;
   /** Compare-and-append a contiguous hash chain in one transaction. */
   appendTailBlocks(network: string, expectedParentHash: Hex, blocks: TailBlock[]): Promise<void>;
-  rewindTail(network: string, aboveNumber: bigint): Promise<void>;
-  wipeTail(network: string): Promise<void>;
+  /** Delete tail blocks above `aboveNumber`; TailConflictError unless the locked tip hash is `expectedTipHash`. */
+  rewindTail(network: string, aboveNumber: bigint, expectedTipHash: Hex): Promise<void>;
+  /** Delete the whole tail; when `expectedTipHash` is given, TailConflictError unless it is the locked tip hash. */
+  wipeTail(network: string, expectedTipHash?: Hex): Promise<void>;
   /** Highest backfilled block, even if the backfill has not reached its target yet. */
   getProgress(network: string, account: Address): Promise<bigint | undefined>;
   /**
