@@ -115,6 +115,10 @@ export function createFollower(o: FollowerOptions): Follower {
   return {
     tick,
 
+    async load() {
+      cursor ??= await store.getFollowerCursor(network);
+    },
+
     start() {
       if (loop) return;
       stopped = false;

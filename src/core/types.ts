@@ -281,6 +281,8 @@ export interface FollowerStatus {
 }
 
 export interface Follower {
+  /** Load the persisted cursor so a restarted process serves immediately, before its first tick reaches the RPC. */
+  load(): Promise<void>;
   start(): void;
   stop(): Promise<void>;
   /** One poll: read the finalized head, apply every range up to it (when leader). */

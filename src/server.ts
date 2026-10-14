@@ -54,6 +54,7 @@ const discovery = createDiscoveryService({
   backfillLimiter: createLimiter(config.request.backfillConcurrency, config.request.backfillQueue),
 });
 
+await Promise.all(Object.values(followers).map((follower) => follower.load()));
 for (const follower of Object.values(followers)) follower.start();
 for (const worker of Object.values(balances)) worker.start();
 

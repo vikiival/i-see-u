@@ -367,3 +367,22 @@ test('overloaded backfills get 503 with Retry-After instead of queueing without 
     await store.close();
   }
 });
+
+test('a restarted follower serves its persisted cursor after load(), before its first tick reaches the RPC', async () => {
+  const chain = new FakeChain(1_000n);
+  const s = await stack(chain);
+  try {
+    await s.follower.tick();
+    const restarted = createFollower({
+      adapter: s.adapter, store: s.store, pollMs: 60_000, maxLagBlocks: 96n,
+      staleAfterMs: 1_200_000, maxNoAdvanceMs: 1_800_000, now: () => s.clock.t,
+    });
+    expect(restarted.status()).toMatchObject({ ready: false });
+    const before = chain.total;
+    await restarted.load();
+    expect(chain.total).toBe(before);
+    expect(restarted.status()).toMatchObject({ ready: true, unhealthy: undefined, cursor: { number: 1_000n } });
+  } finally {
+    await s.close();
+  }
+});
