@@ -214,6 +214,54 @@ test('verifies only ERC-721 items currently held according to seen logs', async 
   ]);
 });
 
+test('shares one ownership sweep between concurrent and repeated requests at a block', async () => {
+  const discovery: DiscoveryService = { async discover() { return resultFor(); } };
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const erc721Owners = vi.fn<ChainAdapter['erc721Owners']>(async () => {
+    await gate;
+    return [{ status: 'ok', owner: account }];
+  });
+  const app = appWith(discovery, adapterWith({ erc721Owners }));
+  const url = `/v1/ethereum/accounts/${account}/erc721?verifyOwnership=true`;
+
+  const pending = Promise.all([app.request(url), app.request(url)]);
+  await vi.waitFor(() => expect(erc721Owners).toHaveBeenCalledTimes(1));
+  release();
+  const [a, b] = await pending;
+  expect(a.status).toBe(200);
+  expect(b.status).toBe(200);
+  const again = await app.request(url);
+  expect(again.status).toBe(200);
+  expect((await again.json()).collections[0].tokens[0].ownerStatus).toBe('ok');
+  expect(erc721Owners).toHaveBeenCalledTimes(1);
+});
+
+test('skips ownership verification above the held-item cap', async () => {
+  const discovery: DiscoveryService = { async discover() { return resultFor(); } };
+  const erc721Owners = vi.fn<ChainAdapter['erc721Owners']>(async () => []);
+  const app = createApp({
+    discovery,
+    adapters: { ethereum: adapterWith({ erc721Owners }) },
+    balances: { ethereum: balancesWith(async () => []) },
+    followers: { ethereum: { status: () => ({ ready: true, leader: true, lagBlocks: 0n, lastAdvanceAt: 0, stale: false }) } },
+    requestRpc: { limiter: createLimiter(2, 2), deadlineMs: 1_000 },
+    maxVerifyOwnershipItems: 0,
+    rpcStats: stats,
+    startedAt: Date.now(),
+  });
+
+  const response = await app.request(`/v1/ethereum/accounts/${account}/erc721?verifyOwnership=true`);
+  expect(response.status).toBe(200);
+  const body = await response.json();
+  expect(erc721Owners).not.toHaveBeenCalled();
+  expect(body.ownershipError).toBe('Too many held items to verify (1 > 0)');
+  expect(body.collections[0].tokens).toEqual([
+    { tokenId: '7', heldBySeenLogs: true, ownerStatus: 'skipped' },
+    { tokenId: '8', heldBySeenLogs: false },
+  ]);
+});
+
 test('maps transient RPC failures to 503 with Retry-After', async () => {
   const discovery: DiscoveryService = {
     async discover() {

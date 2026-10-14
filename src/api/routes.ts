@@ -5,10 +5,13 @@ import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import type { BalanceWorker, RequestRpc } from '../balances/worker.ts';
 import { unavailable, withDeadline } from '../core/limiter.ts';
 import type {
+  Address,
   ChainAdapter,
   DiscoveryResult,
   DiscoveryService,
   FollowerStatus,
+  Hex,
+  OwnerResult,
   RpcStats,
   SyncingResult,
   TailStatus,
@@ -23,6 +26,8 @@ export interface RouteDeps {
   tails?: Record<string, { status(): TailStatus }>;
   /** Bounds request-path RPC that remains (ownership verification). */
   requestRpc: RequestRpc;
+  /** Held-item cap for verifyOwnership (default 2000). */
+  maxVerifyOwnershipItems?: number;
   rpcStats: () => RpcStats;
   startedAt: number;
 }
@@ -95,6 +100,21 @@ export function createApp(deps: RouteDeps, opts: { requestLog?: boolean } = {}):
   const app = new Hono();
   // Middleware lives on this app (not a parent) so its notFound/onError handlers stay in effect.
   if (opts.requestLog) app.use('*', logger());
+
+  // Single-flight + short cache per account and block, so polling clients share one ownerOf sweep.
+  const ownerCache = new Map<string, Promise<OwnerResult[]>>();
+  const ownersFor = (key: string, adapter: ChainAdapter, items: { token: Address; tokenId: bigint }[], blockHash: Hex) => {
+    const hit = ownerCache.get(key);
+    if (hit) return hit;
+    const promise = deps.requestRpc.limiter.run(
+      () => adapter.erc721Owners(items, blockHash),
+      { deadlineAt: Date.now() + deps.requestRpc.deadlineMs },
+    );
+    ownerCache.set(key, promise);
+    promise.catch(() => { if (ownerCache.get(key) === promise) ownerCache.delete(key); });
+    while (ownerCache.size > 1000) ownerCache.delete(ownerCache.keys().next().value as string);
+    return promise;
+  };
 
   app.onError((error, c) => {
     const statusCode = statusCodeOf(error);
@@ -173,9 +193,11 @@ export function createApp(deps: RouteDeps, opts: { requestLog?: boolean } = {}):
     }
     const heldItems = result.nftItems.filter((item) => item.heldBySeenLogs);
     const adapter = deps.adapters[result.network];
-    const owners = verifyOwnership && heldItems.length > 0
+    const cap = deps.maxVerifyOwnershipItems ?? 2000;
+    const skipped = verifyOwnership && heldItems.length > cap;
+    const owners = verifyOwnership && !skipped && heldItems.length > 0
       ? await withDeadline(
-        deps.requestRpc.limiter.run(() => adapter.erc721Owners(heldItems, result.blockHash)),
+        ownersFor(`${result.network}:${result.account}:${result.blockHash}`, adapter, heldItems, result.blockHash),
         deps.requestRpc.deadlineMs,
         () => { throw unavailable('Ownership verification did not finish within the request deadline', 2); },
       )
@@ -193,24 +215,37 @@ export function createApp(deps: RouteDeps, opts: { requestLog?: boolean } = {}):
       else if (item.lastBlock > b.last) b.last = item.lastBlock;
     }
 
+    const byToken = new Map<string, typeof result.nftItems>();
+    for (const item of result.nftItems) {
+      const list = byToken.get(item.token);
+      if (list) list.push(item);
+      else byToken.set(item.token, [item]);
+    }
+
     const collections = [...bounds].map(([contract, { first, last }]) => ({
       contract,
       firstSeenBlock: first.toString(),
       lastSeenBlock: last.toString(),
-      tokens: result.nftItems.filter((item) => item.token === contract).map((item) => {
+      tokens: (byToken.get(contract) ?? []).map((item) => {
         const token = {
           tokenId: item.tokenId.toString(),
           heldBySeenLogs: item.heldBySeenLogs,
           ...(item.unfinalized && { unfinalized: true }),
         };
         if (!verifyOwnership || !item.heldBySeenLogs) return token;
+        if (skipped) return { ...token, ownerStatus: 'skipped' };
         const owner = ownerOf.get(item);
         if (owner?.status !== 'ok') return { ...token, ownerStatus: 'error' };
         return { ...token, owner: owner.owner, ownedByAccount: owner.owner === result.account, ownerStatus: owner.status };
       }),
     }));
 
-    return c.json({ ...baseJson(result), collections, scan: scanJson(result) });
+    return c.json({
+      ...baseJson(result),
+      ...(skipped && { ownershipError: `Too many held items to verify (${heldItems.length} > ${cap})` }),
+      collections,
+      scan: scanJson(result),
+    });
   });
 
   app.get('/health', (c) => c.json({
