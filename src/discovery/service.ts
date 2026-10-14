@@ -1,5 +1,6 @@
 import { createLimiter, unavailable, withDeadline } from '../core/limiter.ts';
 import type { Limiter } from '../core/limiter.ts';
+import { addTransfer, emptyAggregate } from '../core/aggregate.ts';
 import type {
   Address,
   BlockRange,
@@ -10,6 +11,7 @@ import type {
   Follower,
   Store,
   SyncingResult,
+  TailStatus,
   Tracking,
 } from '../core/types.ts';
 
@@ -17,6 +19,7 @@ interface DiscoveryDependencies {
   adapters: Record<string, ChainAdapter>;
   store: Store;
   followers: Record<string, Pick<Follower, 'status' | 'track'>>;
+  tails?: Record<string, { status(): TailStatus }>;
   /** How long a request waits for a cold backfill before answering `syncing`; the backfill continues. */
   requestDeadlineMs?: number;
   /** Bounds concurrent (and queued) backfills; beyond it requests get 503 with Retry-After. */
@@ -149,7 +152,7 @@ export function createDiscoveryService(deps: DiscoveryDependencies): DiscoverySe
   };
 
   return {
-    async discover(network: string, input: string): Promise<DiscoveryResult | SyncingResult> {
+    async discover(network: string, input: string, requestedFinality?: 'latest' | 'finalized'): Promise<DiscoveryResult | SyncingResult> {
       const adapter = deps.adapters[network];
       const follower = deps.followers[network];
       if (!adapter || !follower) {
@@ -187,23 +190,66 @@ export function createDiscoveryService(deps: DiscoveryDependencies): DiscoverySe
       const view = await deps.store.readAccount(network, account);
       if (!view) throw unavailable('Follower has no cursor yet', 5);
       const { cursor } = view;
-      const latest = adapter.cachedLatestBlockNumber?.() ?? cursor.number;
+      const tailStatus = deps.tails?.[network]?.status();
+      const wantsLatest = requestedFinality !== 'finalized' && tailStatus !== undefined;
+      const serveLatest = wantsLatest && tailStatus.healthy && view.tailTip !== undefined;
+      let holdings = view.holdings;
+      let nftItems = view.nftItems;
+      if (serveLatest) {
+        const aggregate = emptyAggregate();
+        for (const event of view.tailTransfers) addTransfer(aggregate, account, event);
+        const byToken = new Map(holdings.map((holding) => [holding.token, { ...holding }]));
+        for (const [token, tail] of aggregate.tokens) {
+          const base = byToken.get(token);
+          if (base) {
+            base.firstBlock = tail.firstBlock < base.firstBlock ? tail.firstBlock : base.firstBlock;
+            base.lastBlock = tail.lastBlock > base.lastBlock ? tail.lastBlock : base.lastBlock;
+            base.sentCount += tail.sentCount;
+            base.receivedCount += tail.receivedCount;
+            if (tail.sentCount > 0) base.unfinalizedSentCount = tail.sentCount;
+            if (tail.receivedCount > 0) base.unfinalizedReceivedCount = tail.receivedCount;
+          } else {
+            byToken.set(token, {
+              token,
+              ...tail,
+              ...(tail.sentCount > 0 && { unfinalizedSentCount: tail.sentCount }),
+              ...(tail.receivedCount > 0 && { unfinalizedReceivedCount: tail.receivedCount }),
+            });
+          }
+        }
+        holdings = [...byToken.values()].sort((a, b) => a.lastBlock === b.lastBlock
+          ? a.token.localeCompare(b.token) : a.lastBlock > b.lastBlock ? -1 : 1);
+        const byItem = new Map(nftItems.map((item) => [`${item.token}:${item.tokenId}`, { ...item }]));
+        for (const [key, item] of aggregate.nfts) byItem.set(key, {
+          token: item.token,
+          tokenId: item.tokenId,
+          heldBySeenLogs: item.held,
+          lastBlock: item.block,
+          unfinalized: true,
+        });
+        nftItems = [...byItem.values()].sort((a, b) => a.lastBlock === b.lastBlock
+          ? `${a.token}:${a.tokenId}`.localeCompare(`${b.token}:${b.tokenId}`) : a.lastBlock > b.lastBlock ? -1 : 1);
+      }
+      const served = serveLatest ? view.tailTip! : cursor;
+      const latest = tailStatus?.latestNumber ?? adapter.cachedLatestBlockNumber?.() ?? served.number;
       const head = status.headNumber ?? cursor.number;
       return {
         status: 'ready',
         network,
         account,
         fromBlock: adapter.startBlock,
-        blockHeight: cursor.number,
-        blockHash: cursor.hash,
-        blockTimestamp: cursor.timestamp,
-        finality: 'finalized',
-        lastProgressAt: cursor.updatedAt,
-        stale: status.stale,
-        lagBlocks: latest > cursor.number ? latest - cursor.number : 0n,
+        blockHeight: served.number,
+        blockHash: served.hash,
+        blockTimestamp: served.timestamp,
+        finality: serveLatest ? 'latest' : 'finalized',
+        ...(serveLatest && { finalizedBlockHeight: cursor.number, finalizedBlockHash: cursor.hash }),
+        ...(wantsLatest && !serveLatest && { tailError: tailStatus?.tailError ?? 'Tail has no complete snapshot yet' }),
+        lastProgressAt: serveLatest ? tailStatus!.lastAdvanceAt : cursor.updatedAt,
+        stale: serveLatest ? false : status.stale,
+        lagBlocks: latest > served.number ? latest - served.number : 0n,
         followerLagBlocks: head > cursor.number ? head - cursor.number : 0n,
-        holdings: view.holdings,
-        nftItems: view.nftItems,
+        holdings,
+        nftItems,
         scan,
       };
     },

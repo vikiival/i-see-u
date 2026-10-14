@@ -11,6 +11,7 @@ import type {
   FollowerStatus,
   RpcStats,
   SyncingResult,
+  TailStatus,
 } from '../core/types.ts';
 import { rpcErrorOf } from '../rpc/errors.ts';
 
@@ -19,6 +20,7 @@ export interface RouteDeps {
   adapters: Record<string, ChainAdapter>;
   balances: Record<string, BalanceWorker>;
   followers: Record<string, { status(): FollowerStatus }>;
+  tails?: Record<string, { status(): TailStatus }>;
   /** Bounds request-path RPC that remains (ownership verification). */
   requestRpc: RequestRpc;
   rpcStats: () => RpcStats;
@@ -29,6 +31,12 @@ const booleanQuery = (value: string | undefined, name: string): boolean => {
   if (value === undefined || value === 'false' || value === '0') return false;
   if (value === 'true' || value === '1') return true;
   throw Object.assign(new Error(`Invalid boolean query value for ${name}`), { statusCode: 400 });
+};
+
+const finalityQuery = (value: string | undefined): 'latest' | 'finalized' | undefined => {
+  if (value === undefined) return undefined;
+  if (value === 'latest' || value === 'finalized') return value;
+  throw Object.assign(new Error('Invalid finality; expected latest or finalized'), { statusCode: 400 });
 };
 
 const scanJson = (result: DiscoveryResult) => ({
@@ -55,6 +63,9 @@ const baseJson = (result: DiscoveryResult) => ({
   blockHeight: result.blockHeight.toString(),
   blockHash: result.blockHash,
   finality: result.finality,
+  ...(result.finalizedBlockHeight !== undefined && { finalizedBlockHeight: result.finalizedBlockHeight.toString() }),
+  ...(result.finalizedBlockHash !== undefined && { finalizedBlockHash: result.finalizedBlockHash }),
+  ...(result.tailError !== undefined && { tailError: result.tailError }),
   lastProgressAt: new Date(result.lastProgressAt).toISOString(),
   blockTimestamp: new Date(Number(result.blockTimestamp) * 1_000).toISOString(),
   dataAgeS: Math.max(0, Math.floor(Date.now() / 1_000) - Number(result.blockTimestamp)),
@@ -108,7 +119,8 @@ export function createApp(deps: RouteDeps, opts: { requestLog?: boolean } = {}):
   // Discovery validates the network (404) and address (400); query flags are checked before it runs.
   app.get('/v1/:network/accounts/:address/erc20', async (c) => {
     const includeBalances = booleanQuery(c.req.query('balances'), 'balances');
-    const result = await deps.discovery.discover(c.req.param('network'), c.req.param('address'));
+    const finality = finalityQuery(c.req.query('finality'));
+    const result = await deps.discovery.discover(c.req.param('network'), c.req.param('address'), finality);
     if (result.status === 'syncing') {
       c.header('Retry-After', '2');
       return c.json(syncingJson(result), 202);
@@ -119,6 +131,7 @@ export function createApp(deps: RouteDeps, opts: { requestLog?: boolean } = {}):
       ? await deps.balances[result.network].forAccount(result.account, holdings.map((h) => h.token), at)
       : undefined;
 
+    const withTail = deps.tails?.[result.network] !== undefined;
     const tokens = holdings.map((holding, i) => {
       const token = {
         contract: holding.token,
@@ -126,24 +139,29 @@ export function createApp(deps: RouteDeps, opts: { requestLog?: boolean } = {}):
         lastSeenBlock: holding.lastBlock.toString(),
         sentCount: holding.sentCount,
         receivedCount: holding.receivedCount,
+        ...(holding.unfinalizedSentCount && { unfinalizedSentCount: holding.unfinalizedSentCount }),
+        ...(holding.unfinalizedReceivedCount && { unfinalizedReceivedCount: holding.unfinalizedReceivedCount }),
       };
       const snapshot = balances?.[i];
       if (!snapshot) return token;
       const { result: balance } = snapshot;
-      const balanceBlock = snapshot.blockNumber.toString();
+      // A tail-tip block can be reorged out, so with the tail the balance is also pinned by hash.
+      const at = { balanceBlock: snapshot.blockNumber.toString(), ...(withTail && { balanceBlockHash: snapshot.blockHash }) };
       return balance.status === 'ok'
-        ? { ...token, balance: balance.balance.toString(), balanceStatus: balance.status, balanceBlock }
-        : { ...token, balanceStatus: balance.status, balanceError: balance.error, balanceBlock };
+        ? { ...token, balance: balance.balance.toString(), balanceStatus: balance.status, ...at }
+        : { ...token, balanceStatus: balance.status, balanceError: balance.error, ...at };
     });
     // Balances are labelled with the block they were read at; true when every one was read at blockHeight.
-    const balancesAtBlockHeight = balances && balances.every((snapshot) => snapshot.blockNumber === result.blockHeight);
+    const balancesAtBlockHeight = balances && balances.every((snapshot) =>
+      snapshot.blockNumber === result.blockHeight && snapshot.blockHash === result.blockHash);
 
     return c.json({ ...baseJson(result), balancesAtBlockHeight, tokens, scan: scanJson(result) });
   });
 
   app.get('/v1/:network/accounts/:address/erc721', async (c) => {
     const verifyOwnership = booleanQuery(c.req.query('verifyOwnership'), 'verifyOwnership');
-    const result = await deps.discovery.discover(c.req.param('network'), c.req.param('address'));
+    const finality = finalityQuery(c.req.query('finality'));
+    const result = await deps.discovery.discover(c.req.param('network'), c.req.param('address'), finality);
     if (result.status === 'syncing') {
       c.header('Retry-After', '2');
       return c.json(syncingJson(result), 202);
@@ -175,7 +193,11 @@ export function createApp(deps: RouteDeps, opts: { requestLog?: boolean } = {}):
       firstSeenBlock: first.toString(),
       lastSeenBlock: last.toString(),
       tokens: result.nftItems.filter((item) => item.token === contract).map((item) => {
-        const token = { tokenId: item.tokenId.toString(), heldBySeenLogs: item.heldBySeenLogs };
+        const token = {
+          tokenId: item.tokenId.toString(),
+          heldBySeenLogs: item.heldBySeenLogs,
+          ...(item.unfinalized && { unfinalized: true }),
+        };
         if (!verifyOwnership || !item.heldBySeenLogs) return token;
         const owner = ownerOf.get(item);
         if (owner?.status !== 'ok') return { ...token, ownerStatus: 'error' };
@@ -190,6 +212,20 @@ export function createApp(deps: RouteDeps, opts: { requestLog?: boolean } = {}):
     status: 'ok',
     uptimeS: Math.max(0, Math.floor((Date.now() - deps.startedAt) / 1_000)),
     followers: Object.fromEntries(Object.entries(deps.followers).map(([network, f]) => [network, statusJson(f.status())])),
+    ...(deps.tails && Object.keys(deps.tails).length > 0 && { tails: Object.fromEntries(Object.entries(deps.tails).map(([network, tail]) => {
+      const status = tail.status();
+      return [network, {
+        enabled: status.enabled,
+        tip: status.tipNumber === undefined ? undefined : { number: status.tipNumber.toString(), hash: status.tipHash },
+        latestNumber: status.latestNumber?.toString(),
+        lagBlocks: status.lagBlocks.toString(),
+        reorgs: status.reorgs,
+        lastReorgDepth: status.lastReorgDepth?.toString(),
+        healthy: status.healthy,
+        lastError: status.lastError,
+        tailError: status.tailError,
+      }];
+    })) }),
     balances: Object.fromEntries(Object.entries(deps.balances).map(([network, b]) => {
       const { activeAccounts, lastRefresh } = b.stats();
       return [network, {

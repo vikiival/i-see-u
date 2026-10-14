@@ -77,7 +77,11 @@ const adapterWith = (overrides: Partial<ChainAdapter> = {}): ChainAdapter => ({
       stale: false,
     };
   },
+  async latestHeader() { return { number: 1n, hash: hash(1), parentHash: hash(0), timestamp: 0n }; },
   async blockByNumber(number) { return { number, hash: hash(Number(number)), timestamp: 0n }; },
+  async headerByNumber(number) { return { number, hash: hash(Number(number)), parentHash: hash(Number(number - 1n)), timestamp: 0n }; },
+  async transfersInBlock() { return []; },
+  async transfersInRange() { return []; },
   async scanAllTransfers() { return { calls: 0 }; },
   async erc20BalancePairs(pairs) {
     return pairs.map(() => ({ status: 'ok', balance: 0n }));
@@ -86,7 +90,7 @@ const adapterWith = (overrides: Partial<ChainAdapter> = {}): ChainAdapter => ({
     return items.map(() => ({ status: 'ok', owner: account }));
   },
   ...overrides,
-});
+}) as ChainAdapter;
 
 const balancesWith = (forAccount: BalanceWorker['forAccount']): BalanceWorker => ({
   forAccount,

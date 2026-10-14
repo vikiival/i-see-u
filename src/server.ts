@@ -12,6 +12,7 @@ import { withFallback } from './sources/fallback.ts';
 import { createHypersyncLogSource } from './sources/hypersync.ts';
 import { createRpcLogSource } from './sources/rpc-logs.ts';
 import { openPostgresStore } from './store/postgres.ts';
+import { createTail } from './tail/tail.ts';
 
 const rpc = createRpcClient(config.rpc);
 const adapters = Object.fromEntries(Object.values(config.networks).map((network) => {
@@ -45,6 +46,7 @@ const balances = Object.fromEntries(Object.values(adapters).map((adapter) => [ad
   activeTtlMs: config.balances.activeAccountTtlMs,
   refreshMs: config.balances.refreshMs,
   requestRpc,
+  tailTip: config.tail.enabled ? () => store.getTailTip(adapter.network) : undefined,
   onError: logError('balance refresh'),
 })]));
 const followers = Object.fromEntries(Object.values(adapters).map((adapter) => [adapter.network, createFollower({
@@ -55,23 +57,38 @@ const followers = Object.fromEntries(Object.values(adapters).map((adapter) => [a
   maxLagBlocks: config.follower.maxLagBlocks,
   staleAfterMs: config.networks[adapter.network].finalizedMaxNoProgressMs,
   maxNoAdvanceMs: config.maxHeadProgressAgeMs,
-  onAdvance: () => balances[adapter.network].kick(),
+  // With the tail, balances are read at the tail tip, which a finalized advance does not move.
+  onAdvance: config.tail.enabled ? undefined : () => balances[adapter.network].kick(),
   onError: logError('follower tick'),
 })]));
+const tails = config.tail.enabled ? Object.fromEntries(Object.values(adapters).map((adapter) => [adapter.network, createTail({
+  adapter,
+  store,
+  follower: followers[adapter.network],
+  maxDepth: config.tail.maxDepth,
+  pollOffsetsMs: config.tail.pollOffsetsMs,
+  // The 60 s sweep follows the tip; a reorg may have orphaned the block balances were read at, so refresh now.
+  onAdvance: (_tip, reorg) => { if (reorg) balances[adapter.network].kick(); },
+  onEpoch: () => followers[adapter.network].kick(),
+  onError: logError('tail tick'),
+})])) : {};
 const discovery = createDiscoveryService({
   adapters,
   store,
   followers,
+  tails,
   requestDeadlineMs: config.request.deadlineMs,
   backfillLimiter: createLimiter(config.request.backfillConcurrency, config.request.backfillQueue),
 });
 
 await Promise.all(Object.values(followers).map((follower) => follower.load()));
+await Promise.all(Object.values(tails).map((tail) => tail.load()));
 for (const follower of Object.values(followers)) follower.start();
+for (const tail of Object.values(tails)) tail.start();
 for (const worker of Object.values(balances)) worker.start();
 
 const app = createApp(
-  { discovery, adapters, balances, followers, requestRpc, rpcStats: () => rpc.stats(), startedAt: Date.now() },
+  { discovery, adapters, balances, followers, tails, requestRpc, rpcStats: () => rpc.stats(), startedAt: Date.now() },
   { requestLog: process.env.LOG_LEVEL !== 'warn' && process.env.LOG_LEVEL !== 'error' },
 );
 
@@ -84,7 +101,7 @@ const shutdown = () => {
   if (shuttingDown) return;
   shuttingDown = true;
   server.close(async (error) => {
-    await Promise.all([...Object.values(followers), ...Object.values(balances)].map((part) => part.stop()));
+    await Promise.all([...Object.values(tails), ...Object.values(followers), ...Object.values(balances)].map((part) => part.stop()));
     await Promise.all(Object.values(adapters).map((adapter) => adapter.accountLogs.close?.()));
     await store.close();
     if (error) {

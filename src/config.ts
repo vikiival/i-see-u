@@ -25,6 +25,21 @@ const choice = <T extends string>(k: string, values: readonly T[], d: T): T => {
   return value as T;
 };
 
+const bool = (k: string, d: boolean): boolean => {
+  const value = env(k, d ? 'true' : 'false');
+  if (value === 'true' || value === '1') return true;
+  if (value === 'false' || value === '0') return false;
+  throw new Error(`${k} must be true or false`);
+};
+
+const intList = (k: string, d: string): number[] => env(k, d).split(',').map((part) => {
+  const value = Number(part.trim());
+  if (!Number.isSafeInteger(value) || value < 0) throw new Error(`${k} must contain non-negative integers`);
+  return value;
+});
+
+const tailEnabled = bool('TAIL_ENABLED', true);
+
 const evmTuning = {
   /** Mark the finalized head stale after this long without a higher block number. */
   finalizedMaxNoProgressMs: int('FINALIZED_MAX_NO_PROGRESS_MS', '1200000'),
@@ -65,10 +80,18 @@ export const config = {
     timeoutMs: int('HYPERSYNC_TIMEOUT_MS', '30000'),
   },
   follower: {
-    /** How often the follower polls the finalized head (finalized advances ~every 6.4 min). */
-    pollMs: int('FOLLOWER_POLL_MS', '30000'),
+    /**
+     * How often the follower polls the finalized head (finalized advances ~every 6.4 min). With the tail enabled the
+     * tail wakes it at each epoch boundary, so this is only a fallback (just over one epoch).
+     */
+    pollMs: int('FOLLOWER_POLL_MS', tailEnabled ? '390000' : '30000'),
     /** Discovery returns 503 when the follower is more than this many blocks behind finalized (~3 epochs). */
     maxLagBlocks: BigInt(int('FOLLOWER_MAX_LAG_BLOCKS', '96')),
+  },
+  tail: {
+    enabled: tailEnabled,
+    maxDepth: BigInt(int('TAIL_MAX_DEPTH', '64')),
+    pollOffsetsMs: intList('TAIL_POLL_OFFSETS_MS', '2500,5000,9000'),
   },
   balances: {
     /** Accounts whose balances were requested within this window are refreshed by the shared worker. */
@@ -99,4 +122,7 @@ for (const network of Object.values(config.networks)) {
 }
 if (config.logSource === 'hypersync' && !config.hypersync.apiToken) {
   throw new Error('LOG_SOURCE=hypersync requires HYPERSYNC_API_KEY');
+}
+if (config.tail.pollOffsetsMs.length === 0 || config.tail.pollOffsetsMs.some((offset) => offset >= 12_000)) {
+  throw new Error('TAIL_POLL_OFFSETS_MS must contain offsets within a 12-second slot');
 }

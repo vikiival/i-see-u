@@ -15,6 +15,8 @@ export interface BalanceWorkerOptions {
   activeTtlMs: number;
   refreshMs: number;
   requestRpc: RequestRpc;
+  /** When enabled, balances refresh at the persisted tail tip instead of the finalized cursor. */
+  tailTip?: () => Promise<BlockRef | undefined>;
   now?: () => number;
   onError?: (error: unknown) => void;
 }
@@ -59,12 +61,13 @@ export function createBalanceWorker(o: BalanceWorkerOptions): BalanceWorker {
       for (const [account, seenAt] of active) if (seenAt < cutoff) active.delete(account);
       const cursor = await store.getFollowerCursor(network);
       if (!cursor || active.size === 0) return { pairs: 0 };
+      const at = await o.tailTip?.() ?? cursor;
       const pairs = await store.erc20Pairs(network, [...active.keys()]);
-      if (pairs.length === 0) return { pairs: 0, block: cursor.number };
+      if (pairs.length === 0) return { pairs: 0, block: at.number };
       // One block for every pair, pinned by hash; a balance read at N is never reported for a later block.
-      const results = await adapter.erc20BalancePairs(pairs, cursor.hash);
-      await store.saveBalances(network, cursor, pairs.map((pair, i) => ({ ...pair, result: results[i] })));
-      return { pairs: pairs.length, block: cursor.number };
+      const results = await adapter.erc20BalancePairs(pairs, at.hash);
+      await store.saveBalances(network, at, pairs.map((pair, i) => ({ ...pair, result: results[i] })));
+      return { pairs: pairs.length, block: at.number };
     })().then((result) => {
       lastRefresh = { at: now(), ...result };
       return result;

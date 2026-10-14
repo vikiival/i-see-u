@@ -67,6 +67,10 @@ class FakeAdapter implements ChainAdapter {
     };
   }
 
+  async latestHeader() {
+    return { ...this.head, parentHash: `0x${this.head.number - 1n}` as Hex };
+  }
+
   async scanChunk(requestedAccount: Address, range: BlockRange): Promise<ChunkScan> {
     const one = async (direction: TransferDirection) => {
       this.calls.push({ account: requestedAccount, direction, range });
@@ -84,6 +88,13 @@ class FakeAdapter implements ChainAdapter {
   async blockByNumber(number: bigint): Promise<BlockRef> {
     return { number, hash: `0x${number}` as Hex, timestamp: number * 10n };
   }
+
+  async headerByNumber(number: bigint) {
+    return { ...(await this.blockByNumber(number)), parentHash: `0x${number - 1n}` as Hex };
+  }
+
+  async transfersInBlock(): Promise<TransferEvent[]> { return []; }
+  async transfersInRange(): Promise<TransferEvent[]> { return []; }
 
   async scanAllTransfers(): Promise<{ calls: number }> {
     return { calls: 0 };
@@ -182,7 +193,10 @@ test('legacy scan progress above the follower cursor is discarded and rebuilt, n
   const adapter = new FakeAdapter();
   const { store, service } = await setup(adapter);
   const token = '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' as Address;
-  const transfer = { standard: 'erc20', token, from: account, to: token, value: 1n, blockNumber: 105n, logIndex: 0, transactionHash: '0x01' } as const;
+  const transfer = {
+    standard: 'erc20', token, from: account, to: token, value: 1n, blockNumber: 105n,
+    blockHash: '0x105', logIndex: 0, transactionHash: '0x01',
+  } as const;
   // Pre-follower data scanned through 120, above the follower cursor (110).
   const legacy = emptyAggregate();
   addTransfer(legacy, account, transfer);
@@ -250,6 +264,7 @@ test('a chunk is not committed when either direction fails', async () => {
         to: '0xcccccccccccccccccccccccccccccccccccccccc' as Address,
         value: 1n,
         blockNumber: 100n,
+        blockHash: '0x100' as Hex,
         logIndex: 0,
         transactionHash: '0x01' as Hex,
       }],
@@ -275,6 +290,7 @@ test('a self-transfer returned by both directions is counted once per side', asy
     to: account,
     value: 1n,
     blockNumber: 100n,
+    blockHash: '0x100' as Hex,
     logIndex: 0,
     transactionHash: '0x01' as Hex,
   };
