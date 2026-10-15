@@ -7,6 +7,10 @@ import type {
   TailBlock,
   TailStatus,
 } from '../core/types.ts';
+import { thrownMessage } from '../core/parse.ts';
+
+/** Fetched headers do not link into one chain from the anchor: handled as a reorg. */
+class ChainMismatchError extends Error {}
 
 export interface TailOptions {
   adapter: ChainAdapter;
@@ -26,7 +30,8 @@ export interface TailOptions {
    */
   onEpoch?: () => void;
   finalityRetrySlots?: number;
-  onError?: (error: unknown) => void;
+  /** The message of each tick failure. */
+  onError?: (message: string) => void;
 }
 
 const SLOT_MS = 12_000;
@@ -48,7 +53,6 @@ export function nextPollDelay(at: number, offsets: number[], tip?: BlockHeader):
   return start + SLOT_MS + offsets[0] - at;
 }
 
-const messageOf = (error: unknown): string => (error instanceof Error ? error.message : String(error)).slice(0, 200);
 
 /** Persistent unfinalized journal. Reorgs only replace these rows; finalized aggregates are never rolled back. */
 export function createTail(o: TailOptions): Tail {
@@ -94,7 +98,7 @@ export function createTail(o: TailOptions): Tail {
       const header = number === head.number ? head : await adapter.headerByNumber(number);
 
       if (header.number !== number || header.parentHash !== parent.hash) {
-        throw Object.assign(new Error(`Header chain does not link at ${number}`), { chainMismatch: true });
+        throw new ChainMismatchError(`Header chain does not link at ${number}`);
       }
 
       headers.push(header);
@@ -228,7 +232,7 @@ export function createTail(o: TailOptions): Tail {
         try {
           await append(tip, head, cursor.number);
         } catch (error) {
-          if ((error as { chainMismatch?: unknown }).chainMismatch === true) await handleReorg(head, anchor);
+          if (error instanceof ChainMismatchError) await handleReorg(head, anchor);
           else throw error;
         }
       }
@@ -237,8 +241,9 @@ export function createTail(o: TailOptions): Tail {
       lastError = undefined;
     } catch (error) {
       consecutiveErrors += 1;
-      lastError = messageOf(error);
-      o.onError?.(error);
+      const message = thrownMessage(error);
+      lastError = message.slice(0, 200);
+      o.onError?.(message);
     }
   };
 

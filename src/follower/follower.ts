@@ -1,4 +1,5 @@
 import { addTransfer, emptyAggregate } from '../core/aggregate.ts';
+import { thrownMessage } from '../core/parse.ts';
 import type {
   Address,
   BlockRange,
@@ -28,7 +29,8 @@ export interface FollowerOptions {
   now?: () => number;
   /** Called once per tick that advanced the cursor (e.g. to refresh balances at the new block). */
   onAdvance?: (cursor: FollowerCursor) => void;
-  onError?: (error: unknown) => void;
+  /** The message of each tick failure. */
+  onError?: (message: string) => void;
 }
 
 /** More than one epoch behind means the follower is not keeping up, even if still within maxLagBlocks. */
@@ -36,7 +38,6 @@ const STALE_LAG_BLOCKS = 32n;
 const MAX_REFOLDS = 8;
 const HEAD_REFRESH_FAILED = 'Finalized head refresh failed; serving cached head';
 
-const messageOf = (error: unknown): string => (error instanceof Error ? error.message : String(error)).slice(0, 200);
 
 /**
  * One finalized follower per network. Each tick reads the finalized head and, when it is ahead of the global cursor,
@@ -154,8 +155,9 @@ export function createFollower(o: FollowerOptions): Follower {
 
       lastError = head.refreshFailed ? HEAD_REFRESH_FAILED : undefined;
     } catch (error) {
-      lastError = messageOf(error);
-      o.onError?.(error);
+      const message = thrownMessage(error);
+      lastError = message.slice(0, 200);
+      o.onError?.(message);
     }
   };
 

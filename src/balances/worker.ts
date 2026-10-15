@@ -1,5 +1,6 @@
 import { unavailable, withDeadline } from '../core/limiter.ts';
 import type { Limiter } from '../core/limiter.ts';
+import { thrownMessage } from '../core/parse.ts';
 import type { Address, BalanceSnapshot, BlockRef, ChainAdapter, Hex, Store } from '../core/types.ts';
 
 /** Bounded concurrency and a per-request deadline for RPC work left on the request path. */
@@ -22,7 +23,8 @@ export interface BalanceWorkerOptions {
   /** When enabled, balances refresh at the persisted tail tip instead of the finalized cursor. */
   tailTip?: () => Promise<BlockRef | undefined>;
   now?: () => number;
-  onError?: (error: unknown) => void;
+  /** The message of each failed background refresh. */
+  onError?: (message: string) => void;
 }
 
 export interface BalanceWorker {
@@ -79,9 +81,12 @@ export function createBalanceWorker(o: BalanceWorkerOptions): BalanceWorker {
   const readNow = async (account: Address, tokens: Address[], at: BlockRef): Promise<void> => {
     const results = await adapter.erc20BalancePairs(tokens.map((token) => ({ account, token })), at.hash);
 
-    const rows = tokens
-      .map((token, i) => ({ account, token, result: results[i] }))
-      .filter((row) => row.result.status !== 'error' || !row.result.transient);
+    // A transient failure keeps the stored snapshot.
+    const rows = tokens.flatMap((token, i) => {
+      const result = results[i];
+
+      return result.status !== 'error' || !result.transient ? [{ account, token, result }] : [];
+    });
 
     if (rows.length > 0) await store.saveBalances(network, at, rows);
   };
@@ -159,7 +164,7 @@ export function createBalanceWorker(o: BalanceWorkerOptions): BalanceWorker {
       try {
         await refresh();
       } catch (error) {
-        o.onError?.(error);
+        o.onError?.(thrownMessage(error));
       }
     } while (kicked && !stopped);
 
