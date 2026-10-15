@@ -10,6 +10,7 @@
     "db:migrate": "node src/store/migrate.ts",
     "compare:sources": "node scripts/compare-sources.ts",
     "typecheck": "tsc --noEmit",
+    "lint": "oxlint src test scripts",
     "test": "vitest run",
     "test:watch": "vitest"
   },
