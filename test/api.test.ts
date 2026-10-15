@@ -4,6 +4,7 @@ import { createApp } from '../src/api/routes.ts';
 import type { BalanceWorker } from '../src/balances/worker.ts';
 import { createLimiter } from '../src/core/limiter.ts';
 import { RpcError } from '../src/rpc/errors.ts';
+import { lowerAddress } from './helpers.ts';
 import type {
   Address,
   BalanceSnapshot,
@@ -15,8 +16,8 @@ import type {
   RpcStats,
 } from '../src/core/types.ts';
 
-const address = (n: number): Address => `0x${n.toString(16).padStart(40, '0')}` as Address;
-const hash = (n: number): Hex => `0x${n.toString(16).padStart(64, '0')}` as Hex;
+const address = (n: number): Address => `0x${n.toString(16).padStart(40, '0')}`;
+const hash = (n: number): Hex => `0x${n.toString(16).padStart(64, '0')}`;
 
 const account = address(1);
 const erc20 = address(2);
@@ -54,7 +55,7 @@ const stats = (): RpcStats => ({
   endpoints: [{ url: 'https://rpc.invalid', state: 'closed', failures: 0 }],
 });
 
-const adapterWith = (overrides: Partial<ChainAdapter> = {}): ChainAdapter => ({
+const baseAdapter = (): ChainAdapter => ({
   network: 'ethereum',
   startBlock: 25_933_634n,
   accountLogs: {
@@ -67,7 +68,7 @@ const adapterWith = (overrides: Partial<ChainAdapter> = {}): ChainAdapter => ({
   scanConcurrency: 4,
   followerMaxRange: 500n,
   normalizeAddress(input) {
-    return /^0x[0-9a-f]{40}$/i.test(input) ? input.toLowerCase() as Address : undefined;
+    return /^0x[0-9a-f]{40}$/i.test(input) ? lowerAddress(input) : undefined;
   },
   async finalizedHead() {
     const now = Date.now();
@@ -90,8 +91,9 @@ const adapterWith = (overrides: Partial<ChainAdapter> = {}): ChainAdapter => ({
   async erc721Owners(items) {
     return items.map(() => ({ status: 'ok', owner: account }));
   },
-  ...overrides,
-}) as ChainAdapter;
+});
+
+const adapterWith = (overrides: Partial<ChainAdapter> = {}): ChainAdapter => ({ ...baseAdapter(), ...overrides });
 
 const balancesWith = (forAccount: BalanceWorker['forAccount']): BalanceWorker => ({
   forAccount,

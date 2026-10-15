@@ -4,7 +4,7 @@ import { createApp } from '../src/api/routes.ts';
 import { createBalanceWorker } from '../src/balances/worker.ts';
 import { addTransfer, emptyAggregate } from '../src/core/aggregate.ts';
 import { createLimiter } from '../src/core/limiter.ts';
-import type { Address, BlockRef, Hex, Store } from '../src/core/types.ts';
+import type { Address, BlockRef, Store } from '../src/core/types.ts';
 import { createDiscoveryService } from '../src/discovery/service.ts';
 import { createFollower } from '../src/follower/follower.ts';
 import { advisoryKey, singleConnectionLeaderLock } from '../src/store/advisory-lock.ts';
@@ -216,8 +216,8 @@ test('claim 2: a delayed old-fork request-path read does not overwrite the canon
   const { store } = await createTestStore();
   const account = address(90);
   const token = address(37);
-  const orphan: BlockRef = { number: 160n, hash: `0x${'d'.repeat(64)}` as Hex, timestamp: 1920n };
-  const canonical: BlockRef = { number: 160n, hash: `0x${'e'.repeat(64)}` as Hex, timestamp: 1920n };
+  const orphan: BlockRef = { number: 160n, hash: `0x${'d'.repeat(64)}`, timestamp: 1920n };
+  const canonical: BlockRef = { number: 160n, hash: `0x${'e'.repeat(64)}`, timestamp: 1920n };
   chain.balanceOf = (_account, _token, at) => (at === orphan.hash ? 111n : 222n);
 
   try {

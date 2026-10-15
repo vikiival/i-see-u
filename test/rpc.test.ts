@@ -1,8 +1,9 @@
-import { afterEach, expect, test, vi } from 'vitest';
+import { afterEach, assert, expect, test, vi } from 'vitest';
 import { mainnet } from 'viem/chains';
 import type { RpcClient, RpcStats } from '../src/core/types.ts';
 import { createHeadTracker } from '../src/chains/evm/head.ts';
 import { createRpcClient } from '../src/rpc/client.ts';
+import { staged } from './helpers.ts';
 import { RpcError, classify } from '../src/rpc/errors.ts';
 
 afterEach(() => {
@@ -106,12 +107,12 @@ test('finalized head is single-flight, cached, records the latest number, and se
       const tag = params[0];
       const number = tag === 'latest' ? '0xa' : '0x8';
 
-      return {
+      return staged<T>({
         number,
         hash: `0x${number.slice(2).padStart(64, 'a')}`,
         parentHash: `0x${number.slice(2).padStart(64, 'b')}`,
         timestamp: '0x64',
-      } as T;
+      });
     },
     stats: rpcStats,
   };
@@ -150,7 +151,7 @@ test('finalized head never moves backwards and marks a lagging observation stale
     async request<T>(_method: string, params: unknown[]): Promise<T> {
       tags.push(params[0]);
 
-      return block(number) as T;
+      return staged<T>(block(number));
     },
     stats: rpcStats,
   };
@@ -209,12 +210,12 @@ test('an unchanged finalized block becomes stale and progress resets on advance'
 
   const rpc: RpcClient = {
     async request<T>(): Promise<T> {
-      return {
+      return staged<T>({
         number: `0x${number.toString(16)}`,
         hash: `0x${number.toString(16).padStart(64, 'a')}`,
         parentHash: `0x${(number - 1n).toString(16).padStart(64, 'b')}`,
         timestamp: '0x64',
-      } as T;
+      });
     },
     stats: rpcStats,
   };
@@ -233,8 +234,23 @@ test('an unchanged finalized block becomes stale and progress resets on advance'
   expect(advanced.lastProgressAt).toBe(1_102);
 });
 
-const json = (body: unknown, status = 200, headers: Record<string, string> = {}): Response =>
+interface RpcEnvelope {
+  jsonrpc: '2.0';
+  id: number;
+  result?: string | string[];
+  error?: { code: number; message: string };
+}
+
+const json = (body: RpcEnvelope, status = 200, headers: Record<string, string> = {}): Response =>
   new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json', ...headers } });
+
+/** The next link of an error's cause chain, if any. */
+const causeOf = (value: NonNullable<unknown>): NonNullable<unknown> | undefined => {
+  if (!(value instanceof Object) || !('cause' in value)) return undefined;
+  const { cause } = value;
+
+  return cause === null || cause === undefined ? undefined : cause;
+};
 
 const stubFetch = (respond: (url: string, call: number) => Response) => {
   const urls: string[] = [];
@@ -254,10 +270,10 @@ test('-32005 with "more than 10000 results" is too_large with the suggested rang
   }));
 
   const client = createRpcClient({ urls: ['https://a.example/key', 'https://b.example/key'], timeoutMs: 1_000, maxAttempts: 4, maxRps: 1_000 });
-  const error = await client.request('eth_getLogs', []).catch((e: unknown) => e);
-  expect(error).toBeInstanceOf(RpcError);
+  const error = await client.request('eth_getLogs', []).catch((e: Error) => e);
+  assert.instanceOf(error, RpcError);
   expect(error).toMatchObject({ kind: 'too_large', code: -32005, suggestedRange: { fromBlock: 1n, toBlock: 2n } });
-  expect((error as RpcError).cause).toMatchObject({ code: -32005 });
+  expect(error.cause).toMatchObject({ code: -32005 });
   expect(urls.length).toBe(1);
   expect(client.stats().attempts).toBe(1);
 });
@@ -309,22 +325,22 @@ test('endpoint path and key never leak into thrown errors or stats', async () =>
     () => new Response('not json', { status: 200 }),
   ];
 
-  const errors: unknown[] = [];
+  const errors: RpcError[] = [];
 
   for (const respond of responses) {
     vi.stubGlobal('fetch', vi.fn(async () => respond()));
     const client = createRpcClient({ urls: [`https://node.example/${secret}?token=${secret}`], timeoutMs: 1_000, maxAttempts: 1, maxRps: 1_000 });
-    const error = await client.request('eth_call', []).catch((e: unknown) => e);
-    expect(error).toBeInstanceOf(RpcError);
+    const error = await client.request('eth_call', []).catch((e: Error) => e);
+    assert.instanceOf(error, RpcError);
     errors.push(error);
     expect(JSON.stringify(client.stats())).not.toContain(secret);
   }
 
-  expect(errors.map(error => (error as RpcError).kind)).toEqual(['transient', 'fatal', 'transient', 'fatal']);
+  expect(errors.map(error => error.kind)).toEqual(['transient', 'fatal', 'transient', 'fatal']);
 
   // Walk the whole cause chain (what a logger would print), not just the top-level message.
   for (const error of errors) {
-    for (let current: unknown = error; current; current = (current as { cause?: unknown }).cause) {
+    for (let current: NonNullable<unknown> | undefined = error; current; current = causeOf(current)) {
       const text = current instanceof Error ? `${current.message} ${current.stack}` : JSON.stringify(current);
       expect(text).not.toContain(secret);
     }

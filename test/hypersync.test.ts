@@ -29,13 +29,14 @@ import type {
   HypersyncStream,
 } from '../src/sources/hypersync.ts';
 import { createRpcLogSource } from '../src/sources/rpc-logs.ts';
+import { lowerAddress, rpcParam, staged } from './helpers.ts';
 import { createTestStore } from './store-fixture.ts';
 import type { Log, Query, QueryResponse, StreamConfig } from '@envio-dev/hypersync-client';
 
-const ACCOUNT = '0x1111111111111111111111111111111111111111' as Address;
-const PEER = '0x2222222222222222222222222222222222222222' as Address;
-const ERC20 = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' as Address;
-const ERC721 = '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' as Address;
+const ACCOUNT: Address = '0x1111111111111111111111111111111111111111';
+const PEER: Address = '0x2222222222222222222222222222222222222222';
+const ERC20: Address = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+const ERC721: Address = '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
 const topic = (address: Address): Hex => pad(address, { size: 32 });
 const hash = (n: number): Hex => `0x${n.toString(16).padStart(64, '0')}`;
 const quantity = (n: number): Hex => `0x${n.toString(16)}`;
@@ -153,11 +154,12 @@ test('HyperSync multi-page streaming exactly matches RPC aggregation, including 
 
   const rpc: RpcClient = {
     async request<T>(_method: string, params: unknown[]): Promise<T> {
-      const filter = params[0] as { topics: Array<Hex | null> };
+      const filter = rpcParam<{ topics: Array<Hex | null> }>(params, 0);
       const sent = filter.topics[1] !== null;
 
-      return logs.filter((item) => sent ? item.topics[1] === topic(ACCOUNT) : item.topics[2] === topic(ACCOUNT))
-        .map((item) => ({ ...item, blockNumber: quantity(item.blockNumber!), logIndex: quantity(item.logIndex!) })) as T;
+      return staged<T>(logs.flatMap((item) => (sent ? item.topics[1] === topic(ACCOUNT) : item.topics[2] === topic(ACCOUNT))
+        ? [{ ...item, blockNumber: quantity(item.blockNumber!), logIndex: quantity(item.logIndex!) }]
+        : []));
     },
     stats: rpcStats,
   };
@@ -210,7 +212,7 @@ test.each([
   ['429', () => ({ async stream() { throw new Error('HTTP 429'); } })],
   ['503', () => ({ async stream() { throw new Error('HTTP 503'); } })],
   ['malformed', () => ({
-    async stream() { return new Pages([{ ...response([], 21), data: { logs: null } } as unknown as QueryResponse]); },
+    async stream() { return new Pages([staged<QueryResponse>({ ...response([], 21), data: { logs: null } })]); },
   })],
 ] as const)('%s primary failure falls back and redacts source stats', async (_label, makeClient) => {
   const expected = { aggregate: emptyAggregate(), calls: 2, logs: 0, heavy: false };
@@ -303,7 +305,7 @@ test('a mid-stream failure commits nothing; the next discovery resumes the same 
 
   const adapter: ChainAdapter = {
     network: 'ethereum', startBlock: 10n, accountLogs: source, scanConcurrency: 1, followerMaxRange: 100n,
-    normalizeAddress: (value) => /^0x[0-9a-f]{40}$/i.test(value) ? value.toLowerCase() as Address : undefined,
+    normalizeAddress: (value) => /^0x[0-9a-f]{40}$/i.test(value) ? lowerAddress(value) : undefined,
     async finalizedHead() { return { block: { number: 20n, hash: hash(20), timestamp: 200n }, lastProgressAt: 1, stale: false }; },
     async latestHeader() { return { number: 20n, hash: hash(20), parentHash: hash(19), timestamp: 200n }; },
     async blockByNumber(number) { return { number, hash: hash(Number(number)), timestamp: number * 10n }; },
