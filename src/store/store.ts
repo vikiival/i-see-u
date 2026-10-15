@@ -238,7 +238,7 @@ export function createStore(db: StoreDatabase, close: () => Promise<void> = asyn
         if (cursor?.number !== range.fromBlock - 1n || to.number !== range.toBlock) {
           throw new Error(`Follower range ${range.fromBlock}-${range.toBlock} does not continue cursor ${cursor?.number}`);
         }
-        // Accounts tracked while the range was being decoded are not in `known`: refetch rather than miss their logs.
+        // Accounts tracked while the range was being decoded are not in `known`: the follower re-folds its retained logs for them and retries.
         const tracked = await tx.select({ account: schema.trackedAccounts.account })
           .from(schema.trackedAccounts).where(eq(schema.trackedAccounts.network, network));
         const missing = tracked.map((row) => row.account as Address).filter((account) => !known.has(account));
