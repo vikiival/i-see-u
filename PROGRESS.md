@@ -386,6 +386,16 @@ After the benchmark, Viktor started a Codex worker from his main session to buil
 | 3 simultaneous first requests (new address) | 202 ×3, no 500. Backfill done in about 3 min, then 200 with 0 calls |
 | 5 min watch | Tail lag 0 in 11/11 samples, healthy, 0 reorgs. The follower advanced one epoch on schedule. About 1.5 header calls + 1 `getLogs` per block (was 1.26; small sample, to re-measure) |
 
+**Second review round (Codex, verified by Opus).** Codex found three more correctness bugs after the merge. Opus confirmed each one with a failing test (`test/regressions-audit.test.ts`) and then fixed it:
+
+| Bug | Origin | Fix |
+|---|---|---|
+| A is tracked; B registers while the follower processes a range that contains an A→B transfer. That log is not "skipped" (A is known), so plan 002's refold never revisited it. The cursor advances and B **permanently misses** the transfer | **Introduced by plan 002** (missed in review); the old refetch handled it | The follower keeps every log it already folded and replays it for newly tracked endpoints (no double count: they were unknown at first fold). Tests: B sends and receives, a B self-transfer, two accounts tracked in different refold rounds; still one `getLogs` |
+| A late request-path balance read from an orphaned fork overwrites the corrected balance **at the same height** (writes compared only block number) | Pre-existing | A same-height write must carry the same block hash. Only the reorg-kicked refresh at the canonical tip overwrites unconditionally |
+| A failed finalized-head poll returned the cached head with `stale: true`, but the follower ignored it and cleared `lastError`, so it reported **healthy for up to ~20 min** | Pre-existing | `refreshFailed` is set on the observation; the follower ORs `head.stale` into `stale` and sets `lastError` ("Finalized head refresh failed; serving cached head") |
+
+Tests: 115 → **120**, all passing. Lesson: a refold optimisation must replay *every* retained event for new accounts, not only the ones it skipped. A test with a transfer **between** a known and a newly tracked account would have caught it in the first review.
+
 **Deliberately not planned** (real, but needs a product decision or is larger; listed in `plans/README.md`):
 - **Backfill credit budget or denylist:** a flood of random addresses could burn the month's credits in about 2 days, and the zero address is the worst case.
 - **Account lifecycle:** untracking idle accounts.
@@ -424,15 +434,15 @@ After the benchmark, Viktor started a Codex worker from his main session to buil
 | Technology choice with reasons | ✅ | REPORT §6 |
 | REST endpoint: ERC-20 tokens the address interacted with | ✅ | `GET /v1/ethereum/accounts/{addr}/erc20` |
 | Balance parameter | ✅ | `?balances=true`. Each token has its own `balanceBlock` |
-| Block height the data is valid for | ✅ | `blockHeight` + `blockHash` (follower cursor), `balancesAtBlockHeight` |
+| Block height the data is valid for | ✅ | `blockHeight` + `blockHash` (the tail tip with `finality=latest`, the follower cursor with `finalized`), `finalizedBlockHeight`, `balancesAtBlockHeight` |
 | Modular (adapter-style) | ✅ / ⚠️ | `ChainAdapter`, `Store` and `RpcClient` are interfaces, and a new EVM chain is a config entry. A per-account `AccountLogSource` (RPC, HyperSync, with fallback) is in progress (§12) |
 | Scales to 5k users polling every minute | ✅ / ⚠️ | 0 RPC calls per warm request. A fake-RPC acceptance test covers 5k accounts. No live HTTP load test. Multi-replica hardened in §14 (race-safe tracking, truthful leadership, shared tail freshness, fenced tail writes); still no cross-replica backfill dedupe |
 | Unreliable RPC: slow, errors, rate limits, lagging | ✅ | RpcClient classification, backoff, breaker, failover, validate. Follower lag, `stale` and 503 |
 | README and documented limits | ✅ | README "Limits", REPORT §7 |
 | Not a full indexer | ✅ | Only `Transfer` logs, only for tracked accounts, aggregated per (account, token) |
-| RPC-efficient (paid per request) | ✅ | About 51M credits/month steady state for 5k users (Build plan has 80M). Cold backfill is 172 calls per account |
+| RPC-efficient (paid per request) | ✅ | About 53–54M credits/month steady state for 5k users at 10 tokens each (Build plan has 80M); the balance sweep scales linearly with tokens per account. Cold backfill is 172 calls per account |
 | BONUS: ERC-721 discovery and endpoint | ✅ | `/erc721`: collections plus token IDs, `?verifyOwnership=true` via `ownerOf` |
-| Own repository, shared | ⚠️ | Pushed (private) to github.com/vikiival/i-see-u up to `9dcafb8`; the tail and `feat/improve` are not pushed yet; collaborators not added |
+| Own repository, shared | ⚠️ | Pushed (private) to github.com/vikiival/i-see-u, including `feat/improve`; collaborators not added yet |
 | Presentation (30 min + Q&A, Thursday) | ❌ | To do. This log and REPORT are the basis |
 
 ## Next
