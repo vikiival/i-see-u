@@ -1,174 +1,128 @@
-# i-see-u: token discovery over plain JSON-RPC (PoC)
+# i-see-u: token discovery over JSON-RPC
 
-For an Ethereum account, returns every ERC-20 contract it sent or received (and, as a bonus, ERC-721 collections and token IDs) from block 25,933,634 to a near-realtime, reorg-aware latest head, optionally with balances labelled with the exact block hash they were read at. A finalized aggregate remains the immutable base; a short journal of unfinalized Transfers is overlaid at read time. It works with only JSON-RPC; an experimental, opt-in Envio HyperSync source (`LOG_SOURCE=auto|hypersync`) can accelerate cold per-account backfills and falls back to RPC per chunk. No Blockbook or full indexer is required.
+A TypeScript PoC for ERC-20 discovery and ERC-721 current ownership, starting at Ethereum block **25,933,634** and running to the **current chain tip**. The service is **near-realtime**: by default responses are valid at the latest block (~12 s slots, typically served within a few seconds of the block) with **finalized durability** underneath. Every finalized `Transfer` is indexed once for every account; a bounded, reorg-aware tail journal holds every `Transfer` above the finalized cursor. Discovery and transfer history read PostgreSQL; optional balances and ownership verification use hash-pinned Multicall3.
 
-Design notes and measurements: [REPORT.md](REPORT.md).
+The architecture targets approximately one million accounts. There are no tracked accounts, account backfills, or account-level syncing responses. See [REPORT.md](REPORT.md) for schema choices, limits and agent handoffs.
 
-## Run
+## Run and validate
+
+Node 26, PostgreSQL 18, Hono, viem over our `RpcClient`, Drizzle and node-postgres. Native TypeScript stripping, `.ts` imports, no build step.
 
 ```sh
 npm install
-cp .env.example .env                # replace RPC_URL with your endpoint
-docker compose up -d postgres       # PostgreSQL 18 on 127.0.0.1:5432
-npm start                            # migrates the database, starts the follower and balance worker, serves :3000
-npm test                             # PGlite tests; no Docker or network needed
-npm run test:watch                   # watch mode
+cp .env.example .env                 # configure RPC_URL and DATABASE_URL
+docker compose up -d postgres
+npm start                             # migrate, start finalized follower and tail, serve :3000
+npx tsc --noEmit -p .
+npm test                              # real migrations on PGlite; no network or Docker
+npm run lint
 ```
 
-The project-root `.env` file is loaded with Node's `process.loadEnvFile()`; existing environment variables take precedence. The development `DATABASE_URL` default matches `docker-compose.yml`, so copying `.env.example` is enough. The database is a derived cache, but migrations preserve it across schema-compatible releases.
+**Global bootstrap is pending.** A fresh database intentionally returns **503 `not_ready`**, including `/health`. Startup never creates a cursor at the head and pretends earlier history exists. The future bootstrap initializes the index and fills contiguous ranges through the same store API as the follower. The follower can resume an initialized index, with bounded catch-up work each tick.
 
-After changing `src/store/schema.ts`, run `npm run db:generate` and commit the generated SQL and metadata in `drizzle/`. `npm run db:migrate` applies pending migrations without starting the API; `npm start` does the same automatically.
+The migration directory is a **fresh baseline for an empty PoC database**, not an upgrade of the old aggregate-only database. Use a new database/schema when moving from that version; preserve an old database separately if needed. After schema changes run `npm run db:generate`. Generated SQL is not hand-edited. `0001_balance_revision` adds the snapshot repair revision; `0002_tail_journal` adds `tail_blocks`/`tail_transfers`. `npm run db:migrate` applies migrations without starting the server.
 
-Optional env (numeric values must be positive integers; invalid values fail at startup):
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `DATABASE_URL` | `postgresql://iseeu:iseeu@localhost:5432/iseeu` | PostgreSQL connection |
-| `RPC_FALLBACK_URLS` | | Comma-separated endpoints tried after `RPC_URL` |
-| `LOG_SOURCE` | `rpc` | `rpc`, `auto`, or `hypersync`. HyperSync is experimental and off by default; `auto` enables it only when its key is set |
-| `HYPERSYNC_API_KEY` | | Optional token. When absent, auto mode never imports the native addon and uses RPC only |
-| `HYPERSYNC_URL` | network default (`https://eth.hypersync.xyz`) | HyperSync endpoint override |
-| `HYPERSYNC_MAX_RANGE` / `HYPERSYNC_TIMEOUT_MS` | 100000 / 30000 | Blocks per committed HyperSync chunk and whole-stream timeout |
-| `PORT` | 3000 | HTTP port |
-| `RPC_TIMEOUT_MS` / `RPC_MAX_ATTEMPTS` / `RPC_MAX_RPS` | 15000 / 6 / 20 | Per attempt timeout, attempts per call, client-side rate limit |
-| `ETH_FOLLOWER_MAX_RANGE` | 500 | Blocks per unfiltered follower `getLogs` (about 450 KB of JSON per block; must be at most 1000) |
-| `FOLLOWER_POLL_MS` | 390000 (30000 with `TAIL_ENABLED=false`) | Finalized-head poll interval. With the tail, the follower is woken whenever the tail tip enters a new epoch, so this is only a fallback (finalized advances about every 6.4 min) |
-| `FOLLOWER_MAX_LAG_BLOCKS` | 96 | Discovery returns 503 when the follower is further behind finalized (about 3 epochs) |
-| `TAIL_ENABLED` | true | Persist and serve the reorg-aware near-realtime Transfer tail |
-| `TAIL_MAX_DEPTH` | 64 | Maximum rollback search above the finalized cursor before wiping and rebuilding the tail |
-| `TAIL_POLL_OFFSETS_MS` | `2500,5000,9000` | Poll offsets within each 12 s Ethereum slot |
-| `TAIL_MAX_AHEAD_BLOCKS` | 1024 | Stop appending this many blocks above the finalized cursor (~3.4 h; normally 64-95). If finality stalls the tail stops growing and reads fall back to finalized with `tailError` |
-| `TAIL_MAX_TIP_AGE_MS` | 60000 | Serve `latest` only while the shared tail tip's block timestamp is at most this old (5 slots); otherwise finalized with `tailError`. Checked in every process, so a stalled leader degrades non-leaders too |
-| `FINALIZED_MAX_NO_PROGRESS_MS` | 1200000 | Responses are `stale` after the follower has not advanced for this long |
-| `MAX_HEAD_AGE_MS` | 1800000 | Discovery returns 503 after the follower has not advanced for this long |
-| `ACTIVE_ACCOUNT_TTL_MS` | 300000 | Accounts that requested balances within this window are refreshed by the balance worker |
-| `BALANCE_REFRESH_MS` | 60000 | Balance worker interval (it also runs whenever the follower advances) |
-| `BALANCE_FULL_SWEEP_MS` | 3600000 | How often a refresh also re-reads pairs with no Transfer since their snapshot (ok zero balances are still skipped) |
-| `BALANCE_ALWAYS_REFRESH_TOKENS` | WETH, stETH | Comma-separated lowercase token addresses re-read every refresh because their balances change without `Transfer` (may be empty) |
-| `ETH_MULTICALL_BATCH` | 1000 | `balanceOf` calls per Multicall3 `aggregate3` |
-| `ETH_LOGS_MAX_RANGE` / `ETH_LOGS_MIN_RANGE` | 3000 / 500 | Adaptive range of address-filtered backfill `getLogs` |
-| `ETH_SCAN_CONCURRENCY` | 8 | Backfill chunks in flight per account |
-| `REQUEST_DEADLINE_MS` | 10000 | How long a request waits for RPC work (cold backfill, first balance read, ownership check) |
-| `BACKFILL_CONCURRENCY` / `BACKFILL_QUEUE` | 4 / 64 | Concurrent account backfills, and how many more may wait before requests get 503 |
-| `REQUEST_RPC_CONCURRENCY` / `REQUEST_RPC_QUEUE` | 16 / 256 | Same for first balance reads and `verifyOwnership` |
-| `DB_POOL_MAX` | 20 | PostgreSQL pool size (one connection is held permanently by the follower leader lock) |
-| `DB_CONNECT_TIMEOUT_MS` | 5000 | Pool acquisition deadline; when exhausted, requests fail with 503 "Database busy" instead of queueing forever |
-| `MAX_VERIFY_OWNERSHIP_ITEMS` | 2000 | `verifyOwnership` is skipped (`ownershipError`, items `ownerStatus: skipped`) above this many held items; results are shared per account and block |
-
-## Data sources
-
-The finalized follower, head reads, Multicall balances and ownership checks always use JSON-RPC. Only the per-account historical backfill is pluggable. The default `LOG_SOURCE=rpc` is the zero-extra-service path. HyperSync is experimental and opt-in: `auto` chooses streaming HyperSync when `HYPERSYNC_API_KEY` is present, and `hypersync` requires a key. HyperSync ORs sent/received filters in one query and RPC reruns a complete chunk after any primary failure, so the store never sees partial vendor data.
-
-HyperSync serves through the unfinalized chain head, but this service queries only through the already pinned finalized backfill target and sends `toBlock = target + 1` because its end is exclusive. The free tier exposed no limit headers in the 2026-10-14 measurements, but 429s, auth failures and vendor outages remain possible and trigger fallback/cooldown. The client is a N-API native addon; it is loaded lazily only when selected, and its streams are closed on completion, timeout and shutdown.
+Runtime config loads `.env` with Node; already exported environment variables take precedence. The old `.env.example` may contain obsolete backfill/worker knobs; these no longer configure runtime behavior.
 
 ## API
 
-| Endpoint | Returns |
+| Endpoint | Behavior |
 |---|---|
-| `GET /v1/ethereum/accounts/{address}/erc20?balances=true&finality=latest` | `{ status: "ready", blockHeight, blockHash, finality, finalizedBlockHeight?, finalizedBlockHash?, tailError?, …, tokens: [{ contract, …, sentCount, receivedCount, unfinalizedSentCount?, unfinalizedReceivedCount?, balance?, balanceBlock?, balanceBlockHash?, balanceCurrent? }], balancesAtBlockHeight?, balancesCurrent? }` |
-| `GET /v1/ethereum/accounts/{address}/erc721?verifyOwnership=true&finality=latest` | `{ status: "ready", blockHeight, blockHash, …, collections: [{ contract, tokens: [{ tokenId, heldBySeenLogs, unfinalized?, owner?, ownedByAccount? }] }] }` |
-| either, while the account's backfill runs | **HTTP 202** `{ status: "syncing", progressBlocks, targetBlocks, followerLagBlocks }` with `Retry-After: 2` |
-| `GET /health` | uptime; follower, tail (tip/lag/reorg depth/health), and balance status; source and RPC stats |
+| `GET /v1/ethereum/accounts/{address}/erc20` | All ERC-20 contracts with a Transfer in or out from the start block to the served block |
+| `…/erc20?balances=true` | Same discovery plus balances pinned to the served block hash (tail tip, or finalized cursor) |
+| `…?finality=latest` (default) / `…?finality=finalized` | Any account endpoint: tip view with unfinalized overlay, or the finalized index only |
+| `GET /v1/ethereum/accounts/{address}/erc721` | Interacted collections and currently owned token IDs according to indexed logs |
+| `…/erc721?verifyOwnership=true` | Optional pinned `ownerOf` checks for held items, subject to the configured cap |
+| `GET /v1/ethereum/accounts/{address}/transfers?limit=50` | Raw ERC-20/ERC-721 transfers newest first; `limit` is 1–200 |
+| `…/transfers?limit=50&before={next}` | Next keyset page; use the previous response's `next` unchanged |
+| `GET /health` | Shared database readiness per network, local follower and tail diagnostics (tip, lag, reorgs, errors) and redacted RPC stats; 503 until ready |
 
-Chain quantities are decimal strings; `dataAgeS` is an integer. `finality` defaults to `latest` while the tail is enabled and healthy. Then `blockHeight`/`blockHash` identify the tail tip and `finalizedBlockHeight`/`finalizedBlockHash` identify its durable base. `finality=finalized` returns the original finalized discovery shape (only `balanceBlockHash` is added per balance while the tail is enabled; with `TAIL_ENABLED=false` every response is exactly the pre-tail shape). An unhealthy tail safely falls back to finalized and adds `tailError`. Cursor, holdings, matching tail Transfers, and tail tip are read in one repeatable-read transaction, so a concurrent finalization prune cannot double-count or omit a Transfer.
+Discovery responses identify `blockHeight`, `blockHash`, `blockTimestamp`, `finality` and the network start block. **`finality=latest` (default)** serves the tail tip: `blockHeight`/`blockHash` are the tip, `finalizedBlockHeight`/`finalizedBlockHash` the finalized cursor below it. Counts include unfinalized Transfers and name that part as `unfinalizedSentCount`/`unfinalizedReceivedCount`; NFTs received in tail blocks carry `unfinalized: true`, NFTs sent in tail blocks disappear. If the tail is disabled, unhealthy, empty, or its tip is older than `TAIL_MAX_TIP_AGE_MS`, the response is the finalized view with `finality: "finalized"` and a `tailError` explaining why; it is never a 503 as long as the finalized index is ready. **`finality=finalized`** always serves the cursor without overlay and without `tailError`. `lastProgressAt` is the tip's block time (latest) or the cursor commit time (finalized); `lagBlocks` is the latest-head distance. Blocks, uint256 values, token IDs and **sent/received counts are decimal strings**. Historical NFT movements live in `/transfers`; the NFT endpoint no longer stores one historical held flag per account/item. Burned NFTs have no current holder.
 
-Each balance carries `balanceBlock`, and with the tail enabled also `balanceBlockHash` (EIP-1898; a tail block can be reorged out). With the tail enabled, reads target the tail tip hash (also for `finality=finalized`, so `balanceBlock` can be above `blockHeight`); otherwise they target the finalized cursor. A snapshot is never relabelled at a later block, and `balancesAtBlockHeight` is true only when both number and hash match the served block. Balances refresh every `BALANCE_REFRESH_MS`, not every block, so with the tail they usually trail `blockHeight` by a few blocks and `balancesAtBlockHeight` is usually false.
+History merges two bounded indexed scans per table (finalized `transfers`, and with latest `tail_transfers` above the cursor), excludes the duplicate side of self-transfers, and never uses OFFSET. Tail rows carry `unfinalized: true`. `next: null` means the end. A cursor carries the original `throughBlock` bound and repair revision; appends do not introduce new rows into later pages. Responses expose `throughBlock` separately from the served block. A repair/rebuild invalidates old cursors with **409**; so does a latest cursor whose `throughBlock` is above both the finalized cursor and the current tail tip (or that is continued with `finality=finalized`). A reorg between pages can change unfinalized rows of a later page; restart from the first page after a `tailError` or reorg if exactness matters.
 
-`balanceCurrent` means no Transfer of this token touched the account between `balanceBlock` and `blockHeight` (true as well when the balance was read at the served block; false for a failed read, and for a read above `blockHeight`, where the finalized view cannot rule out a later tail Transfer); tokens that change without Transfer (`BALANCE_ALWAYS_REFRESH_TOKENS`) are only current when read at `blockHeight`. `balancesCurrent` (only with `balances=true`) is true when every token's `balanceCurrent` is.
+Readiness is shared by every replica: a recent finalized-head observation must exist, the contiguous cursor must have reached it, and no repair may be pending. Incomplete, stale or suspect indexes return **503 `{ status: "not_ready", error }`** with `Retry-After`; there is no 202. The tail never makes the service not ready; it only degrades latest to finalized. Other errors: 400 invalid input (including `finality` other than `latest`/`finalized`), 404 unknown network, 503 RPC/queue/deadline/database acquisition failures.
 
-Errors: 400 (address/flags), 404 (network), 503 with `Retry-After` when the follower is unhealthy (too far behind or not advancing), the RPC is down, or request-path RPC is saturated or past `REQUEST_DEADLINE_MS`.
+## Balances (`balances=true`)
 
-## How it works
+Balances are read **only when a request asks for them**; nothing refreshes accounts in the background. Every read is a Multicall3 `aggregate3` of `balanceOf` calls at the served block (the tail tip for latest, the finalized cursor otherwise), pinned by block hash (EIP-1898), and is stored in `balance_snapshots` as value-or-error with block number/hash, `readAt` and the repair revision. A save is accepted only when the block is still canonical (the finalized header, or the tail block at that height).
 
-`RpcClient` is the only component that performs JSON-RPC HTTP. It owns error classification, retries, per-endpoint circuit breakers and unsupported-method memory, result validation with failover, rate limiting, and per-attempt statistics. A viem `PublicClient` sits on top through a custom transport with viem retries and call batching disabled. viem supplies RPC/action types, standard ABIs, calldata and topic encoding, strict event/result decoding, and the block/call actions. Inside `RpcClient`, one viem `http()` transport per endpoint (retries and batching off) does the HTTP/JSON-RPC mechanics; viem's retry, `shouldRetry` and `fallback` never run, so every attempt is billed and recorded once. The optional HyperSync source uses its own streaming client only for backfill.
+**Reuse rule.** A snapshot read at block R serves block S (the response's `blockHeight`) without RPC when its revision equals the current repair revision and either R = S with the same hash, or R < S, R's hash is **still canonical** (finalized header at R, or the current tail block at R), the token is not in the always-refresh list, and no Transfer of that token touching the account exists in (R, S]: the finalized `holdings.last_block` ≤ R **and** no matching tail Transfer above R (the latest overlay folds tail Transfers into `lastBlock`). Canonicality is computed by joining `block_headers`/`tail_blocks` in the same repeatable-read snapshot as holdings and tail rows, so a tail reorg of R (seen by any replica's tail leader) makes the snapshot non-reusable, and a newer snapshot on an orphaned block may be overwritten by an older canonical read. If the served tail block itself is reorged out while the Multicall runs, the values are returned (labelled with that block) but not cached. Any repair or rebuild bumps the revision and so invalidates every snapshot; repairs also delete touched accounts' snapshots and snapshots inside the repaired range. A snapshot newer than S (e.g. a latest read, then a `finality=finalized` request) is not reused and the finalized read is not cached over it.
 
-Durable aggregates are **finalized-only**. Unfinalized data lives only in a replaceable Transfer journal and is never folded into `holdings`, `nft_items`, the follower cursor, or backfill state.
+**Response fields per token:** `balance` or `balanceError`, `balanceStatus`, `balanceBlock`/`balanceBlockHash` (always the block actually read; never relabelled), `balanceReadAt`, `balanceCached` (no RPC in this request), and `balanceValidAt` (= `blockHeight`) only when the value provably holds at the served block. Top-level `balancesCurrent` is true when every token has `balanceValidAt`. A per-token revert or bad return data is stored as an error at its block and is reused under the same rule, but is never given `balanceValidAt`. Outage, rate limit or auth failure fails the request with **503** and caches nothing.
 
-1. **Shared finalized follower (one per network).** A background loop polls the finalized head every `FOLLOWER_POLL_MS`, and immediately when the tail tip enters a new beacon epoch (the finalized checkpoint only moves at epoch boundaries), then every 4 slots of that epoch until finalized has moved. When it is ahead of the global cursor (`follower_cursor`: number, hash, timestamp, updated_at), the follower fetches every `Transfer` log of (cursor, head] **without an address filter**, in ranges of at most `ETH_FOLLOWER_MAX_RANGE` blocks, with the same strict decoding and split-on-too-large/timeout as the backfill. Logs whose from/to are not tracked are dropped before decoding; the rest fold into the same per-account aggregates the backfill uses. Each range commits in one transaction together with the cursor advance (a range that ends below the head costs one extra `eth_getBlockByNumber` for its hash). At the head, one epoch (32 blocks, about 22k logs, about 14 MB) is one `getLogs` call.
-   - **Exactly one follower per network.** The loop runs only while it holds a PostgreSQL **session** advisory lock (`pg_try_advisory_lock`) on a dedicated pool connection, held for the follower's lifetime and re-verified every tick. Other processes retry acquisition each poll and meanwhile only read the cursor. Independently, each commit locks the cursor row and refuses a range that does not continue it, so a lost lock can never double-apply a range.
-   - **Tracked accounts** are kept in an in-memory set loaded from `tracked_accounts`. At commit, the store compares the set the range was decoded against with the table; if an account was tracked in the meantime, nothing is applied. The follower keeps the logs it already folded or skipped and re-folds them for the newly tracked accounts, with no refetch; only after 8 such rounds (`MAX_REFOLDS`) does it fall back to refetching the range.
-   - **Health.** The follower reports its lag (finalized head minus cursor) and when the cursor last advanced. Responses are `stale` after an RPC failure on the last poll, a lag above one epoch, or no advance for `FINALIZED_MAX_NO_PROGRESS_MS`; discovery returns 503 above `FOLLOWER_MAX_LAG_BLOCKS` or after `MAX_HEAD_AGE_MS` without an advance.
-2. **Near-realtime tail.** Only the follower leader polls `latest`, aligned to slot +2.5/+5/+9 s; once the slot's block is in, the remaining offsets are skipped (a late or missed block is retried at +5/+9 s). A direct successor costs one header and one `eth_getLogs({ blockHash })`; catch-up (startup, gaps) fetches headers by number, verifies their parent-hash chain, and accepts its range query (split on too-large/timeout like the follower) only if every log hash matches its header. A head at or below the finalized cursor, or a lower head whose hash we already store, is a lagging node and ignored; a header that changes mid catch-up is retried, not counted as a reorg. While the follower is more than an epoch behind finalized (startup, outage), the tail waits and wakes it rather than fetching headers the follower's commits would prune. Parent mismatch walks stored/canonical hashes back to a common ancestor, rewinds only tail rows, then re-ingests. Reaching the finalized cursor or exceeding `TAIL_MAX_DEPTH` wipes the tail, serves finalized with `tailError`, and rebuilds safely on the next tick. Finalization fetches the block again through the existing follower, then prunes tail rows ≤ cursor in the same transaction (or wipes on a hash mismatch). On restart the persisted tip is re-validated by the first leader tick, which compares the stored tip against `latest`'s parent chain (`load()` only reads it, since leadership is not yet known at startup).
-3. **Backfill → follower handoff.** A new account is tracked in one transaction that takes a share lock on the cursor row, inserts `tracked_accounts`, and records the cursor C as its `backfill_target`. A follower commit therefore happens entirely before (its blocks are ≤ C) or entirely after (it applies to the account, blocks > C). Because the tail stores every Transfer, accounts tracked mid-tail need no second handoff and are complete immediately after their finalized backfill.
-   - Backfill uses the network's `AccountLogSource`. With a key, `auto` streams both account directions in one HyperSync query, folds pages immediately (never `collect()`), and commits 100k-block chunks in order. Any auth, rate-limit, server, timeout, lagging-height, or malformed-response failure reruns that entire uncommitted chunk through RPC. After two consecutive failures a 60 s breaker skips HyperSync. Without a key, RPC is used directly: two `eth_getLogs` directions per chunk, strict shared decoding, and self-transfer dedupe.
-   - Up to `ETH_SCAN_CONCURRENCY` chunks are in flight; completed chunks commit strictly in order with `progress_to`. A partial stream is never exposed or committed. Direct RPC alone persists its adaptive per-account range (halve on heavy/split, grow after three light chunks). HyperSync uses its fixed large range; an RPC fallback recursively splits provider-limited requests but the composite chunk remains the atomic resume unit.
-   - A request waits up to `REQUEST_DEADLINE_MS` for the backfill and otherwise answers **202 `syncing`** with `progressBlocks`/`targetBlocks`; the backfill continues in the background. Concurrent requests share one backfill. Backfills run through a bounded limiter (`BACKFILL_CONCURRENCY`, `BACKFILL_QUEUE`); beyond it requests get 503 with `Retry-After`.
-   - Scan progress stored by the pre-follower version is resumed when it is at or below C, and discarded (the account is rebuilt) when it is above C.
-4. **Shared balance worker (change-driven).** Accounts that requested balances within `ACTIVE_ACCOUNT_TTL_MS` are active. Every `BALANCE_REFRESH_MS`, and immediately after a tail reorg (or after a follower advance when the tail is disabled), the worker reads at one hash: tail tip when enabled, otherwise finalized cursor. It re-reads only the pairs that may have changed: pairs without a snapshot, pairs whose latest Transfer (`max(holdings.last_block, tail Transfers)`, tail-only ERC-20 pairs included) is after their snapshot's block, pairs whose last read failed transiently, pairs whose snapshot block is no longer canonical (above the finalized cursor and not the tail block hash at its height; such a snapshot is replaced even at the same height, which also covers reorgs seen only by another process's tail), and tokens in `BALANCE_ALWAYS_REFRESH_TOKENS` (WETH and stETH by default: their balances change through `Deposit`/rebases without `Transfer`). Every `BALANCE_FULL_SWEEP_MS` (1 h) a refresh also re-reads every other pair except `ok` zero balances (a zero balance only becomes non-zero through a Transfer), which bounds the staleness of other non-Transfer changes. A reorg-kicked refresh re-reads every pair, since a snapshot's block may have been orphaned. A read at a hash that was just reorged out (`unknown block`/`header for hash not found`) is transient; the next refresh uses the new tip. Results are packed into Multicall3 and retain their number and hash; `/health` reports each refresh's `candidates`, `read` and `fullSweep`.
-5. **Request path.** With the account backfilled, a request reads cursor, holdings, NFT items, matching tail rows, and tail tip in one repeatable-read snapshot, plus balance snapshots. Only a missing balance snapshot, `verifyOwnership`, or cold backfill uses request-path RPC.
-6. **Classification.** A `Transfer` log with 3 topics is decoded strictly with the ERC-20 event ABI. With 4 topics it is decoded with the ERC-721 variant, where `tokenId` is indexed. Malformed and `removed: true` logs are skipped.
-7. **Storage.** PostgreSQL 18 stores finalized aggregates plus `tail_blocks` and `tail_transfers`. Individual Transfers are stored only for the bounded unfinalized tail (roughly 30–60k rows), then pruned on finalization. Drizzle migrations run before startup.
+**Always-refresh tokens** (balance changes without a Transfer: WETH deposits, stETH/AMPL rebases, Aave aToken interest) are re-read once per new served block: with the tail that is every new tip (~12 s), not every finalized epoch. Mainnet defaults live in `src/networks.ts`; `BALANCE_ALWAYS_REFRESH_TOKENS` replaces the list. It is a starter list, not exhaustive, and the addresses were not re-verified on chain in this PoC; any unlisted token of that kind can be served stale under the Transfer rule.
 
-`lagBlocks` uses the highest `latest` block number cached by head tracking, which only the follower's poll refreshes.
+**Coalescing.** Uncached (account, token) pairs at the same block hash and revision are single-flight and join one open batch. With latest, requests in different slots read different tip hashes, so batches split at every new block. A batch is sent when it reaches `ETH_MULTICALL_BATCH` pairs or `BALANCE_BATCH_WINDOW_MS` after its first pair, so concurrent requests for different accounts share Multicalls. Batches run through the bounded request-RPC limiter (`REQUEST_RPC_CONCURRENCY`/`REQUEST_RPC_QUEUE`); a full queue is 503 `Retry-After`, and each request waits at most `REQUEST_DEADLINE_MS`. Late reads still save, but `saveBalances` rejects a read crossing a repair (503, retry) and never replaces a snapshot from a newer block.
 
-## Code layout
+**Cost at 1M accounts** (assumptions: every account polls once a minute, 20 ERC-20 holdings each, 1,000 pairs per call, 20 credits per `eth_call`, finalized cursor advancing once per 6.4-minute epoch, ~5M Transfers/day, 10% of accounts holding one always-refresh token). The table is for `finality=finalized`; with the default latest view, Transfer-touched pairs are the same, but always-refresh pairs are re-read on every poll (each minute sees a new tip): 100k × 1,440 = 144M pairs/day (~144k full calls, ~2.9M credits), and a reorg adds re-reads of pairs whose snapshot block was orphaned. The tail itself costs one `latest` header poll + one `eth_getLogs({ blockHash })` per block (~7,200 of each per day, independent of users), plus at most two extra polls in a slot whose block is late.
 
-```
-src/core/types.ts         shared contracts (ChainAdapter, RpcClient, Store, DiscoveryService)
-src/core/aggregate.ts     per-chunk aggregate folded from decoded Transfers (self-transfer dedupe, ERC-721 latest wins)
-src/rpc/                  JSON-RPC client: viem http() per endpoint for transport mechanics; our policy on top: failover,
-                          backoff with jitter, capped Retry-After, circuit breaker, token-bucket limiter, error classification
-                          (rate_limited / transient / too_large / unsupported / fatal); rpcErrorOf() unwraps viem-wrapped errors
-src/chains/evm/           EVM adapter: logs.ts (typed topics/strict decoding and range splitting), head.ts (finalized head via a
-                          viem PublicClient over RpcClient, retries and batching disabled), multicall.ts, adapter.ts
-src/sources/              per-account backfill sources: RPC wrapper, streaming HyperSync, and generic fallback/breaker
-src/networks.ts           network registry: chain/id, start block, HyperSync default and Multicall3 address
-src/store/schema.ts       Drizzle PostgreSQL schema
-src/store/store.ts        async Store queries and transactional upserts, shared by pg and PGlite
-src/store/postgres.ts     pg Pool startup and automatic Drizzle migrations
-src/store/advisory-lock.ts advisory locks: transaction-scoped helper, and the session-level follower leader lock
-drizzle/                  generated, commit-ready SQL migrations and metadata
-src/follower/follower.ts  shared finalized follower: leader lock, unfiltered getLogs per range, health
-src/tail/tail.ts          slot-aligned latest follower: hash-pinned logs, catch-up, reorg rewind/rebuild, health
-src/balances/worker.ts    shared balance worker for active accounts; first-request reads (single-flight)
-src/discovery/service.ts  tracking, backfill to the handoff target (resumable, single-flight), database reads
-src/core/limiter.ts       bounded concurrency and per-request deadlines for request-path RPC
-src/api/routes.ts         Hono routes
-```
+| | Pairs/day | Calls/day | Credits/day |
+|---|---|---|---|
+| Re-read on every request, perfectly batched | 28.8B | 28.8M | 576M |
+| Reuse: Transfer-touched pairs (≤ 2 × 5M) | ≤ 10M | | |
+| Reuse: always-refresh (100k × 225 epochs) | 22.5M | | |
+| Reuse total, batches full | ~32.5M | ~33k | ~0.65M |
+| Reuse total, 25 ms window (~9 pairs per batch at ~376 pairs/s) | ~32.5M | ≤ 3.5M | ≤ 69M |
 
-A new EVM network is one entry in `src/networks.ts`; the generic config/server construction supplies its source and `createEvmAdapter` (give it separate RPC/env wiring when endpoints differ). A non-EVM family implements `ChainAdapter`. A new backfill provider implements the small `AccountLogSource` contract (`name`, preferred chunk range, aggregate-returning `scanAccount`, stats/optional close) and can be composed with `withFallback`; discovery contains no provider switch.
+Unchanged polls cost no RPC, so cost follows real balance changes. At this load the window, not the pair count, bounds calls: 250 ms gives ≤ 346k calls (≤ 7M credits) per day for ≤ 250 ms extra latency. One-time first reads add 20M pairs (≈ 0.4M credits batched). Each replica batches independently, so multiply the window bound by the replica count.
 
-For a live, finalized comparison run `npm run compare:sources -- <address> [fromBlock] [toBlock]`. It loads `.env` without printing secrets and reports chunks, upstream requests, time, logs, ERC-20 tokens, NFT items and aggregate equality. The default full window keeps RPC at its normal 3k-block ranges (about 172 `eth_getLogs` calls); pass a smaller range for a cheaper smoke check.
+## Near-realtime tail (liveness)
 
-## Unreliable RPC
+The durable index stays finalized-only (~13 min behind the tip). Liveness comes from a replaceable journal above it, `tail_blocks` (number/hash/parent hash/timestamp) and `tail_transfers` (same column types as `transfers`), which is never folded into `holdings`/`nft_ownership`. Because the index is global, the tail stores every `Transfer` of every block; there is no tracked-account logic.
 
-viem's `http()` transport builds requests, enforces the timeout and parses responses; `RpcClient` decides everything else. viem's built-in policy would get this wrong for us: it retries `-32005` even when the message says the range is too large (we must split instead), does not treat Quicknode `-32010` as a rate limit, cannot fail over on a null result, has no breaker, and would wait a full hour-long `Retry-After`; it would also hide retried attempts from the billing stats.
+1. **Leader only, slot aligned.** Only the process holding the follower's advisory lock polls `latest`, at slot +2.5/+5/+9 s (`TAIL_POLL_OFFSETS_MS`); once the slot's block is in, the remaining offsets are skipped. A direct successor costs one header and one `eth_getLogs({ blockHash })`; catch-up fetches headers by number, verifies the parent-hash chain and accepts its range query (split on too-large/timeout) only if every log hash matches its header.
+2. **Readiness first.** The tail runs only once the global index exists and its cursor is within an epoch of the observed finalized head; while bootstrap or catch-up is pending it waits (the service stays `not_ready`) and wakes the follower instead of fetching headers the next commit would prune.
+3. **Lagging nodes.** A head at or below the finalized cursor, or a lower head whose hash the tail already stores, is a lagging endpoint and ignored. A header that changes mid catch-up (load-balanced nodes) is retried, not counted as a reorg.
+4. **Reorgs.** A parent mismatch walks stored vs canonical hashes back to the common ancestor, rewinds only tail rows above it and re-ingests. No ancestor within `TAIL_MAX_DEPTH`, or only the finalized cursor, wipes the tail: responses fall back to finalized with `tailError` until the next tick rebuilds it. Rewind and wipe are fenced on the tip hash the leader observed, and appends on the expected parent, so a failover writer cannot lose rows.
+5. **Finalization.** `appendRange` deletes tail rows ≤ the new cursor in the same transaction that advances it; a different tail hash at the new cursor wipes the tail. A repair that replaces the cursor block also wipes it. There is never a moment where a Transfer is counted twice or missing between the two tables.
+6. **Finality stalls.** The tail stops `TAIL_MAX_AHEAD_BLOCKS` above the cursor and degrades to finalized with `tailError`, bounding rows and overlay cost. At each epoch boundary (and every 4 slots until finalized moves) it wakes the follower.
+7. **Shared freshness.** Every replica serves latest from the database tip; latest is served only while the tip's own block timestamp is at most `TAIL_MAX_TIP_AGE_MS` old, so a stalled leader degrades all replicas, not just itself. `/health` shows each process's tail status; non-leader processes report the tip loaded at startup.
 
-| Failure | Handling |
-|---|---|
-| 429, `-32007`, `-32010`, "limit reached" | Exponential backoff with full jitter, honouring `Retry-After`. Client-side limiter at `RPC_MAX_RPS` |
-| 5xx, timeouts, network errors, "header not found" | Retry, then fail over to the next endpoint. The circuit breaker opens after 5 consecutive failures |
-| Timeout on a multi-block `eth_getLogs` | Not retried with the same range: the error carries `timeout: true` and the range is split in half, like "range too large". It does not count against endpoint health. A single-block range retries normally |
-| "more than N results", "range too large" | Split the block range. A range suggested in the error message is used when the provider gives one |
-| "method not available", archive refused | Skip that endpoint for that method for 10 minutes |
-| Null or invalid block result | Count it as a transient endpoint failure and retry the next endpoint in the same request |
-| Null or non-array log result | Count it as a transient endpoint failure and retry the next endpoint in the same request |
-| Unknown/reorged block hash | Transient retry/failover; no tail row is committed until the complete block/range validates |
-| By-number catch-up returns a log from another fork | Reject the whole batch unless `log.blockHash` equals the fetched header hash |
-| Latest parent mismatch | Find a common stored/canonical ancestor, rewind tail rows above it, and re-ingest by hash |
-| Node behind the cached head | Keep the newer cached finalized block; the follower does not move its cursor backwards |
-| Follower poll fails (head or `getLogs`) | The cursor stays put and the range is retried next poll; responses are `stale: true` until a poll succeeds |
-| Follower falls behind finalized | `followerLagBlocks` grows; `stale` above one epoch, 503 with `Retry-After` above `FOLLOWER_MAX_LAG_BLOCKS` |
-| Finalized (or the follower) stops advancing | `stale` after `FINALIZED_MAX_NO_PROGRESS_MS`, 503 after `MAX_HEAD_AGE_MS`; clears on the next advance |
-| Request-path RPC saturated or slow | Bounded limiters and `REQUEST_DEADLINE_MS`: 202 `syncing` for backfills, 503 with `Retry-After` otherwise |
-| HyperSync failure or timeout | Discard the partial aggregate, close the stream, rerun the whole chunk through RPC; breaker cooldown avoids retrying a dead primary on every later chunk |
+## Ingestion and repair
 
-## Limits (PoC)
+1. Bootstrap calls `initialize(network, startBlock, anchorHeader, at)` with the header at `startBlock - 1`, then `observeHead(network, finalizedHead, at)`.
+2. `appendRange(network, range, headers, transfers, at)` receives all headers, including empty blocks, and all decoded transfers. It checks range coverage, parent linkage and log hashes, locks the network cursor and atomically commits raw rows, derived rows and progress. A fully committed replay is a no-op; corrections require replacement.
+3. The finalized follower holds a per-network session advisory lock, fetches complete header chains with bounded concurrency, then unfiltered `getLogs`. It has no account set. Each range uses the same append API; cursor locking also protects against competing writers.
+4. Gaps/hash disagreements enter `repair_queue`. An alternate-source repair runner (pending) refetches the suspect range and calls `replaceRange`. The transaction checks both neighbors, remembers old and new participants, replaces raw rows/headers, rebuilds touched accounts from their complete retained histories, and restores the latest owner for touched NFTs. It invalidates affected caches and increments the repair revision. Fully covered queue entries are removed only with a successful replacement/append.
+5. `rebuildRange` reconstructs derived data for accounts/items touched by an existing raw range, without changing raw transfers. It deliberately does not resolve a suspected-source repair.
 
-- **Pre-start tokens.** Tokens held before block 25,933,634 and never moved since are not discovered.
-- **Balances without `Transfer`.** Tokens that change balances without emitting `Transfer` are not discovered until a first `Transfer`. Examples: WETH deposits, rebasing tokens. Once discovered, tokens in `BALANCE_ALWAYS_REFRESH_TOKENS` are re-read every refresh; other non-`Transfer` changes (unlisted rebasing tokens, admin mints without events) are only picked up by the hourly full sweep, and never for a balance stored as `ok` zero. Extend the list rather than lowering the sweep interval. ERC-1155 is not supported.
-- **Spam.** Spam and address-poisoning tokens are returned. Many of them fail `balanceOf` and show `balanceStatus: "error"`.
-- **Polling cost.** Warm requests cost no RPC. The tail adds about 1.2–1.4 header calls (measured) and one `getLogs` per block (about 9.5–10.4M credits/month); `finalized` is polled once per epoch instead of every 30 s (saving about 3.2M), and the change-driven balance refresh costs about 1.6M *(estimate: 5k users × 10 tokens, about 1% of pairs touched per minute, about 1.8 calls/min; about 6M if every user holds WETH/stETH)* instead of about 43M for a full 60 s sweep. The tail (about 9–11M) now dominates and the follower is under 0.5M, so the steady-state total is about 12–17M credits/month *(estimate)*, down from about 53–54M (REPORT §4). Cold backfills still cost about 172 calls per new account (one-off). The balance cost now scales with Transfer activity, not with tokens held: zero-balance spam tokens cost nothing after their first read.
-- **Single process.** The active-account set, single-flight maps and limiters are in process memory, and the balance worker runs in every process. Only the follower is protected against concurrent processes (advisory lock). Several API replicas would need the active set in the database (or Redis) and one balance-worker leader.
-- **Freshness of balances.** A pair touched by a Transfer is re-read within `BALANCE_REFRESH_MS` (plus one refresh duration); an untouched pair keeps its older snapshot, which `balanceCurrent` reports as current, and every token says which block it was read at. A balance that changes without `Transfer` outside the always-refresh list can be up to `BALANCE_FULL_SWEEP_MS` stale while reported as current. Accounts idle for `ACTIVE_ACCOUNT_TTL_MS` are no longer refreshed; their next request is served from the old snapshot (labelled with its block) and re-activates them.
-- **Tracked accounts are never untracked.** The follower applies logs for every account ever requested; the per-tick cost is independent of their number, but the set and the commit-time check grow with it.
-- **Tail degradation.** Normal discovery trails the tip only by its slot polling delay. A reorg deeper than `TAIL_MAX_DEPTH`, or one reaching the finalized cursor, temporarily serves the roughly 13-minute-old finalized base with `tailError` while the tail rebuilds. The same fallback applies when the tail tip block is older than `TAIL_MAX_TIP_AGE_MS` (checked in every process from the shared tip), and when the tail reaches `TAIL_MAX_AHEAD_BLOCKS` above the finalized cursor because finality stalled (it stops appending until finality resumes).
-- **Balance cadence.** Only tail reorgs kick the shared worker; otherwise the 60 s change-driven refresh follows the tip, reading only Transfer-touched pairs, always-refresh tokens and, hourly, the non-zero rest. Kicking it per tail block (the change test already limits the read to that block's pairs) is the next step (not implemented).
-- **Tail on non-leader replicas.** Only the follower leader runs the tail. Another replica serves the leader's tail rows from Postgres, and every process serves `latest` only while the shared tail tip block is at most `TAIL_MAX_TIP_AGE_MS` old, so a stalled leader degrades all replicas to finalized with `tailError`. Only the tail status in `/health` is leader-local.
-- **HyperSync boundary.** HyperSync itself serves through the unfinalized chain head, but backfill targets are pinned to the follower's finalized cursor and queries always end exactly at `target + 1` (exclusive). A source below the requested height fails to RPC.
-- **HyperSync is experimental (off by default).** Normal and NFT accounts matched RPC exactly (1 request vs 172 calls), but the stream for a 100k-block chunk of the Binance hot wallet (`0x28c6…`, about 1M logs per chunk) hung and never finished, even with a 600 s timeout. The chunk then fails over to RPC after the timeout. Undiagnosed; until it is fixed, use `LOG_SOURCE=rpc`.
-- **Vendor/native dependency.** HyperSync is an optional hosted vendor/free-tier risk (auth, throttling and availability). Its package is a N-API native addon: it is dynamically imported only when configured; shutdown closes streams and drops the client reference. RPC remains the zero-extra-service path.
-- **Heavy accounts.** An exchange hot wallet can mean about 2.5M logs (about 1.6 GB of JSON) for the window. The scan is then bound by download throughput (about 75 s measured for Binance's hot wallet), and the adaptive range trades RPC calls for smaller responses: about 320-450 calls instead of 172. Every response is still parsed whole by viem, so peak RSS is about 1 GB at concurrency 8, mostly in-flight responses plus GC slack. Each cold scan commits per chunk and resumes after the last committed chunk following a failure.
-- **Concurrency and rate limit.** At the default `RPC_MAX_RPS` of 20, concurrency 8 (16 requests in flight) already saturates the limiter for a normal account: 172 calls take about 8.6 s, and concurrency 16 measured no faster. The limiter is shared with the follower and the balance worker; a live cold backfill on 2026-10-14 took about 26 s for the same 172 calls (so with the default 10 s deadline, the first requests answer 202).
-- **Reorgs.** Durable summaries contain finalized blocks only. Ordinary latest-chain reorgs delete and re-ingest only tail rows; a consensus-level finality failure is still out of scope.
-- **PostgreSQL required at runtime.** The API does not fall back to embedded storage. Tests use PGlite and exercise the same generated migrations without Docker.
+All database conversions are in `src/store/columns.ts` plus the name-to-ID registry lookup in `createStore`. Public contracts keep `Address`, `Hex` and `bigint`. A new EVM network gets an immutable smallint database ID and adapter configuration in `src/networks.ts`; non-EVM networks can implement `ChainAdapter`. Separate RPC endpoint wiring is still required when networks use different providers.
+
+## Configuration
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `RPC_URL`, `RPC_FALLBACK_URLS` | required, empty | Primary and comma-separated fallback RPC endpoints |
+| `DATABASE_URL` | local `iseeu` PostgreSQL database | Connection string |
+| `PORT` | 3000 | HTTP port |
+| `RPC_TIMEOUT_MS`, `RPC_MAX_ATTEMPTS`, `RPC_MAX_RPS` | 15000, 6, 20 | Timeout, retry budget, shared outgoing rate cap |
+| `ETH_FOLLOWER_MAX_RANGE` | 500 (maximum 1000) | Unfiltered log range; large responses require bounded memory |
+| `FOLLOWER_POLL_MS` | 30000 | Finalized-head poll interval |
+| `FOLLOWER_MAX_RANGES_PER_TICK` | 8 | Bounded catch-up per tick |
+| `FOLLOWER_HEADER_CONCURRENCY` | 8 | Concurrent block-header reads |
+| `MAX_HEAD_OBSERVATION_AGE_MS` | 120000 | Shared head observation expiry |
+| `TAIL_ENABLED` | true | Run the tail and serve `finality=latest` by default; false serves finalized only |
+| `TAIL_MAX_DEPTH` | 64 | Deepest reorg rewound in place; deeper ones wipe the tail |
+| `TAIL_POLL_OFFSETS_MS` | 2500,5000,9000 | `latest` poll offsets within each 12 s slot |
+| `TAIL_MAX_AHEAD_BLOCKS` | 1024 | Stop appending this far above the finalized cursor (finality stall, ~3.4 h) |
+| `TAIL_MAX_TIP_AGE_MS` | 60000 | Serve finalized with `tailError` when the shared tail tip block is older |
+| `FINALIZED_MAX_NO_PROGRESS_MS` | 1200000 | Head tracker stops trusting a non-advancing head |
+| `MAX_HEAD_AGE_MS` | 1800000 | Refuse reads after index progress stops this long |
+| `ETH_MULTICALL_BATCH` | 1000 | Calls per Multicall3 batch; also the shared balance batch size |
+| `BALANCE_ALWAYS_REFRESH_TOKENS` | `src/networks.ts` list | Comma-separated tokens re-read at every new cursor; replaces the defaults |
+| `BALANCE_BATCH_WINDOW_MS` | 25 | Wait for other requests' pairs before sending a partial Multicall |
+| `REQUEST_DEADLINE_MS` | 10000 | On-request RPC wait budget |
+| `REQUEST_RPC_CONCURRENCY`, `REQUEST_RPC_QUEUE` | 16, 256 | Concurrent and queued request-path Multicalls (balance batches, ownership) |
+| `MAX_VERIFY_OWNERSHIP_ITEMS` | 2000 | Cap on optional ownership verification |
+| `DB_POOL_MAX`, `DB_CONNECT_TIMEOUT_MS` | 20, 5000 | Pool size and acquisition timeout; one connection per follower leader lock |
+
+The standalone `scripts/compare-sources.ts` and `src/sources/` remain diagnostic tools for RPC/HyperSync comparison. They are not wired into discovery or ingestion, and their account aggregates cannot populate the raw global index. Their vendor-related variables apply only to that diagnostic.
+
+## Limits
+
+Only standard three-topic ERC-20 and four-topic ERC-721 Transfer logs are included. Pre-start untouched holdings, native ETH, ERC-1155, non-Transfer balance changes and spam filtering remain outside discovery. Malformed and removed logs are skipped.
+
+RPC retains bounded retries, rate limiting, endpoint breakers/failover, unsupported-method memory, result validation and split-on-size/timeout log queries. A linked header chain detects fork/gap inconsistencies, **not silently omitted logs**. Alternate-source comparison and queue processing remain operational work.
+
+Latest data is unfinalized: rows above `finalizedBlockHeight` and balances read at the tip can be reorged out (the tail repairs itself within one slot; deep reorgs degrade to finalized). History pages are not reorg-stable across the tail. The tail stores every Transfer of up to `TAIL_MAX_AHEAD_BLOCKS` blocks (normally 64–96 blocks, roughly 100k rows; a stalled finality grows this toward ~1M rows). Each latest request adds one indexed `tail_transfers` lookup. Full-window bootstrap throughput, 180M-row query plans, vacuum/WAL behavior and one-million-account load have not been benchmarked. Large repairs serialize that network's writer and may scan substantial account history. See the report's partitioning tradeoff before the full bootstrap.
