@@ -45,6 +45,8 @@ const balances = Object.fromEntries(Object.values(adapters).map((adapter) => [ad
   store,
   activeTtlMs: config.balances.activeAccountTtlMs,
   refreshMs: config.balances.refreshMs,
+  fullSweepMs: config.balances.fullSweepMs,
+  alwaysRefreshTokens: config.balances.alwaysRefreshTokens,
   requestRpc,
   tailTip: config.tail.enabled ? () => store.getTailTip(adapter.network) : undefined,
   onError: logError('balance refresh'),
@@ -90,7 +92,7 @@ for (const tail of Object.values(tails)) tail.start();
 for (const worker of Object.values(balances)) worker.start();
 
 const app = createApp(
-  { discovery, adapters, balances, followers, tails, requestRpc, maxVerifyOwnershipItems: config.request.maxVerifyOwnershipItems, rpcStats: () => rpc.stats(), startedAt: Date.now() },
+  { discovery, adapters, balances, followers, tails, requestRpc, maxVerifyOwnershipItems: config.request.maxVerifyOwnershipItems, alwaysRefreshTokens: config.balances.alwaysRefreshTokens, rpcStats: () => rpc.stats(), startedAt: Date.now() },
   { requestLog: process.env.LOG_LEVEL !== 'warn' && process.env.LOG_LEVEL !== 'error' },
 );
 

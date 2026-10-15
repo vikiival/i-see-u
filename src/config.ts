@@ -1,3 +1,4 @@
+import type { Address } from './core/types.ts';
 import { networkRegistry } from './networks.ts';
 
 try {
@@ -101,6 +102,15 @@ export const config = {
     /** Accounts whose balances were requested within this window are refreshed by the shared worker. */
     activeAccountTtlMs: int('ACTIVE_ACCOUNT_TTL_MS', '300000'),
     refreshMs: int('BALANCE_REFRESH_MS', '60000'),
+    /** Between refreshes only Transfer-touched pairs are re-read; this often every non-zero pair is (catches non-Transfer changes). */
+    fullSweepMs: int('BALANCE_FULL_SWEEP_MS', '3600000'),
+    /** Tokens whose balance changes without a Transfer (WETH Deposit, stETH rebase): re-read every refresh. */
+    alwaysRefreshTokens: env('BALANCE_ALWAYS_REFRESH_TOKENS',
+      '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2,0xae7ab96520de3a18e5e111b5eaab095312d7fe84')
+      .split(',').map((token) => token.trim().toLowerCase()).filter(Boolean).map((token) => {
+        if (!/^0x[0-9a-f]{40}$/.test(token)) throw new Error('BALANCE_ALWAYS_REFRESH_TOKENS must contain addresses');
+        return token as Address;
+      }),
   },
   db: {
     /** Postgres pool size (one connection is held permanently by the follower leader lock). */

@@ -242,6 +242,17 @@ export interface Tracking {
   progress?: bigint;
 }
 
+/** What the balance refresh needs to decide whether a pair must be re-read. */
+export interface Erc20RefreshState extends BalancePair {
+  /** Block of the pair's latest Transfer: max(holdings.last_block, tail Transfers). */
+  lastTransferBlock: bigint;
+  /**
+   * The stored snapshot, if any: `ok` = the read succeeded, `zero` = it succeeded with balance 0, `canonical` = its
+   * block is at or below the follower cursor, or its hash is the tail block at that height (false when orphaned).
+   */
+  snapshot?: { blockNumber: bigint; zero: boolean; ok: boolean; canonical: boolean };
+}
+
 export interface BalanceSnapshot {
   token: Address;
   result: BalanceResult;
@@ -312,6 +323,8 @@ export interface Store {
   nftItems(network: string, account: Address): Promise<NftItem[]>;
   /** Every ERC-20 (account, token) pair of these accounts. */
   erc20Pairs(network: string, accounts: Address[]): Promise<BalancePair[]>;
+  /** The same pairs as erc20Pairs, each with its latest Transfer block and stored snapshot state. */
+  erc20RefreshState(network: string, accounts: Address[]): Promise<Erc20RefreshState[]>;
   /** Upsert balance snapshots read at `block`; a row moves backward only for a canonical-tip reorg refresh. */
   saveBalances(
     network: string,

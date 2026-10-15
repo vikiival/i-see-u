@@ -4,9 +4,9 @@ import type { PgDatabase } from 'drizzle-orm/pg-core';
 import type {
   AccountView,
   Address,
-  BalancePair,
   BlockRange,
   ChunkAggregate,
+  Erc20RefreshState,
   FollowerCursor,
   Hex,
   Store,
@@ -176,6 +176,74 @@ export function createStore(db: StoreDatabase, close: () => Promise<void> = asyn
   const wipeTail = async (tx: Executor, network: string): Promise<void> => {
     await tx.delete(schema.tailTransfers).where(eq(schema.tailTransfers.network, network));
     await tx.delete(schema.tailBlocks).where(eq(schema.tailBlocks.network, network));
+  };
+
+  const erc20RefreshState = async (network: string, accounts: Address[]): Promise<Erc20RefreshState[]> => {
+    const states: Erc20RefreshState[] = [];
+    const cursor = await getFollowerCursor(db, network);
+    await inBatches(accounts, async (batch) => {
+      const members = new Set<string>(batch);
+      const byPair = new Map<string, Erc20RefreshState>();
+      const touch = (account: string, token: string, block: bigint) => {
+        const key = `${account}:${token}`;
+        const state = byPair.get(key);
+        if (!state) byPair.set(key, { account: account as Address, token: token as Address, lastTransferBlock: block });
+        else if (block > state.lastTransferBlock) state.lastTransferBlock = block;
+      };
+      const rows = await db.select({
+        account: schema.holdings.holder, token: schema.holdings.token, lastBlock: schema.holdings.lastBlock,
+      }).from(schema.holdings).where(and(
+        eq(schema.holdings.network, network),
+        eq(schema.holdings.standard, 'erc20'),
+        inArray(schema.holdings.holder, batch),
+      )).orderBy(asc(schema.holdings.holder), asc(schema.holdings.token));
+      for (const row of rows) touch(row.account, row.token, row.lastBlock);
+      // Tail rows above the cursor are newer than any finalized Transfer folded into holdings.
+      const tail = await db.select({
+        from: schema.tailTransfers.from,
+        to: schema.tailTransfers.to,
+        token: schema.tailTransfers.token,
+        block: sql<string>`max(${schema.tailTransfers.blockNumber})`,
+      }).from(schema.tailTransfers).where(and(
+        eq(schema.tailTransfers.network, network),
+        eq(schema.tailTransfers.standard, 'erc20'),
+        or(inArray(schema.tailTransfers.from, batch), inArray(schema.tailTransfers.to, batch)),
+      )).groupBy(schema.tailTransfers.from, schema.tailTransfers.to, schema.tailTransfers.token);
+      for (const row of tail) for (const account of [row.from, row.to]) {
+        if (members.has(account)) touch(account, row.token, BigInt(row.block));
+      }
+      const snapshots = await db.select({
+        account: schema.balanceSnapshots.account,
+        token: schema.balanceSnapshots.token,
+        balance: schema.balanceSnapshots.balance,
+        blockNumber: schema.balanceSnapshots.blockNumber,
+        blockHash: schema.balanceSnapshots.blockHash,
+      }).from(schema.balanceSnapshots).where(and(
+        eq(schema.balanceSnapshots.network, network),
+        inArray(schema.balanceSnapshots.account, batch),
+      ));
+      // A snapshot above the cursor is canonical only while the tail still holds its hash at that height: a reorg
+      // seen by another process's tail never kicks this worker, so the Transfer test alone would trust an orphan.
+      const above = [...new Set(snapshots.map((row) => row.blockNumber).filter((n) => !cursor || n > cursor.number))];
+      const tailHashes = new Map<bigint, string>();
+      if (above.length > 0) {
+        const rows = await db.select({ number: schema.tailBlocks.number, hash: schema.tailBlocks.hash })
+          .from(schema.tailBlocks).where(and(
+            eq(schema.tailBlocks.network, network), inArray(schema.tailBlocks.number, above),
+          ));
+        for (const row of rows) tailHashes.set(row.number, row.hash);
+      }
+      for (const row of snapshots) {
+        const state = byPair.get(`${row.account}:${row.token}`);
+        if (!state) continue;
+        const ok = row.balance !== null;
+        const canonical = (cursor !== undefined && row.blockNumber <= cursor.number)
+          || tailHashes.get(row.blockNumber) === row.blockHash;
+        state.snapshot = { blockNumber: row.blockNumber, ok, zero: ok && BigInt(row.balance!) === 0n, canonical };
+      }
+      states.push(...byPair.values());
+    });
+    return states;
   };
 
   return {
@@ -436,39 +504,10 @@ export function createStore(db: StoreDatabase, close: () => Promise<void> = asyn
     nftItems: (network, account) => nftItems(db, network, account),
 
     async erc20Pairs(network, accounts) {
-      const pairs: BalancePair[] = [];
-      const seen = new Set<string>();
-      await inBatches(accounts, async (batch) => {
-        const members = new Set<string>(batch);
-        const rows = await db.select({ account: schema.holdings.holder, token: schema.holdings.token })
-          .from(schema.holdings).where(and(
-            eq(schema.holdings.network, network),
-            eq(schema.holdings.standard, 'erc20'),
-            inArray(schema.holdings.holder, batch),
-          )).orderBy(asc(schema.holdings.holder), asc(schema.holdings.token));
-        for (const row of rows) {
-          const key = `${row.account}:${row.token}`;
-          if (!seen.has(key)) pairs.push({ account: row.account as Address, token: row.token as Address });
-          seen.add(key);
-        }
-        const tail = await db.select({
-          from: schema.tailTransfers.from,
-          to: schema.tailTransfers.to,
-          token: schema.tailTransfers.token,
-        }).from(schema.tailTransfers).where(and(
-          eq(schema.tailTransfers.network, network),
-          eq(schema.tailTransfers.standard, 'erc20'),
-          or(inArray(schema.tailTransfers.from, batch), inArray(schema.tailTransfers.to, batch)),
-        ));
-        for (const row of tail) for (const account of [row.from, row.to]) {
-          if (!members.has(account)) continue;
-          const key = `${account}:${row.token}`;
-          if (!seen.has(key)) pairs.push({ account: account as Address, token: row.token as Address });
-          seen.add(key);
-        }
-      });
-      return pairs;
+      return (await erc20RefreshState(network, accounts)).map(({ account, token }) => ({ account, token }));
     },
+
+    erc20RefreshState,
 
     async saveBalances(network, block, rows, opts) {
       await inBatches(rows, (batch) => db.insert(schema.balanceSnapshots).values(batch.map((row) => ({

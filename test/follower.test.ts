@@ -14,7 +14,9 @@ import { createTestStore } from './store-fixture.ts';
 type AdapterOverrides = Parameters<FakeChain['adapter']>[0];
 
 /** The full service (store, follower, balance worker, discovery, routes) over a FakeChain, with a test clock. */
-async function stack(chain: FakeChain, opts: { adapter?: AdapterOverrides; deadlineMs?: number } = {}) {
+async function stack(chain: FakeChain, opts: {
+  adapter?: AdapterOverrides; deadlineMs?: number; fullSweepMs?: number; alwaysRefreshTokens?: Address[];
+} = {}) {
   const { db, store } = await createTestStore();
   const clock = { t: 1_800_000_000_000 };
   const now = () => clock.t;
@@ -30,7 +32,10 @@ async function stack(chain: FakeChain, opts: { adapter?: AdapterOverrides; deadl
     now,
   });
   const requestRpc = { limiter: createLimiter(8, 1_000), deadlineMs: opts.deadlineMs ?? 30_000 };
-  const balances = createBalanceWorker({ adapter, store, activeTtlMs: 300_000, refreshMs: 60_000, requestRpc, now });
+  const balances = createBalanceWorker({
+    adapter, store, activeTtlMs: 300_000, refreshMs: 60_000, requestRpc, now,
+    fullSweepMs: opts.fullSweepMs, alwaysRefreshTokens: opts.alwaysRefreshTokens,
+  });
   const discovery = createDiscoveryService({
     adapters: { ethereum: adapter },
     store,
@@ -73,7 +78,7 @@ async function expectTruth(store: Store, chain: FakeChain, account: Address, fro
     .toEqual(Object.fromEntries([...truth.nfts].map(([key, n]) => [key, { held: n.held, block: n.block }])));
 }
 
-test('5k accounts x 10 tokens: one follower tick and one refresh cost O(ranges + pairs/1000) calls; 5k requests then cost zero', async () => {
+test('5k accounts x 10 tokens: one follower tick and one refresh cost O(ranges + pairs/1000) calls; an unchanged refresh and 5k requests then cost zero', async () => {
   const chain = new FakeChain(1_000n);
   const s = await stack(chain, { adapter: { startBlock: 1_001n } });
   try {
@@ -111,6 +116,12 @@ test('5k accounts x 10 tokens: one follower tick and one refresh cost O(ranges +
     expect(await s.balances.refresh()).toEqual({ pairs: 50_000, block: 1_032n });
     expect(chain.calls.eth_call).toBe(50); // 50k pairs / 1000 per aggregate3
     expect(chain.multicallSizes.every((size) => size === 1_000)).toBe(true);
+
+    // No Transfer since the snapshots and the hourly sweep not due: the next 60 s refresh reads nothing (was 50 calls).
+    s.clock.t += 60_000;
+    expect(await s.balances.refresh()).toEqual({ pairs: 0, block: 1_032n });
+    expect(chain.calls.eth_call).toBe(50);
+    expect(s.balances.stats().lastRefresh).toMatchObject({ candidates: 50_000, read: 0, fullSweep: false });
 
     const served = chain.total;
     await each(async (account) => {
@@ -447,6 +458,135 @@ test('balances: a transient failed refresh chunk does not replace its last good 
     expect(snapshots[successfulToken]).toMatchObject({
       result: { status: 'ok', balance: 21n }, blockNumber: 101n, blockHash: blockHash(101n),
     });
+
+    // The failed pair has no Transfer after its old snapshot, but is retried by the next refresh anyway.
+    chain.beforeMulticall = undefined;
+    chain.multicallSizes = [];
+    expect(await s.balances.refresh()).toEqual({ pairs: 1, block: 101n });
+    expect(chain.multicallSizes).toEqual([1]);
+    expect((await s.store.balances('ethereum', account)).find((row) => row.token === failedToken))
+      .toMatchObject({ result: { status: 'ok', balance: 21n }, blockNumber: 101n });
+  } finally {
+    await s.close();
+  }
+});
+
+/** One tracked account holding `tokens` (Transfers at 120, cursor at 150) whose first balances request has been served. */
+async function warmBalances(chain: FakeChain, tokens: Address[], opts: Parameters<typeof stack>[1] = {}) {
+  const account = address(41);
+  for (const token of tokens) chain.addTransfer({ token, from: address(99), to: account, value: 1n, blockNumber: 120n });
+  const s = await stack(chain, opts);
+  await s.follower.tick();
+  await s.get(`/v1/ethereum/accounts/${account}/erc20`);
+  expect((await s.get(`/v1/ethereum/accounts/${account}/erc20?balances=true`)).status).toBe(200);
+  /** Pairs read by multicall since the last reset, as token addresses. */
+  const readTokens: Address[] = [];
+  chain.beforeMulticall = (targets) => { readTokens.push(...targets); };
+  const reset = () => { chain.calls = {}; chain.multicallSizes = []; readTokens.length = 0; };
+  return { s, account, readTokens, reset };
+}
+
+test('balances: a refresh with no new Transfers reads nothing', async () => {
+  const chain = new FakeChain(150n);
+  const tokens = [address(51), address(52), address(53)];
+  chain.balanceOf = () => 7n;
+  const { s, reset } = await warmBalances(chain, tokens);
+  try {
+    expect(await s.balances.refresh()).toEqual({ pairs: 3, block: 150n }); // the first refresh is a full sweep
+    s.clock.t += 60_000;
+    reset();
+    expect(await s.balances.refresh()).toEqual({ pairs: 0, block: 150n });
+    expect(chain.calls).toEqual({});
+    expect(s.balances.stats().lastRefresh).toMatchObject({ candidates: 3, read: 0, pairs: 0, fullSweep: false });
+  } finally {
+    await s.close();
+  }
+});
+
+test('balances: a Transfer after the snapshot re-reads only that pair', async () => {
+  const chain = new FakeChain(150n);
+  const tokens = [address(51), address(52), address(53)];
+  chain.balanceOf = (_account, _token, at) => at === blockHash(150n) ? 7n : 8n;
+  const { s, account, readTokens, reset } = await warmBalances(chain, tokens);
+  try {
+    await s.balances.refresh();
+    chain.addTransfer({ token: tokens[1], from: address(99), to: account, value: 1n, blockNumber: 160n });
+    chain.finalized = 182n;
+    await s.follower.tick();
+    s.clock.t += 60_000;
+    reset();
+    expect(await s.balances.refresh()).toEqual({ pairs: 1, block: 182n });
+    expect(chain.calls).toEqual({ eth_call: 1 });
+    expect(readTokens).toEqual([tokens[1]]);
+    const byToken = Object.fromEntries((await s.store.balances('ethereum', account)).map((row) => [row.token, row]));
+    expect(byToken[tokens[1]]).toMatchObject({ result: { status: 'ok', balance: 8n }, blockNumber: 182n });
+    expect(byToken[tokens[0]]).toMatchObject({ result: { status: 'ok', balance: 7n }, blockNumber: 150n });
+  } finally {
+    await s.close();
+  }
+});
+
+test('balances: the hourly sweep re-reads non-zero pairs and skips zero balances', async () => {
+  const chain = new FakeChain(150n);
+  const [zero, nonZero] = [address(51), address(52)];
+  chain.balanceOf = (_account, token) => token === zero ? 0n : 5n;
+  // A 4 min sweep stands in for the hour: the test clock must stay within the follower's staleness bounds.
+  const { s, account, readTokens, reset } = await warmBalances(chain, [zero, nonZero], { fullSweepMs: 240_000 });
+  try {
+    await s.balances.refresh();
+    s.clock.t += 60_000;
+    reset();
+    await s.balances.refresh();
+    expect(chain.calls).toEqual({});
+
+    s.clock.t += 180_000;
+    await s.get(`/v1/ethereum/accounts/${account}/erc20?balances=true`); // still active; served from snapshots
+    expect(chain.calls).toEqual({});
+    expect(await s.balances.refresh()).toEqual({ pairs: 1, block: 150n });
+    expect(readTokens).toEqual([nonZero]);
+    expect(s.balances.stats().lastRefresh).toMatchObject({ candidates: 2, read: 1, fullSweep: true });
+
+    s.clock.t += 60_000;
+    reset();
+    await s.balances.refresh();
+    expect(chain.calls).toEqual({}); // the sweep is not due again for another interval
+  } finally {
+    await s.close();
+  }
+});
+
+test('balances: always-refresh tokens are read every cycle', async () => {
+  const chain = new FakeChain(150n);
+  const tokens = [address(51), address(52), address(53)];
+  chain.balanceOf = () => 7n;
+  const { s, readTokens, reset } = await warmBalances(chain, tokens, { alwaysRefreshTokens: [tokens[2]] });
+  try {
+    await s.balances.refresh();
+    for (let cycle = 0; cycle < 2; cycle += 1) {
+      s.clock.t += 60_000;
+      reset();
+      expect(await s.balances.refresh()).toEqual({ pairs: 1, block: 150n });
+      expect(readTokens).toEqual([tokens[2]]);
+    }
+  } finally {
+    await s.close();
+  }
+});
+
+test('balances: a reorg-kicked refresh still re-reads every pair, zero balances included', async () => {
+  const chain = new FakeChain(150n);
+  const tokens = [address(51), address(52), address(53)];
+  chain.balanceOf = () => 0n;
+  const { s, readTokens, reset } = await warmBalances(chain, tokens);
+  try {
+    expect(await s.balances.refresh()).toEqual({ pairs: 0, block: 150n }); // zero balances are not swept
+    s.clock.t += 60_000;
+    reset();
+    s.balances.start();
+    s.balances.kick({ reorg: true });
+    expect(await s.balances.refresh()).toEqual({ pairs: 3, block: 150n }); // joins the kicked refresh
+    expect([...readTokens].sort()).toEqual([...tokens].sort());
+    expect(s.balances.stats().lastRefresh).toMatchObject({ candidates: 3, read: 3, fullSweep: true });
   } finally {
     await s.close();
   }

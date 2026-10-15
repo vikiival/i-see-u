@@ -105,6 +105,7 @@ const appWith = (
   discovery: DiscoveryService,
   adapter = adapterWith(),
   balances = balancesWith(async () => []),
+  alwaysRefreshTokens?: Address[],
 ) => createApp({
   discovery,
   adapters: { ethereum: adapter },
@@ -113,6 +114,7 @@ const appWith = (
   requestRpc: { limiter: createLimiter(2, 2), deadlineMs: 1_000 },
   rpcStats: stats,
   startedAt: Date.now() - 2_500,
+  alwaysRefreshTokens,
 });
 
 test('serializes bigint fields and labels each balance with the block it was read at', async () => {
@@ -160,7 +162,9 @@ test('serializes bigint fields and labels each balance with the block it was rea
     balance: '987654321',
     balanceStatus: 'ok',
     balanceBlock: '26000091',
+    balanceCurrent: false,
   }]);
+  expect(body.balancesCurrent).toBe(false);
 
   const withoutBalances = await app.request(`/v1/ethereum/accounts/${account}/erc20?balances=false`);
   expect(withoutBalances.status).toBe(200);
@@ -168,6 +172,57 @@ test('serializes bigint fields and labels each balance with the block it was rea
   const plain = await withoutBalances.json();
   expect(plain.tokens[0].balanceStatus).toBeUndefined();
   expect(plain.balancesAtBlockHeight).toBeUndefined();
+  expect(plain.balancesCurrent).toBeUndefined();
+});
+
+/** The erc20 response for `resultFor()` holdings (plus `extra` erc20 holdings) with the given snapshots. */
+async function erc20With(snapshots: BalanceSnapshot[], extra: DiscoveryResult['holdings'] = [], always?: Address[]) {
+  const discovery: DiscoveryService = {
+    async discover() {
+      const result = resultFor();
+      return result.status === 'ready' ? { ...result, holdings: [...result.holdings, ...extra] } : result;
+    },
+  };
+  const balances = balancesWith(async (_account, tokens) => tokens.map((token) => snapshots.find((s) => s.token === token)!));
+  const response = await appWith(discovery, adapterWith(), balances, always).request(`/v1/ethereum/accounts/${account}/erc20?balances=true`);
+  expect(response.status).toBe(200);
+  return response.json();
+}
+
+test('balanceCurrent: a snapshot older than blockHeight with no Transfer since (lastSeenBlock <= balanceBlock) is current', async () => {
+  const body = await erc20With([{ token: erc20, result: { status: 'ok', balance: 5n }, blockNumber: 26_000_110n, blockHash: hash(7) }]);
+  expect(body.balancesAtBlockHeight).toBe(false);
+  expect(body.tokens[0]).toMatchObject({ lastSeenBlock: '26000100', balanceBlock: '26000110', balanceCurrent: true });
+  expect(body.balancesCurrent).toBe(true);
+});
+
+test('balanceCurrent: false when a Transfer came after the snapshot (lastSeenBlock > balanceBlock), the read failed, or it is above blockHeight', async () => {
+  const [failed, above] = [address(4), address(6)];
+  const holding = (token: Address) => ({ token, standard: 'erc20' as const, firstBlock: 26_000_000n, lastBlock: 26_000_000n, sentCount: 0, receivedCount: 1 });
+  const body = await erc20With([
+    { token: erc20, result: { status: 'ok', balance: 5n }, blockNumber: 26_000_099n, blockHash: hash(7) },
+    { token: failed, result: { status: 'error', error: 'reverted' }, blockNumber: 26_000_110n, blockHash: hash(7) },
+    // Read at the tail tip while serving the finalized view: a tail Transfer may sit between blockHeight and the read.
+    { token: above, result: { status: 'ok', balance: 1n }, blockNumber: 26_000_130n, blockHash: hash(10) },
+  ], [holding(failed), holding(above)]);
+  const byToken = Object.fromEntries(body.tokens.map((t: { contract: string }) => [t.contract, t]));
+  expect(byToken[erc20]).toMatchObject({ lastSeenBlock: '26000100', balanceBlock: '26000099', balanceCurrent: false });
+  expect(byToken[failed]).toMatchObject({ balanceStatus: 'error', balanceCurrent: false });
+  expect(byToken[above]).toMatchObject({ balanceBlock: '26000130', balanceCurrent: false });
+  expect(body.balancesCurrent).toBe(false);
+});
+
+test('balanceCurrent: an always-refresh token is current only when read at blockHeight', async () => {
+  const atHeight = address(5);
+  const body = await erc20With([
+    { token: erc20, result: { status: 'ok', balance: 5n }, blockNumber: 26_000_110n, blockHash: hash(7) },
+    { token: atHeight, result: { status: 'ok', balance: 6n }, blockNumber: 26_000_123n, blockHash: hash(9) },
+  ], [{ token: atHeight, standard: 'erc20', firstBlock: 26_000_000n, lastBlock: 26_000_000n, sentCount: 0, receivedCount: 1 }],
+  [erc20, atHeight]);
+  const byToken = Object.fromEntries(body.tokens.map((t: { contract: string }) => [t.contract, t]));
+  expect(byToken[erc20]).toMatchObject({ balanceBlock: '26000110', balanceCurrent: false });
+  expect(byToken[atHeight]).toMatchObject({ balanceBlock: '26000123', balanceCurrent: true });
+  expect(body.balancesCurrent).toBe(false);
 });
 
 test('a syncing account answers 202 with progress; overload answers 503 with Retry-After', async () => {
