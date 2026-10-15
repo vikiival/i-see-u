@@ -5,29 +5,22 @@
     {
       "idx": 0,
       "version": "7",
-      "when": 1791985673717,
-      "tag": "0000_steady_nehzno",
+      "when": 1792094203509,
+      "tag": "0000_nebulous_kate_bishop",
       "breakpoints": true
     },
     {
       "idx": 1,
       "version": "7",
-      "when": 1791986411457,
-      "tag": "0001_overrated_tempest",
+      "when": 1792094990706,
+      "tag": "0001_balance_revision",
       "breakpoints": true
     },
     {
       "idx": 2,
       "version": "7",
-      "when": 1791986415775,
-      "tag": "0002_first_butterfly",
-      "breakpoints": true
-    },
-    {
-      "idx": 3,
-      "version": "7",
-      "when": 1791994118502,
-      "tag": "0003_clean_puck",
+      "when": 1792095903610,
+      "tag": "0002_tail_journal",
       "breakpoints": true
     }
   ]
