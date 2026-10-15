@@ -22,6 +22,8 @@ export interface HeadObservation {
   /** Epoch milliseconds when the head last advanced to a higher block number. */
   lastProgressAt: number;
   stale: boolean;
+  /** True when the latest refresh failed and this is the cached observation (then also stale). */
+  refreshFailed?: boolean;
 }
 
 export interface BlockRange {

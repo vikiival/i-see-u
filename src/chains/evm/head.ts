@@ -61,7 +61,7 @@ export function createHeadTracker(
       checkedAt = Date.now();
       if (observation && block.number < observation.block.number) {
         // A lagging node: keep the newer block, but flag it.
-        observation = { ...observation, stale: true };
+        observation = { block: observation.block, lastProgressAt: observation.lastProgressAt, stale: true };
       } else {
         const lastProgressAt = !observation || block.number > observation.block.number ? checkedAt : observation.lastProgressAt;
         observation = { block, lastProgressAt, stale: checkedAt - lastProgressAt > opts.maxNoProgressMs };
@@ -69,7 +69,7 @@ export function createHeadTracker(
     } catch (error) {
       if (!observation) throw error;
       checkedAt = Date.now();
-      observation = { ...observation, stale: true };
+      observation = { ...observation, stale: true, refreshFailed: true };
     }
     return observation;
   };

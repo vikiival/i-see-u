@@ -249,7 +249,15 @@ test('claim 3: a failed finalized-head poll is reported as stale', async () => {
     s.clock.t += 60_000;
     await s.follower.tick();
     // head.ts serves the cached head flagged stale; the follower must surface it.
-    expect(s.follower.status().stale).toBe(true);
+    expect(s.follower.status()).toMatchObject({
+      stale: true,
+      lastError: 'Finalized head refresh failed; serving cached head',
+      unhealthy: undefined, // still within maxLagBlocks and maxNoAdvanceMs
+    });
+
+    chain.failHead = false;
+    await s.follower.tick();
+    expect(s.follower.status()).toMatchObject({ stale: false, lastError: undefined });
   } finally {
     await s.close();
   }

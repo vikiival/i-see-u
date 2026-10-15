@@ -34,6 +34,7 @@ export interface FollowerOptions {
 /** More than one epoch behind means the follower is not keeping up, even if still within maxLagBlocks. */
 const STALE_LAG_BLOCKS = 32n;
 const MAX_REFOLDS = 8;
+const HEAD_REFRESH_FAILED = 'Finalized head refresh failed; serving cached head';
 
 const messageOf = (error: unknown): string => (error instanceof Error ? error.message : String(error)).slice(0, 200);
 
@@ -50,6 +51,8 @@ export function createFollower(o: FollowerOptions): Follower {
   let cursor: FollowerCursor | undefined;
   let headNumber: bigint | undefined;
   let lastError: string | undefined;
+  /** The last finalized head observation was flagged stale (failed refresh, lagging node or no progress). */
+  let headStale = false;
   let leader = false;
   let stopped = false;
   let ticking: Promise<void> | undefined;
@@ -110,6 +113,7 @@ export function createFollower(o: FollowerOptions): Follower {
       leader = o.lock ? await o.lock.tryAcquire() : true;
       if (!leader) tracked = undefined;
       const head = await adapter.finalizedHead();
+      headStale = head.stale;
       if (headNumber === undefined || head.block.number > headNumber) headNumber = head.block.number;
       cursor = await store.getFollowerCursor(network);
       if (leader) {
@@ -125,7 +129,7 @@ export function createFollower(o: FollowerOptions): Follower {
         }
         if (cursor.number > startedAt) o.onAdvance?.(cursor);
       }
-      lastError = undefined;
+      lastError = head.refreshFailed ? HEAD_REFRESH_FAILED : undefined;
     } catch (error) {
       lastError = messageOf(error);
       o.onError?.(error);
@@ -192,7 +196,7 @@ export function createFollower(o: FollowerOptions): Follower {
         lagBlocks,
         lastAdvanceAt,
         lastError,
-        stale: lastError !== undefined || lagBlocks > STALE_LAG_BLOCKS || idleMs > o.staleAfterMs,
+        stale: headStale || lastError !== undefined || lagBlocks > STALE_LAG_BLOCKS || idleMs > o.staleAfterMs,
         unhealthy,
       };
     },
