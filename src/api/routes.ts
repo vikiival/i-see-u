@@ -30,6 +30,8 @@ export interface RouteDeps {
   maxVerifyOwnershipItems?: number;
   rpcStats: () => RpcStats;
   startedAt: number;
+  /** Tokens whose balance changes without Transfer: only current when read at the served block (default none). */
+  alwaysRefreshTokens?: readonly Address[];
 }
 
 const booleanQuery = (value: string | undefined, name: string): boolean => {
@@ -157,6 +159,8 @@ export function createApp(deps: RouteDeps, opts: { requestLog?: boolean } = {}):
       : undefined;
 
     const withTail = deps.tails?.[result.network] !== undefined;
+    const always = new Set<string>(deps.alwaysRefreshTokens ?? []);
+    const current: boolean[] = [];
     const tokens = holdings.map((holding, i) => {
       const token = {
         contract: holding.token,
@@ -171,7 +175,17 @@ export function createApp(deps: RouteDeps, opts: { requestLog?: boolean } = {}):
       if (!snapshot) return token;
       const { result: balance } = snapshot;
       // A tail-tip block can be reorged out, so with the tail the balance is also pinned by hash.
-      const at = { balanceBlock: snapshot.blockNumber.toString(), ...(withTail && { balanceBlockHash: snapshot.blockHash }) };
+      // Current: read at the served block, or no Transfer of this token touched the account between the read and it.
+      // A read above blockHeight (finalized view, tail on) may postdate a Transfer the finalized holdings do not show.
+      const balanceCurrent = (snapshot.blockNumber === result.blockHeight && snapshot.blockHash === result.blockHash)
+        || (balance.status === 'ok' && holding.lastBlock <= snapshot.blockNumber
+          && snapshot.blockNumber <= result.blockHeight && !always.has(holding.token));
+      current.push(balanceCurrent);
+      const at = {
+        balanceBlock: snapshot.blockNumber.toString(),
+        ...(withTail && { balanceBlockHash: snapshot.blockHash }),
+        balanceCurrent,
+      };
       return balance.status === 'ok'
         ? { ...token, balance: balance.balance.toString(), balanceStatus: balance.status, ...at }
         : { ...token, balanceStatus: balance.status, balanceError: balance.error, ...at };
@@ -180,7 +194,9 @@ export function createApp(deps: RouteDeps, opts: { requestLog?: boolean } = {}):
     const balancesAtBlockHeight = balances && balances.every((snapshot) =>
       snapshot.blockNumber === result.blockHeight && snapshot.blockHash === result.blockHash);
 
-    return c.json({ ...baseJson(result), balancesAtBlockHeight, tokens, scan: scanJson(result) });
+    const balancesCurrent = balances && current.every(Boolean);
+
+    return c.json({ ...baseJson(result), balancesAtBlockHeight, balancesCurrent, tokens, scan: scanJson(result) });
   });
 
   app.get('/v1/:network/accounts/:address/erc721', async (c) => {

@@ -63,7 +63,7 @@ HyperSync serves through the unfinalized chain head, but this service queries on
 
 | Endpoint | Returns |
 |---|---|
-| `GET /v1/ethereum/accounts/{address}/erc20?balances=true&finality=latest` | `{ status: "ready", blockHeight, blockHash, finality, finalizedBlockHeight?, finalizedBlockHash?, tailError?, …, tokens: [{ contract, …, sentCount, receivedCount, unfinalizedSentCount?, unfinalizedReceivedCount?, balance?, balanceBlock?, balanceBlockHash? }] }` |
+| `GET /v1/ethereum/accounts/{address}/erc20?balances=true&finality=latest` | `{ status: "ready", blockHeight, blockHash, finality, finalizedBlockHeight?, finalizedBlockHash?, tailError?, …, tokens: [{ contract, …, sentCount, receivedCount, unfinalizedSentCount?, unfinalizedReceivedCount?, balance?, balanceBlock?, balanceBlockHash?, balanceCurrent? }], balancesAtBlockHeight?, balancesCurrent? }` |
 | `GET /v1/ethereum/accounts/{address}/erc721?verifyOwnership=true&finality=latest` | `{ status: "ready", blockHeight, blockHash, …, collections: [{ contract, tokens: [{ tokenId, heldBySeenLogs, unfinalized?, owner?, ownedByAccount? }] }] }` |
 | either, while the account's backfill runs | **HTTP 202** `{ status: "syncing", progressBlocks, targetBlocks, followerLagBlocks }` with `Retry-After: 2` |
 | `GET /health` | uptime; follower, tail (tip/lag/reorg depth/health), and balance status; source and RPC stats |
@@ -71,6 +71,8 @@ HyperSync serves through the unfinalized chain head, but this service queries on
 Chain quantities are decimal strings; `dataAgeS` is an integer. `finality` defaults to `latest` while the tail is enabled and healthy. Then `blockHeight`/`blockHash` identify the tail tip and `finalizedBlockHeight`/`finalizedBlockHash` identify its durable base. `finality=finalized` returns the original finalized discovery shape (only `balanceBlockHash` is added per balance while the tail is enabled; with `TAIL_ENABLED=false` every response is exactly the pre-tail shape). An unhealthy tail safely falls back to finalized and adds `tailError`. Cursor, holdings, matching tail Transfers, and tail tip are read in one repeatable-read transaction, so a concurrent finalization prune cannot double-count or omit a Transfer.
 
 Each balance carries `balanceBlock`, and with the tail enabled also `balanceBlockHash` (EIP-1898; a tail block can be reorged out). With the tail enabled, reads target the tail tip hash (also for `finality=finalized`, so `balanceBlock` can be above `blockHeight`); otherwise they target the finalized cursor. A snapshot is never relabelled at a later block, and `balancesAtBlockHeight` is true only when both number and hash match the served block. Balances refresh every `BALANCE_REFRESH_MS`, not every block, so with the tail they usually trail `blockHeight` by a few blocks and `balancesAtBlockHeight` is usually false.
+
+`balanceCurrent` means no Transfer of this token touched the account between `balanceBlock` and `blockHeight` (true as well when the balance was read at the served block; false for a failed read, and for a read above `blockHeight`, where the finalized view cannot rule out a later tail Transfer); tokens that change without Transfer (`BALANCE_ALWAYS_REFRESH_TOKENS`) are only current when read at `blockHeight`. `balancesCurrent` (only with `balances=true`) is true when every token's `balanceCurrent` is.
 
 Errors: 400 (address/flags), 404 (network), 503 with `Retry-After` when the follower is unhealthy (too far behind or not advancing), the RPC is down, or request-path RPC is saturated or past `REQUEST_DEADLINE_MS`.
 
