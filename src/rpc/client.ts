@@ -3,6 +3,7 @@ import { HttpRequestError, RpcRequestError, TimeoutError, http } from 'viem';
 import type { EIP1193RequestFn } from 'viem';
 
 import type { RpcClient, RpcErrorKind, RpcRequestOptions, RpcStats } from '../core/types.ts';
+import { isObject, isString } from '../core/parse.ts';
 import { RpcError, classify } from './errors.ts';
 
 export interface RpcClientOptions {
@@ -45,20 +46,16 @@ const retryAfterMs = (value: string | null | undefined): number => {
   return Number.isNaN(at) ? 0 : Math.max(0, at - Date.now());
 };
 
-function* causes(error: unknown): Generator<unknown> {
-  const seen = new Set<unknown>();
-
-  for (let current = error; current && typeof current === 'object' && !seen.has(current); current = (current as { cause?: unknown }).cause) {
-    seen.add(current);
-    yield current;
-  }
-}
-
+/** The first string `code` (e.g. ECONNRESET) along a thrown value's cause chain. */
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- boundary parser: walks the cause chain of an arbitrary thrown value
 const networkMessage = (error: unknown): string => {
-  for (const cause of causes(error)) {
-    const code = (cause as { code?: unknown }).code;
+  const seen = new Set<object>();
 
-    if (typeof code === 'string') return `RPC network error: ${code}`;
+  for (let current = error; isObject(current) && !seen.has(current); current = 'cause' in current ? current.cause : undefined) {
+    seen.add(current);
+    const code = 'code' in current ? current.code : undefined;
+
+    if (isString(code)) return `RPC network error: ${code}`;
   }
 
   return 'RPC network error: fetch failed';
@@ -77,6 +74,7 @@ const networkMessage = (error: unknown): string => {
  */
 const timeoutMessage = /timed? ?out|timeout/i;
 
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- boundary parser: maps whatever the transport threw into an RpcError
 const failureOf = (error: unknown, response: Response | undefined): RpcError => {
   if (error instanceof RpcError) return error;
 
@@ -138,11 +136,11 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
     };
   });
 
-  const counters = {
+  const counters: Pick<RpcStats, 'requests' | 'attempts' | 'byMethod' | 'errors'> = {
     requests: 0,
     attempts: 0,
-    byMethod: {} as Record<string, number>,
-    errors: {} as Record<string, number>,
+    byMethod: {},
+    errors: {},
   };
 
   const bucketCapacity = Math.max(1, options.maxRps);
@@ -246,8 +244,8 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
       try {
         const result = await attemptResponse.run(
           value => { response = value; },
-          () => endpoint.send({ method, params } as never),
-        ) as T | undefined;
+          () => endpoint.send({ method, params }),
+        );
 
         if (result === undefined) throw new RpcError('fatal', 'Malformed JSON-RPC response');
 
@@ -258,7 +256,9 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
         recordSuccess(endpoint);
         report(true);
 
-        return result;
+        // SAFETY: T is the caller's declared result type for `method`: the transport returns the JSON-RPC `result`
+        // parsed from the response body, checked by the caller's `validate` above where the shape is not guaranteed.
+        return result as T;
       } catch (cause) {
         const error = failureOf(cause, response);
         lastError = error;
