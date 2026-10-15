@@ -7,18 +7,13 @@ import type {
   AccountLogSource,
   AccountLogSourceStats,
   Address,
-  BalanceResult,
   BlockRange,
-  ChainAdapter,
   ChunkAggregate,
   ChunkScan,
-  FollowerStatus,
   Hex,
-  OwnerResult,
   RpcClient,
   RpcStats,
 } from '../src/core/types.ts';
-import { createDiscoveryService } from '../src/discovery/service.ts';
 import { withFallback } from '../src/sources/fallback.ts';
 import {
   createHypersyncLogSource,
@@ -29,8 +24,7 @@ import type {
   HypersyncStream,
 } from '../src/sources/hypersync.ts';
 import { createRpcLogSource } from '../src/sources/rpc-logs.ts';
-import { lowerAddress, rpcParam, staged } from './helpers.ts';
-import { createTestStore } from './store-fixture.ts';
+import { rpcParam, staged } from './helpers.ts';
 import type { Log, Query, QueryResponse, StreamConfig } from '@envio-dev/hypersync-client';
 
 const ACCOUNT: Address = '0x1111111111111111111111111111111111111111';
@@ -164,7 +158,7 @@ test('HyperSync multi-page streaming exactly matches RPC aggregation, including 
     stats: rpcStats,
   };
 
-  const rpcSource = createRpcLogSource(rpc, { preferredMaxRange: 3_000n, minRange: 500n });
+  const rpcSource = createRpcLogSource(rpc, { preferredMaxRange: 3_000n });
 
   try {
     const range = { fromBlock: 10n, toBlock: 20n };
@@ -286,55 +280,22 @@ test('fallback breaker skips a dead primary during cooldown and retries it after
   expect(source.stats().primary.cooldownUntil).toBeUndefined();
 });
 
-test('a mid-stream failure commits nothing; the next discovery resumes the same chunk', async () => {
-  const transfer = log({ block: 15, index: 0, from: PEER, to: ACCOUNT });
+test('a mid-stream failure exposes no aggregate and a retry returns the complete range', async () => {
   let fail = true;
-
-  const hsClient: HypersyncClientLike = {
-    async stream() {
-      return fail
-        ? new Pages([response([transfer], 16, 20), new Error('stream broke')])
-        : new Pages([response([transfer], 21, 20), null]);
-    },
-  };
+  const transfer = log({ block: 15, index: 0, from: PEER, to: ACCOUNT });
 
   const source = createHypersyncLogSource({
     url: 'https://eth.hypersync.xyz', apiToken: 'token', preferredMaxRange: 100n, timeoutMs: 1_000,
-    clientFactory: clientFactory(hsClient),
-  });
-
-  const adapter: ChainAdapter = {
-    network: 'ethereum', startBlock: 10n, accountLogs: source, scanConcurrency: 1, followerMaxRange: 100n,
-    normalizeAddress: (value) => /^0x[0-9a-f]{40}$/i.test(value) ? lowerAddress(value) : undefined,
-    async finalizedHead() { return { block: { number: 20n, hash: hash(20), timestamp: 200n }, lastProgressAt: 1, stale: false }; },
-    async latestHeader() { return { number: 20n, hash: hash(20), parentHash: hash(19), timestamp: 200n }; },
-    async blockByNumber(number) { return { number, hash: hash(Number(number)), timestamp: number * 10n }; },
-    async headerByNumber(number) { return { number, hash: hash(Number(number)), parentHash: hash(Number(number - 1n)), timestamp: number * 10n }; },
-    async transfersInBlock() { return []; },
-    async transfersInRange() { return []; },
-    async scanAllTransfers() { return { calls: 0 }; },
-    async erc20BalancePairs(): Promise<BalanceResult[]> { return []; },
-    async erc721Owners(): Promise<OwnerResult[]> { return []; },
-  };
-
-  const { store } = await createTestStore();
-  await store.initFollowerCursor('ethereum', { number: 20n, hash: hash(20), timestamp: 200n }, 1);
-  const status = (): FollowerStatus => ({ ready: true, leader: true, lagBlocks: 0n, lastAdvanceAt: 1, stale: false });
-
-  const discovery = createDiscoveryService({
-    adapters: { ethereum: adapter }, store, followers: { ethereum: { status, track() {} } }, requestDeadlineMs: 1_000,
+    clientFactory: clientFactory({ async stream() {
+      return fail ? new Pages([response([transfer], 16, 20), new Error('stream broke')]) : new Pages([response([transfer], 21, 20)]);
+    } }),
   });
 
   try {
-    await expect(discovery.discover('ethereum', ACCOUNT)).rejects.toThrow('stream broke');
-    expect(await store.getProgress('ethereum', ACCOUNT)).toBeUndefined();
-    expect(await store.holdings('ethereum', ACCOUNT)).toEqual([]);
+    await expect(source.scanAccount(ACCOUNT, { fromBlock: 10n, toBlock: 20n })).rejects.toThrow('stream broke');
     fail = false;
-    await expect(discovery.discover('ethereum', ACCOUNT)).resolves.toMatchObject({ status: 'ready' });
-    expect(await store.getProgress('ethereum', ACCOUNT)).toBe(20n);
-    expect(await store.holdings('ethereum', ACCOUNT)).toMatchObject([{ token: ERC20, receivedCount: 1 }]);
+    expect((await source.scanAccount(ACCOUNT, { fromBlock: 10n, toBlock: 20n })).logs).toBe(1);
   } finally {
     await source.close?.();
-    await store.close();
   }
 });

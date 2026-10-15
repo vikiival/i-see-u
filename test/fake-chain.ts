@@ -7,7 +7,6 @@ import { MULTICALL3 } from '../src/chains/evm/multicall.ts';
 import { addTransfer, emptyAggregate } from '../src/core/aggregate.ts';
 import type { Address, BlockHeader, BlockRef, ChainAdapter, ChunkAggregate, Hex, RpcClient, TransferEvent } from '../src/core/types.ts';
 import { RpcError } from '../src/rpc/errors.ts';
-import { createRpcLogSource } from '../src/sources/rpc-logs.ts';
 import { lowerAddress, rpcParam, staged } from './helpers.ts';
 
 export const address = (n: number): Address => `0x${n.toString(16).padStart(40, '0')}`;
@@ -219,20 +218,14 @@ export class FakeChain {
 
   adapter(overrides: Partial<{
     startBlock: bigint;
-    logsMaxRange: bigint;
     followerMaxRange: bigint;
-    scanConcurrency: number;
     multicallBatch: number;
   }> = {}): ChainAdapter {
-    const logsMaxRange = overrides.logsMaxRange ?? 1_000n;
-
     return createEvmAdapter(this.rpc, {
       network: 'ethereum',
       chain: mainnet,
       startBlock: 100n,
-      accountLogs: createRpcLogSource(this.rpc, { preferredMaxRange: logsMaxRange, minRange: 1n }),
       finalizedMaxNoProgressMs: 1_200_000,
-      scanConcurrency: 2,
       followerMaxRange: 500n,
       multicallBatch: 1_000,
       multicall3: MULTICALL3,
