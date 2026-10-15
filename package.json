@@ -26,9 +26,11 @@
     "viem": "^2.57.6"
   },
   "devDependencies": {
+    "@oxlint/plugins": "1.88.0",
     "@types/node": "^26.6.5",
     "@types/pg": "^8.23.1",
     "drizzle-kit": "^0.31.11",
+    "oxlint": "1.88.0",
     "typescript": "^7.0.2",
     "vitest": "^5.0.4"
   }
