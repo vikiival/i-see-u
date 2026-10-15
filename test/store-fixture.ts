@@ -10,5 +10,6 @@ export async function createTestStore() {
   const client = new PGlite();
   const db = drizzle(client, { schema });
   await migrate(db, { migrationsFolder });
+
   return { client, db, store: createStore(db, () => client.close()) };
 }

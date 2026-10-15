@@ -3,6 +3,7 @@ import type { Log, Query, QueryResponse, StreamConfig } from '@envio-dev/hypersy
 
 import { addTransfer, aggregateLogCount, emptyAggregate } from '../core/aggregate.ts';
 import type { AccountLogSource, AccountLogSourceStats, Address, BlockRange } from '../core/types.ts';
+import { isNumber, isObject, thrownMessage } from '../core/parse.ts';
 import { decodeTransferLog } from '../chains/evm/logs.ts';
 import type { WireLog } from '../chains/evm/logs.ts';
 import { TRANSFER_TOPIC } from '../chains/evm/logs.ts';
@@ -31,21 +32,25 @@ export interface HypersyncSourceOptions {
   clientFactory?: () => Promise<HypersyncFactoryResult>;
 }
 
-const integer = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0;
+const integer = (value: unknown): value is number => isNumber(value) && Number.isSafeInteger(value) && value >= 0;
 const quantity = (value: number): `0x${string}` => `0x${value.toString(16)}`;
 
-const redact = (value: unknown, secrets: string[]): string => {
-  let message = value instanceof Error ? value.message : String(value);
+const redact = (raw: string, secrets: string[]): string => {
+  let message = raw;
+
   for (const secret of secrets) if (secret) message = message.split(secret).join('[redacted]');
   message = message
     .replace(/(api[-_ ]?key|api[-_ ]?token|authorization)\s*[:=]\s*\S+/gi, '$1=[redacted]')
     .replace(/(https?:\/\/[^\s/]+)\/\S+/gi, '$1/***');
+
   return (message.trim().replace(/\s+/g, ' ') || 'HyperSync request failed').slice(0, 200);
 };
 
 const wireLog = (log: Log): WireLog => {
   const topics = [...log.topics];
+
   while (topics.at(-1) == null) topics.pop();
+
   return {
     address: log.address,
     topics,
@@ -68,6 +73,7 @@ export function createHypersyncLogSource(options: HypersyncSourceOptions): Accou
 
   const factory = options.clientFactory ?? (async () => {
     const { HypersyncClient, JoinMode } = await import('@envio-dev/hypersync-client');
+
     return {
       client: new HypersyncClient({
         url: options.url,
@@ -77,8 +83,10 @@ export function createHypersyncLogSource(options: HypersyncSourceOptions): Accou
       joinNothing: JoinMode.JoinNothing,
     };
   });
+
   const getClient = (): Promise<HypersyncFactoryResult> => {
     if (closed) throw new Error('HyperSync source is closed');
+
     return client ??= factory();
   };
 
@@ -89,9 +97,11 @@ export function createHypersyncLogSource(options: HypersyncSourceOptions): Accou
     setOwnedStream: (stream: HypersyncStream | undefined) => void,
   ) => {
     const exclusive = range.toBlock + 1n;
+
     if (range.fromBlock < 0n || exclusive > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error('HyperSync block range is not safely representable');
     const { client: hs, joinNothing } = await getClient();
     const paddedAccount = pad(account, { size: 32 }).toLowerCase();
+
     const query: Query = {
       fromBlock: Number(range.fromBlock),
       toBlock: Number(exclusive),
@@ -102,30 +112,40 @@ export function createHypersyncLogSource(options: HypersyncSourceOptions): Accou
       ],
       fieldSelection: { log: ['BlockNumber', 'BlockHash', 'LogIndex', 'TransactionHash', 'Address', 'Topic0', 'Topic1', 'Topic2', 'Topic3', 'Data'] },
     };
+
     const aggregate = emptyAggregate();
     let stream: HypersyncStream | undefined;
     let pages = 0;
     let nextBlock = Number(range.fromBlock);
+
     try {
       stream = await hs.stream(query, {});
+
       if (timedOut()) throw new Error('HyperSync request timed out');
       setOwnedStream(stream);
       active.add(stream);
+
       for (;;) {
         const response = await stream.recv();
+
         if (!response) break;
         pages += 1;
+
         if (!integer(response.archiveHeight) || BigInt(response.archiveHeight) < range.toBlock) {
           throw new Error('HyperSync response archive height is below the requested range');
         }
+
         if (!integer(response.nextBlock) || response.nextBlock < nextBlock || response.nextBlock > Number(exclusive)) {
           throw new Error('HyperSync returned a malformed next block');
         }
+
         if (!response.data || !Array.isArray(response.data.logs)) throw new Error('HyperSync returned malformed log data');
         nextBlock = response.nextBlock;
+
         for (const raw of response.data.logs) {
-          if (!raw || typeof raw !== 'object' || !Array.isArray(raw.topics)) throw new Error('HyperSync returned a malformed log');
+          if (!isObject(raw) || !Array.isArray(raw.topics)) throw new Error('HyperSync returned a malformed log');
           const event = decodeTransferLog(wireLog(raw));
+
           if (event) addTransfer(aggregate, account, event);
         }
       }
@@ -136,7 +156,9 @@ export function createHypersyncLogSource(options: HypersyncSourceOptions): Accou
         await stream.close().catch(() => {});
       }
     }
+
     if (pages === 0 || nextBlock < Number(exclusive)) throw new Error('HyperSync stream ended before the requested range completed');
+
     return { aggregate, calls: 1, logs: aggregateLogCount(aggregate), heavy: false };
   };
 
@@ -150,20 +172,24 @@ export function createHypersyncLogSource(options: HypersyncSourceOptions): Accou
       let expired = false;
       let ownedStream: HypersyncStream | undefined;
       const work = scan(account, range, () => expired, (stream) => { ownedStream = stream; });
+
       const timeout = new Promise<never>((_resolve, reject) => {
         timer = setTimeout(() => {
           expired = true;
+
           if (ownedStream) void ownedStream.close().catch(() => {});
           reject(new Error(`HyperSync request timed out after ${options.timeoutMs} ms`));
         }, options.timeoutMs);
       });
+
       try {
         const result = await Promise.race([work, timeout]);
         state.logs += result.logs;
+
         return result;
       } catch (error) {
         state.failures += 1;
-        state.lastError = redact(error, secrets);
+        state.lastError = redact(thrownMessage(error), secrets);
         throw new Error(state.lastError);
       } finally {
         clearTimeout(timer);

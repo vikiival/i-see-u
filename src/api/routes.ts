@@ -4,11 +4,15 @@ import type { ContentfulStatusCode } from 'hono/utils/http-status';
 
 import type { BalanceWorker, RequestRpc } from '../balances/worker.ts';
 import { unavailable, withDeadline } from '../core/limiter.ts';
+import { isNumber } from '../core/parse.ts';
 import type {
+  Address,
   ChainAdapter,
   DiscoveryResult,
   DiscoveryService,
   FollowerStatus,
+  Hex,
+  OwnerResult,
   RpcStats,
   SyncingResult,
   TailStatus,
@@ -23,18 +27,24 @@ export interface RouteDeps {
   tails?: Record<string, { status(): TailStatus }>;
   /** Bounds request-path RPC that remains (ownership verification). */
   requestRpc: RequestRpc;
+  /** Held-item cap for verifyOwnership (default 2000). */
+  maxVerifyOwnershipItems?: number;
   rpcStats: () => RpcStats;
   startedAt: number;
+  /** Tokens whose balance changes without Transfer: only current when read at the served block (default none). */
+  alwaysRefreshTokens?: readonly Address[];
 }
 
 const booleanQuery = (value: string | undefined, name: string): boolean => {
   if (value === undefined || value === 'false' || value === '0') return false;
+
   if (value === 'true' || value === '1') return true;
   throw Object.assign(new Error(`Invalid boolean query value for ${name}`), { statusCode: 400 });
 };
 
 const finalityQuery = (value: string | undefined): 'latest' | 'finalized' | undefined => {
   if (value === undefined) return undefined;
+
   if (value === 'latest' || value === 'finalized') return value;
   throw Object.assign(new Error('Invalid finality; expected latest or finalized'), { statusCode: 400 });
 };
@@ -86,31 +96,76 @@ const statusJson = (status: FollowerStatus) => ({
   unhealthy: status.unhealthy,
 });
 
-const statusCodeOf = (error: unknown): number | undefined => {
-  const statusCode = (error as { statusCode?: unknown } | null)?.statusCode;
-  return typeof statusCode === 'number' && statusCode >= 400 && statusCode <= 599 ? statusCode : undefined;
+/** The 4xx/5xx `statusCode` (and `retryAfterS`) attached to an error with Object.assign, e.g. by unavailable(). */
+const statusOf = (error: Error): { statusCode: ContentfulStatusCode; retryAfterS: number | undefined } | undefined => {
+  const statusCode = 'statusCode' in error ? error.statusCode : undefined;
+
+  if (!isNumber(statusCode) || statusCode < 400 || statusCode > 599) return undefined;
+  const retryAfterS = 'retryAfterS' in error ? error.retryAfterS : undefined;
+
+  return {
+    // SAFETY: checked to be 400-599 above; every such status carries a body, and Hono sends the number unchanged.
+    statusCode: statusCode as ContentfulStatusCode,
+    retryAfterS: isNumber(retryAfterS) ? retryAfterS : undefined,
+  };
 };
 
 export function createApp(deps: RouteDeps, opts: { requestLog?: boolean } = {}): Hono {
   const app = new Hono();
+
   // Middleware lives on this app (not a parent) so its notFound/onError handlers stay in effect.
   if (opts.requestLog) app.use('*', logger());
 
+  // Single-flight + short cache per account and block, so polling clients share one ownerOf sweep.
+  const ownerCache = new Map<string, Promise<OwnerResult[]>>();
+
+  const ownersFor = (key: string, adapter: ChainAdapter, items: { token: Address; tokenId: bigint }[], blockHash: Hex) => {
+    const hit = ownerCache.get(key);
+
+    if (hit) return hit;
+
+    const promise = deps.requestRpc.limiter.run(
+      () => adapter.erc721Owners(items, blockHash),
+      { deadlineAt: Date.now() + deps.requestRpc.deadlineMs },
+    );
+
+    ownerCache.set(key, promise);
+    promise.catch(() => { if (ownerCache.get(key) === promise) ownerCache.delete(key); });
+
+    // Evict oldest first (Map iterates in insertion order; deleting while iterating is safe).
+    for (const oldest of ownerCache.keys()) {
+      if (ownerCache.size <= 1000) break;
+      ownerCache.delete(oldest);
+    }
+
+    return promise;
+  };
+
   app.onError((error, c) => {
-    const statusCode = statusCodeOf(error);
-    if (statusCode !== undefined) {
-      const retryAfterS = (error as { retryAfterS?: unknown }).retryAfterS;
-      if (typeof retryAfterS === 'number') c.header('Retry-After', String(retryAfterS));
-      return c.json({ error: error.message || 'Request failed' }, statusCode as ContentfulStatusCode);
+    const status = statusOf(error);
+
+    if (status !== undefined) {
+      if (status.retryAfterS !== undefined) c.header('Retry-After', String(status.retryAfterS));
+
+      return c.json({ error: error.message || 'Request failed' }, status.statusCode);
     }
 
     const kind = rpcErrorOf(error)?.kind;
+
     if (kind === 'rate_limited' || kind === 'transient') {
       c.header('Retry-After', '5');
+
       return c.json({ error: 'RPC temporarily unavailable' }, 503);
     }
 
+    if (/timeout exceeded when trying to connect/i.test(error.message)) {
+      c.header('Retry-After', '2');
+
+      return c.json({ error: 'Database busy' }, 503);
+    }
+
     console.error('request failed', error);
+
     return c.json({ error: 'Internal server error' }, 500);
   });
 
@@ -121,17 +176,24 @@ export function createApp(deps: RouteDeps, opts: { requestLog?: boolean } = {}):
     const includeBalances = booleanQuery(c.req.query('balances'), 'balances');
     const finality = finalityQuery(c.req.query('finality'));
     const result = await deps.discovery.discover(c.req.param('network'), c.req.param('address'), finality);
+
     if (result.status === 'syncing') {
       c.header('Retry-After', '2');
+
       return c.json(syncingJson(result), 202);
     }
+
     const holdings = result.holdings.filter((holding) => holding.standard === 'erc20');
     const at = { number: result.blockHeight, hash: result.blockHash, timestamp: result.blockTimestamp };
+
     const balances = includeBalances
       ? await deps.balances[result.network].forAccount(result.account, holdings.map((h) => h.token), at)
       : undefined;
 
     const withTail = deps.tails?.[result.network] !== undefined;
+    const always = new Set<string>(deps.alwaysRefreshTokens ?? []);
+    const current: boolean[] = [];
+
     const tokens = holdings.map((holding, i) => {
       const token = {
         contract: holding.token,
@@ -142,70 +204,118 @@ export function createApp(deps: RouteDeps, opts: { requestLog?: boolean } = {}):
         ...(holding.unfinalizedSentCount && { unfinalizedSentCount: holding.unfinalizedSentCount }),
         ...(holding.unfinalizedReceivedCount && { unfinalizedReceivedCount: holding.unfinalizedReceivedCount }),
       };
+
       const snapshot = balances?.[i];
+
       if (!snapshot) return token;
       const { result: balance } = snapshot;
+
       // A tail-tip block can be reorged out, so with the tail the balance is also pinned by hash.
-      const at = { balanceBlock: snapshot.blockNumber.toString(), ...(withTail && { balanceBlockHash: snapshot.blockHash }) };
+      // Current: read at the served block, or no Transfer of this token touched the account between the read and it.
+      // A read above blockHeight (finalized view, tail on) may postdate a Transfer the finalized holdings do not show.
+      const balanceCurrent = (snapshot.blockNumber === result.blockHeight && snapshot.blockHash === result.blockHash)
+        || (balance.status === 'ok' && holding.lastBlock <= snapshot.blockNumber
+          && snapshot.blockNumber <= result.blockHeight && !always.has(holding.token));
+
+      current.push(balanceCurrent);
+
+      const at = {
+        balanceBlock: snapshot.blockNumber.toString(),
+        ...(withTail && { balanceBlockHash: snapshot.blockHash }),
+        balanceCurrent,
+      };
+
       return balance.status === 'ok'
         ? { ...token, balance: balance.balance.toString(), balanceStatus: balance.status, ...at }
         : { ...token, balanceStatus: balance.status, balanceError: balance.error, ...at };
     });
+
     // Balances are labelled with the block they were read at; true when every one was read at blockHeight.
     const balancesAtBlockHeight = balances && balances.every((snapshot) =>
       snapshot.blockNumber === result.blockHeight && snapshot.blockHash === result.blockHash);
 
-    return c.json({ ...baseJson(result), balancesAtBlockHeight, tokens, scan: scanJson(result) });
+    const balancesCurrent = balances && current.every(Boolean);
+
+    return c.json({ ...baseJson(result), balancesAtBlockHeight, balancesCurrent, tokens, scan: scanJson(result) });
   });
 
   app.get('/v1/:network/accounts/:address/erc721', async (c) => {
     const verifyOwnership = booleanQuery(c.req.query('verifyOwnership'), 'verifyOwnership');
     const finality = finalityQuery(c.req.query('finality'));
     const result = await deps.discovery.discover(c.req.param('network'), c.req.param('address'), finality);
+
     if (result.status === 'syncing') {
       c.header('Retry-After', '2');
+
       return c.json(syncingJson(result), 202);
     }
+
     const heldItems = result.nftItems.filter((item) => item.heldBySeenLogs);
     const adapter = deps.adapters[result.network];
-    const owners = verifyOwnership && heldItems.length > 0
+    const cap = deps.maxVerifyOwnershipItems ?? 2000;
+    const skipped = verifyOwnership && heldItems.length > cap;
+
+    const owners = verifyOwnership && !skipped && heldItems.length > 0
       ? await withDeadline(
-        deps.requestRpc.limiter.run(() => adapter.erc721Owners(heldItems, result.blockHash)),
+        ownersFor(`${result.network}:${result.account}:${result.blockHash}`, adapter, heldItems, result.blockHash),
         deps.requestRpc.deadlineMs,
         () => { throw unavailable('Ownership verification did not finish within the request deadline', 2); },
       )
       : [];
+
     const ownerOf = new Map(heldItems.map((item, i) => [item, owners[i]]));
 
     // Collections in holdings order; bounds come from the holding, widened by any item seen later.
     const bounds = new Map<string, { first: bigint; last: bigint }>();
+
     for (const holding of result.holdings) {
       if (holding.standard === 'erc721') bounds.set(holding.token, { first: holding.firstBlock, last: holding.lastBlock });
     }
+
     for (const item of result.nftItems) {
       const b = bounds.get(item.token);
+
       if (!b) bounds.set(item.token, { first: item.lastBlock, last: item.lastBlock });
       else if (item.lastBlock > b.last) b.last = item.lastBlock;
+    }
+
+    const byToken = new Map<string, typeof result.nftItems>();
+
+    for (const item of result.nftItems) {
+      const list = byToken.get(item.token);
+
+      if (list) list.push(item);
+      else byToken.set(item.token, [item]);
     }
 
     const collections = [...bounds].map(([contract, { first, last }]) => ({
       contract,
       firstSeenBlock: first.toString(),
       lastSeenBlock: last.toString(),
-      tokens: result.nftItems.filter((item) => item.token === contract).map((item) => {
+      tokens: (byToken.get(contract) ?? []).map((item) => {
         const token = {
           tokenId: item.tokenId.toString(),
           heldBySeenLogs: item.heldBySeenLogs,
           ...(item.unfinalized && { unfinalized: true }),
         };
+
         if (!verifyOwnership || !item.heldBySeenLogs) return token;
+
+        if (skipped) return { ...token, ownerStatus: 'skipped' };
         const owner = ownerOf.get(item);
+
         if (owner?.status !== 'ok') return { ...token, ownerStatus: 'error' };
+
         return { ...token, owner: owner.owner, ownedByAccount: owner.owner === result.account, ownerStatus: owner.status };
       }),
     }));
 
-    return c.json({ ...baseJson(result), collections, scan: scanJson(result) });
+    return c.json({
+      ...baseJson(result),
+      ...(skipped && { ownershipError: `Too many held items to verify (${heldItems.length} > ${cap})` }),
+      collections,
+      scan: scanJson(result),
+    });
   });
 
   app.get('/health', (c) => c.json({
@@ -214,6 +324,7 @@ export function createApp(deps: RouteDeps, opts: { requestLog?: boolean } = {}):
     followers: Object.fromEntries(Object.entries(deps.followers).map(([network, f]) => [network, statusJson(f.status())])),
     ...(deps.tails && Object.keys(deps.tails).length > 0 && { tails: Object.fromEntries(Object.entries(deps.tails).map(([network, tail]) => {
       const status = tail.status();
+
       return [network, {
         enabled: status.enabled,
         tip: status.tipNumber === undefined ? undefined : { number: status.tipNumber.toString(), hash: status.tipHash },
@@ -228,12 +339,16 @@ export function createApp(deps: RouteDeps, opts: { requestLog?: boolean } = {}):
     })) }),
     balances: Object.fromEntries(Object.entries(deps.balances).map(([network, b]) => {
       const { activeAccounts, lastRefresh } = b.stats();
+
       return [network, {
         activeAccounts,
         lastRefresh: lastRefresh && {
           at: new Date(lastRefresh.at).toISOString(),
           block: lastRefresh.block?.toString(),
           pairs: lastRefresh.pairs,
+          candidates: lastRefresh.candidates,
+          read: lastRefresh.read,
+          fullSweep: lastRefresh.fullSweep,
         },
       }];
     })),

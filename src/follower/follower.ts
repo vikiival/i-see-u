@@ -1,4 +1,5 @@
 import { addTransfer, emptyAggregate } from '../core/aggregate.ts';
+import { thrownMessage } from '../core/parse.ts';
 import type {
   Address,
   BlockRange,
@@ -28,13 +29,15 @@ export interface FollowerOptions {
   now?: () => number;
   /** Called once per tick that advanced the cursor (e.g. to refresh balances at the new block). */
   onAdvance?: (cursor: FollowerCursor) => void;
-  onError?: (error: unknown) => void;
+  /** The message of each tick failure. */
+  onError?: (message: string) => void;
 }
 
 /** More than one epoch behind means the follower is not keeping up, even if still within maxLagBlocks. */
 const STALE_LAG_BLOCKS = 32n;
+const MAX_REFOLDS = 8;
+const HEAD_REFRESH_FAILED = 'Finalized head refresh failed; serving cached head';
 
-const messageOf = (error: unknown): string => (error instanceof Error ? error.message : String(error)).slice(0, 200);
 
 /**
  * One finalized follower per network. Each tick reads the finalized head and, when it is ahead of the global cursor,
@@ -49,6 +52,8 @@ export function createFollower(o: FollowerOptions): Follower {
   let cursor: FollowerCursor | undefined;
   let headNumber: bigint | undefined;
   let lastError: string | undefined;
+  /** The last finalized head observation was flagged stale (failed refresh, lagging node or no progress). */
+  let headStale = false;
   let leader = false;
   let stopped = false;
   let ticking: Promise<void> | undefined;
@@ -56,42 +61,87 @@ export function createFollower(o: FollowerOptions): Follower {
   let wake = (): void => {};
   let kicked = false;
 
-  /** Fetch, fold and commit one range; false when it must be refetched because the tracked set grew. */
+  /** Fetch, fold and commit one range; false when too many concurrent sign-ups force a refetch. */
   const applyRange = async (range: BlockRange, head: BlockRef): Promise<boolean> => {
     const known = new Set(tracked);
     const aggregates = new Map<Address, ChunkAggregate>();
+    const skipped: { from: Address; to: Address; decode: () => TransferEvent | undefined }[] = [];
+    /** Every event folded so far: an endpoint tracked later was unknown when it was folded, so it is added on refold. */
+    const folded: TransferEvent[] = [];
+
     const add = (account: Address, event: TransferEvent): void => {
       let aggregate = aggregates.get(account);
+
       if (!aggregate) aggregates.set(account, aggregate = emptyAggregate());
       addTransfer(aggregate, account, event);
     };
-    await adapter.scanAllTransfers(range, (event) => {
+
+    const fold = (event: TransferEvent): void => {
+      folded.push(event);
+
       if (known.has(event.from)) add(event.from, event);
+
       if (event.to !== event.from && known.has(event.to)) add(event.to, event);
-    }, (address) => known.has(address));
+    };
+
+    await adapter.scanAllTransfers(range, fold, (address) => known.has(address),
+      (from, to, decode) => skipped.push({ from, to, decode }));
     const to = range.toBlock === head.number ? head : await adapter.blockByNumber(range.toBlock);
     const at = now();
-    const result = await store.applyFollowerRange(network, range, to, at, aggregates, known);
-    if (!result.applied) {
-      // Tracked (by another request or process) while this range was decoded: refetch it with them included.
-      for (const account of result.missing) tracked!.add(account);
-      return false;
+
+    for (let refolds = 0; refolds < MAX_REFOLDS; refolds += 1) {
+      const result = await store.applyFollowerRange(network, range, to, at, aggregates, known);
+
+      if (result.applied) {
+        cursor = { number: to.number, hash: to.hash, timestamp: to.timestamp, updatedAt: at };
+
+        return true;
+      }
+
+      const newlyKnown = new Set(result.missing);
+
+      for (const account of newlyKnown) {
+        tracked!.add(account);
+        known.add(account);
+      }
+
+      for (const event of folded) {
+        if (newlyKnown.has(event.from)) add(event.from, event);
+
+        if (event.to !== event.from && newlyKnown.has(event.to)) add(event.to, event);
+      }
+
+      for (let i = skipped.length - 1; i >= 0; i -= 1) {
+        const entry = skipped[i];
+
+        if (!newlyKnown.has(entry.from) && !newlyKnown.has(entry.to)) continue;
+        const event = entry.decode();
+
+        if (event) fold(event);
+        skipped.splice(i, 1);
+      }
     }
-    cursor = { number: to.number, hash: to.hash, timestamp: to.timestamp, updatedAt: at };
-    return true;
+
+    return false;
   };
 
   const run = async (): Promise<void> => {
     try {
+      leader = false;
       leader = o.lock ? await o.lock.tryAcquire() : true;
+
       if (!leader) tracked = undefined;
       const head = await adapter.finalizedHead();
+      headStale = head.stale;
+
       if (headNumber === undefined || head.block.number > headNumber) headNumber = head.block.number;
       cursor = await store.getFollowerCursor(network);
+
       if (leader) {
         cursor ??= await store.initFollowerCursor(network, head.block, now());
         tracked ??= new Set(await store.trackedAccounts(network));
         const startedAt = cursor.number;
+
         while (!stopped && cursor.number < head.block.number) {
           const end = cursor.number + adapter.followerMaxRange;
           await applyRange({
@@ -99,17 +149,21 @@ export function createFollower(o: FollowerOptions): Follower {
             toBlock: end < head.block.number ? end : head.block.number,
           }, head.block);
         }
+
         if (cursor.number > startedAt) o.onAdvance?.(cursor);
       }
-      lastError = undefined;
+
+      lastError = head.refreshFailed ? HEAD_REFRESH_FAILED : undefined;
     } catch (error) {
-      lastError = messageOf(error);
-      o.onError?.(error);
+      const message = thrownMessage(error);
+      lastError = message.slice(0, 200);
+      o.onError?.(message);
     }
   };
 
   const tick = (): Promise<void> => {
     ticking ??= run().finally(() => { ticking = undefined; });
+
     return ticking;
   };
 
@@ -127,7 +181,9 @@ export function createFollower(o: FollowerOptions): Follower {
         while (!stopped) {
           kicked = false;
           await tick();
+
           if (stopped) break;
+
           if (kicked) continue;
           await new Promise<void>((resolve) => {
             const timer = setTimeout(resolve, o.pollMs);
@@ -155,20 +211,22 @@ export function createFollower(o: FollowerOptions): Follower {
       const lagBlocks = cursor && headNumber !== undefined && headNumber > cursor.number ? headNumber - cursor.number : 0n;
       const lastAdvanceAt = cursor?.updatedAt ?? 0;
       const idleMs = now() - lastAdvanceAt;
+
       const unhealthy = !cursor
         ? 'Follower has not initialized its cursor yet'
         : lagBlocks > o.maxLagBlocks
           ? `Follower is ${lagBlocks} blocks behind the finalized head`
           : idleMs > o.maxNoAdvanceMs ? 'Follower has not advanced recently enough' : undefined;
+
       return {
         ready: cursor !== undefined,
-        leader,
+        leader: leader && (o.lock?.held() ?? true),
         cursor,
         headNumber,
         lagBlocks,
         lastAdvanceAt,
         lastError,
-        stale: lastError !== undefined || lagBlocks > STALE_LAG_BLOCKS || idleMs > o.staleAfterMs,
+        stale: headStale || lastError !== undefined || lagBlocks > STALE_LAG_BLOCKS || idleMs > o.staleAfterMs,
         unhealthy,
       };
     },

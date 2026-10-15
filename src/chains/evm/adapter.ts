@@ -1,6 +1,7 @@
 import { isAddress } from 'viem';
 import type { Chain } from 'viem';
 
+import { toLowerHex } from '../../core/parse.ts';
 import type { AccountLogSource, Address, ChainAdapter, RpcClient } from '../../core/types.ts';
 import { createHeadTracker } from './head.ts';
 import { scanAllTransfers, transfersInBlock, transfersInRange } from './logs.ts';
@@ -27,13 +28,14 @@ export interface EvmAdapterOptions {
 /** Any EVM chain with a plain JSON-RPC endpoint: differs only by options. */
 export function createEvmAdapter(rpc: RpcClient, o: EvmAdapterOptions): ChainAdapter {
   const head = createHeadTracker(rpc, { cacheMs: o.headCacheMs ?? HEAD_CACHE_MS, maxNoProgressMs: o.finalizedMaxNoProgressMs, chain: o.chain });
+
   return {
     network: o.network,
     startBlock: o.startBlock,
     accountLogs: o.accountLogs,
     scanConcurrency: o.scanConcurrency,
     followerMaxRange: o.followerMaxRange,
-    normalizeAddress: (input) => isAddress(input, { strict: false }) ? input.toLowerCase() as Address : undefined,
+    normalizeAddress: (input) => isAddress(input, { strict: false }) ? toLowerHex(input) : undefined,
     finalizedHead: head.finalizedHead,
     latestHeader: head.latestHeader,
     cachedLatestBlockNumber: head.latestBlockNumber,
@@ -41,7 +43,7 @@ export function createEvmAdapter(rpc: RpcClient, o: EvmAdapterOptions): ChainAda
     headerByNumber: head.blockByNumber,
     transfersInBlock: (blockHash) => transfersInBlock(rpc, blockHash),
     transfersInRange: (range, headers) => transfersInRange(rpc, range, headers),
-    scanAllTransfers: (range, onTransfer, accept) => scanAllTransfers(rpc, range, onTransfer, accept),
+    scanAllTransfers: (range, onTransfer, accept, onSkipped) => scanAllTransfers(rpc, range, onTransfer, accept, onSkipped),
     erc20BalancePairs: (pairs, blockHash) => readErc20BalancePairs(rpc, pairs, blockHash, o.multicallBatch, o.multicall3),
     erc721Owners: (items, blockHash) => readErc721Owners(rpc, items, blockHash, o.multicallBatch, o.multicall3),
   };

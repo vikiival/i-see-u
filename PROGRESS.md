@@ -21,6 +21,8 @@ Times are local (CEST). "We" is Viktor plus AI agents: a Claude orchestrator han
 | 15:56–16:52 | Shared finalized follower and balance worker | Warm requests make 0 RPC calls. About 51M credits/month for 5k users |
 | 17:00– | HyperSync `LogSource` for backfill | Codex, started from Viktor's main session. Landed as an opt-in, experimental source with per-chunk RPC fallback (76 tests) |
 | 18:00–21:00 | Realtime tail with reorg handling | Jakub: realtime is part of the brief. Opus design, Codex build, Opus audit (9 bugs fixed). Tail lag 0 blocks live; 93 tests |
+| 23:50–01:15 | `/improve` audit and fixes (branch `feat/improve`) | Three parallel audits (Codex sol, 2× Opus), 5 fix plans run by Sonnet, sol and Opus in isolated worktrees, each reviewed. 115 tests; live run passed every check |
+| 11:00–13:30 | Budget: change-driven balance refresh (plan 006) | Opus built levers 1+3, 1 revision (orphaned snapshots on non-leaders). Balance sweep ~43M → ~1.6–6M credits/month; total ≈53M → ≈12–17M (estimates). 130 tests |
 
 ---
 
@@ -347,7 +349,103 @@ After the benchmark, Viktor started a Codex worker from his main session to buil
 - No real reorg observed live yet; reorgs are covered by tests only.
 - The 5k-account acceptance test took 130 s on a loaded machine (load average 15). The same test on the pre-tail commit was even slower, so this is the environment, not a regression.
 - Balances are not refreshed per block for pairs a new block touched; the 60 s sweep remains.
-- A non-leader replica doesn't report live tail health.
+- A non-leader replica doesn't report live tail health. *(Fixed in §14: freshness now comes from the shared tip.)*
+
+---
+
+## 14. Audit and hardening pass (`feat/improve`, 2026-10-15 00:00–01:15)
+
+**How:**
+- **Audit:** the `/improve` skill ran three read-only audits in parallel:
+  - Codex gpt-5.6-sol on correctness and performance.
+  - Opus on correctness, concurrency and reorgs.
+  - Opus on performance at 5k users, security and test gaps.
+- **Vetting:** every finding was re-checked against the code. The confirmed ones became five self-contained plans in `plans/` (index: `plans/README.md`).
+- **Execution:** each plan ran in its own git worktree, with the executor picked by complexity: Sonnet for the small ones, sol for the mechanical ones, Opus for the riskiest.
+- **Review:** every diff was reviewed before merging (done criteria re-run, scope checked, tests read). Two plans needed one revision round each.
+- **Merge:** all five were merged on an integration branch, then fast-forwarded into `feat/improve` (`850f3ed`).
+
+| Plan | Executor | Problem | Fix |
+|---|---|---|---|
+| 001 | Sonnet | Two simultaneous first requests for one address → **500** (duplicate key on `tracked_accounts`). `/v1/constructor/…` → 500 (prototype lookup). The pg pool waited **forever** when exhausted | `ON CONFLICT DO NOTHING` + re-read the winner's target (the handoff is unchanged). `Object.hasOwn` network lookup → 404. `DB_POOL_MAX` / `DB_CONNECT_TIMEOUT_MS` → 503 "Database busy" |
+| 002 | sol | A sign-up during a follower range made it **re-download the whole range** (up to 500 blocks, billed). Steady sign-ups could stall the cursor and 503 everyone. Logs outside the requested range were accepted. The leader flag stayed `true` after the lock's DB session died | Skipped logs are kept and re-folded for newly tracked accounts (no refetch, up to 8 refolds). Out-of-range logs are a transient error. `leader` = flag ∧ `lock.held()`, false when acquire throws |
+| 003 | Opus (1 revision) | Non-leader processes always reported the tail **healthy**, so a frozen tail was served as fresh `latest`. Rewind/wipe were unfenced, so two leaders during failover could delete each other's rows. The tail grew **without bound** if finality stalled. The restart re-validation never ran (leader unknown at `load()`) | `TAIL_MAX_TIP_AGE_MS` (60 s): every process judges freshness by the shared tip block's age. `lastProgressAt` = tip block time. Rewind/wipe compare the locked tip hash (`TailConflictError`). `TAIL_MAX_AHEAD_BLOCKS` (1024) caps the tail and degrades to finalized. The first leader tick validates the stored tip |
+| 004 | sol (1 revision) | After a reorg to a **shorter** chain, balances read at the orphaned block were never replaced. One failed multicall batch **discarded the whole sweep**. A first read re-fetched **all** tokens when one was missing. A malformed outer `aggregate3` result → 500, no failover | A reorg-kicked refresh may overwrite newer snapshots (`replaceNewer`). Per-batch results; failed-batch rows are marked `transient` and not saved, so old good balances survive. Revision: the first version overwrote them with errors. Only missing tokens are read. Outer decode moved into the RPC client's `validate`, so it retries and fails over |
+| 005 | Sonnet | `verifyOwnership` had no cap, cache or single-flight (~83 calls/s at 5k users, 4× the RPS cap). Queued RPC work still ran after its request had timed out. NFT grouping was O(collections × items) | `MAX_VERIFY_OWNERSHIP_ITEMS` (2000, then `ownerStatus: skipped`). Shared lookup per (account, block hash). Limiter `deadlineAt` drops expired queued jobs. Grouping via a Map |
+
+**Tests:** 93 → **115**, all passing; typecheck clean. One caveat: PGlite has one connection, so the race fixes are covered by contract tests and reasoning, not a reproduced race.
+
+**Live run** (Sonnet agent, Quicknode + Docker Postgres, about 450 RPC calls in total):
+
+| Check | Result |
+|---|---|
+| Startup on a 17 h-old cursor | Listening in < 12 s. The follower caught up 2,069 blocks in about 4 min (175 calls); 503 meanwhile, as designed |
+| `/erc20?balances=true` (Vitalik) | 158 tokens, all balances ok, `finality: latest`, lag 0, `lastProgressAt` = tip time (9 s old). A repeat costs 0 calls |
+| `?finality=finalized` | Old shape, 85 blocks behind |
+| `/v1/constructor/…`, `?finality=bogus` | 404, 400 |
+| `/erc721?verifyOwnership=true` | 68 items with 1 `eth_call`. A second request 2 s later: 0 calls (shared lookup) |
+| 3 simultaneous first requests (new address) | 202 ×3, no 500. Backfill done in about 3 min, then 200 with 0 calls |
+| 5 min watch | Tail lag 0 in 11/11 samples, healthy, 0 reorgs. The follower advanced one epoch on schedule. About 1.5 header calls + 1 `getLogs` per block (was 1.26; small sample, to re-measure) |
+
+**Second review round (Codex, verified by Opus).** Codex found three more correctness bugs after the merge. Opus confirmed each one with a failing test (`test/regressions-audit.test.ts`) and then fixed it:
+
+| Bug | Origin | Fix |
+|---|---|---|
+| A is tracked; B registers while the follower processes a range that contains an A→B transfer. That log is not "skipped" (A is known), so plan 002's refold never revisited it. The cursor advances and B **permanently misses** the transfer | **Introduced by plan 002** (missed in review); the old refetch handled it | The follower keeps every log it already folded and replays it for newly tracked endpoints (no double count: they were unknown at first fold). Tests: B sends and receives, a B self-transfer, two accounts tracked in different refold rounds; still one `getLogs` |
+| A late request-path balance read from an orphaned fork overwrites the corrected balance **at the same height** (writes compared only block number) | Pre-existing | A same-height write must carry the same block hash. Only the reorg-kicked refresh at the canonical tip overwrites unconditionally |
+| A failed finalized-head poll returned the cached head with `stale: true`, but the follower ignored it and cleared `lastError`, so it reported **healthy for up to ~20 min** | Pre-existing | `refreshFailed` is set on the observation; the follower ORs `head.stale` into `stale` and sets `lastError` ("Finalized head refresh failed; serving cached head") |
+
+Tests: 115 → **120**, all passing. Lesson: a refold optimisation must replay *every* retained event for new accounts, not only the ones it skipped. A test with a transfer **between** a known and a newly tracked account would have caught it in the first review.
+
+**Deliberately not planned** (real, but needs a product decision or is larger; listed in `plans/README.md`):
+- **Backfill credit budget or denylist:** a flood of random addresses could burn the month's credits in about 2 days, and the zero address is the worst case.
+- **Account lifecycle:** untracking idle accounts.
+- **Cross-replica backfills:** a per-account lease, so two processes don't backfill the same account.
+- **Follower catch-up memory:** 500-block unfiltered responses ≈ 225 MB of JSON.
+- **Response size:** pagination for heavy accounts.
+- ~~**Balance sweep cost:** refreshing only touched pairs.~~ Done in §15.
+- **Real concurrency tests:** a multi-connection Postgres integration suite.
+
+---
+
+## 15. Budget: change-driven balance refresh (2026-10-15)
+
+**Problem.** The steady-state bill for 5k users × 10 tokens was about 53M of the 80M credits/month, and the balance worker was most of it (the 20-credit call rate is the only lever, so the number of calls had to drop):
+
+| Item (before) | Credits/month (estimate) |
+|---|---|
+| Balances: every pair every 60 s (50k pairs / 1000 per Multicall = 50 calls/min) | about 43M |
+| Tail (`latest` header + `getLogs` per block) | about 9–11M |
+| Follower, head polling | under 0.5M |
+| **Total** | **about 53–54M** |
+
+**Levers considered:**
+1. **Change-driven refresh.** Re-read a pair only when something may have changed. Built.
+2. **Bigger or compact batches.** 2000 per batch, or `aggregate3` replaced by a state-override balance-checker contract. Not done: needs a measurement of the Quicknode `eth_call` gas cap first.
+3. **Skip zero balances.** A zero balance only becomes non-zero through a Transfer, which lever 1 already catches. Built with lever 1.
+4. **HyperSync backfills.** Would cut the one-off cold backfill cost, but blocked on the Binance stream hang (§12).
+5. **WebSocket heads.** Would replace header polling, but how Quicknode bills subscriptions is unverified.
+6. **Abuse or admission cap.** A cap on newly tracked accounts and backfills; a product decision, not done.
+7. **Self-hosted node.** Comparison point only: about $200–400/month flat (estimate), against Quicknode Build at $49 for 80M credits.
+
+**What was built (plan 006, levers 1+3; Opus, `873f91e`, merged in `a4e98d6`).** Each 60 s cycle the worker re-reads only pairs with no snapshot, pairs with a Transfer after their snapshot's block (`store.erc20RefreshState`), `BALANCE_ALWAYS_REFRESH_TOKENS` (WETH, stETH), pairs whose last read failed transiently, and pairs whose snapshot block is no longer canonical. Every `BALANCE_FULL_SWEEP_MS` (1 h) it re-reads all non-zero pairs; a reorg kick re-reads everything. Responses gained per-token `balanceCurrent` and a top-level `balancesCurrent`; `/health` reports `candidates`, `read` and `fullSweep`.
+
+**Review revision (1 round).** Processes that never received a reorg kick (non-leader replicas, whose tail does not run) kept snapshots of an orphaned block, because the change test looked only at Transfers. Orphaned snapshots are now detected (block no longer canonical), re-read and saved with `replaceNewer`.
+
+**Soundness assumption.** Balances change only through `Transfer`, except for the always-refresh list. Anything else (unlisted rebasing tokens, admin mints without events) can be stale, bounded by the hourly sweep, and never fixed for an `ok` zero balance. `balanceCurrent` says "no Transfer since the snapshot", not "verified on chain", so it can be true for such a balance.
+
+**Cost, before vs after** (all estimates; 5k users × 10 tokens, about 1% of pairs touched per minute):
+
+| Item | Before | After |
+|---|---|---|
+| Balances | about 43M (50 calls/min) | about 1.6M (about 1.8 calls/min); about 6M if every user holds WETH/stETH |
+| Tail | about 9–11M | about 9–11M |
+| Follower and heads | under 0.5M | under 0.5M |
+| **Total steady state** | **about 53–54M** | **about 12–17M** |
+
+Cold backfill is unchanged: about 172 calls per new account, one-off.
+
+**Tests:** 120 → **130**. The call rate is modelled, not measured live (next items: lever 2 gas cap, live re-measure).
 
 ---
 
@@ -378,15 +476,15 @@ After the benchmark, Viktor started a Codex worker from his main session to buil
 | Technology choice with reasons | ✅ | REPORT §6 |
 | REST endpoint: ERC-20 tokens the address interacted with | ✅ | `GET /v1/ethereum/accounts/{addr}/erc20` |
 | Balance parameter | ✅ | `?balances=true`. Each token has its own `balanceBlock` |
-| Block height the data is valid for | ✅ | `blockHeight` + `blockHash` (follower cursor), `balancesAtBlockHeight` |
+| Block height the data is valid for | ✅ | `blockHeight` + `blockHash` (the tail tip with `finality=latest`, the follower cursor with `finalized`), `finalizedBlockHeight`, `balancesAtBlockHeight` |
 | Modular (adapter-style) | ✅ / ⚠️ | `ChainAdapter`, `Store` and `RpcClient` are interfaces, and a new EVM chain is a config entry. A per-account `AccountLogSource` (RPC, HyperSync, with fallback) is in progress (§12) |
-| Scales to 5k users polling every minute | ✅ / ⚠️ | 0 RPC calls per warm request. A fake-RPC acceptance test covers 5k accounts. No live HTTP load test. Single replica only |
+| Scales to 5k users polling every minute | ✅ / ⚠️ | 0 RPC calls per warm request. A fake-RPC acceptance test covers 5k accounts. No live HTTP load test. Multi-replica hardened in §14 (race-safe tracking, truthful leadership, shared tail freshness, fenced tail writes); still no cross-replica backfill dedupe |
 | Unreliable RPC: slow, errors, rate limits, lagging | ✅ | RpcClient classification, backoff, breaker, failover, validate. Follower lag, `stale` and 503 |
 | README and documented limits | ✅ | README "Limits", REPORT §7 |
 | Not a full indexer | ✅ | Only `Transfer` logs, only for tracked accounts, aggregated per (account, token) |
-| RPC-efficient (paid per request) | ✅ | About 51M credits/month steady state for 5k users (Build plan has 80M). Cold backfill is 172 calls per account |
+| RPC-efficient (paid per request) | ✅ | About 12–17M credits/month steady state for 5k users at 10 tokens each (estimate; Build plan has 80M, was about 53–54M before the change-driven balance refresh, §15). Balance cost now scales with Transfer activity. Cold backfill is 172 calls per account |
 | BONUS: ERC-721 discovery and endpoint | ✅ | `/erc721`: collections plus token IDs, `?verifyOwnership=true` via `ownerOf` |
-| Own repository, shared | ❌ | Nothing pushed yet (github.com/vikiival/i-see-u) |
+| Own repository, shared | ⚠️ | Pushed (private) to github.com/vikiival/i-see-u, including `feat/improve`; collaborators not added yet |
 | Presentation (30 min + Q&A, Thursday) | ❌ | To do. This log and REPORT are the basis |
 
 ## Next
@@ -397,3 +495,7 @@ After the benchmark, Viktor started a Codex worker from his main session to buil
 4. **Presentation:** the arc above, the chunk-size table, the cost table, and the path from finalized-only to the realtime tail with reorgs.
 5. **Tuning:** raise `RPC_MAX_RPS` toward the plan's 50 (normal cold scan about 3.5 s). Verify credits per call and per batch on the Quicknode dashboard.
 6. **Known limits to decide on:** multi-replica state (active set, balance-worker leader), untracking idle accounts, holdings from before the start block, spam flags, and native ETH.
+7. **Backfill admission and credit budget** for arbitrary addresses: the largest remaining cost and DoS lever (§14).
+8. **Re-measure tail cost per block** over a longer window (1.5 vs 1.26 header calls).
+9. **Lever 2:** measure the Quicknode `eth_call` gas cap for a state-override balance checker / 2000 per batch.
+10. **Live re-measure of the balance refresh call rate** (the 1.8 calls/min figure is an estimate).

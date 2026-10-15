@@ -24,6 +24,11 @@ interface DiscoveryDependencies {
   requestDeadlineMs?: number;
   /** Bounds concurrent (and queued) backfills; beyond it requests get 503 with Retry-After. */
   backfillLimiter?: Limiter;
+  /**
+   * Serve `latest` only while the shared tail tip's own block timestamp is at most this old (undefined: no check).
+   * Every process reads the same tip, so a stalled leader degrades all of them, not just itself.
+   */
+  maxTailTipAgeMs?: number;
   now?: () => number;
 }
 
@@ -41,6 +46,7 @@ interface ChunkSlot {
 }
 
 const DEFAULT_REQUEST_DEADLINE_MS = 10_000;
+
 /** Consecutive light chunks (at the current range) before the range doubles again. */
 const GROW_AFTER = 3;
 
@@ -57,6 +63,7 @@ export function createDiscoveryService(deps: DiscoveryDependencies): DiscoverySe
   const backfill = async (adapter: ChainAdapter, account: Address): Promise<BackfillStats> => {
     const startedAt = Date.now();
     const tracking = await deps.store.getTracking(adapter.network, account);
+
     if (!tracking) throw new Error(`Account ${account} is not tracked`);
     const target = tracking.target;
     const appliedTo = tracking.progress;
@@ -64,6 +71,7 @@ export function createDiscoveryService(deps: DiscoveryDependencies): DiscoverySe
 
     let newBlocks = 0n;
     let rpcCalls = 0;
+
     if (fromBlock <= target) {
       const source = adapter.accountLogs;
       const maxRange = source.preferredMaxRange;
@@ -74,11 +82,14 @@ export function createDiscoveryService(deps: DiscoveryDependencies): DiscoverySe
       const persisted = source.adaptiveRange ? await deps.store.getLogsRange(adapter.network, account) : undefined;
       let range = persisted === undefined || persisted > maxRange ? maxRange : persisted < minRange ? minRange : persisted;
       let lightStreak = 0;
+
       // Called in completion order: shrink below a heavy chunk's own size, grow after a streak of light ones.
       const adapt = (chunk: BlockRange, heavy: boolean): void => {
         const size = chunk.toBlock - chunk.fromBlock + 1n;
+
         if (heavy) {
           const half = size / 2n > minRange ? size / 2n : minRange;
+
           if (half < range) range = half;
           lightStreak = 0;
         } else if (size >= range && ++lightStreak >= GROW_AFTER) {
@@ -95,6 +106,7 @@ export function createDiscoveryService(deps: DiscoveryDependencies): DiscoverySe
       let stopped = false;
       let wake = (): void => {};
       const settled = (): Promise<void> => new Promise<void>((resolve) => { wake = resolve; });
+
       const launch = (): void => {
         while (!stopped && active < concurrency && window.length < 2 * concurrency && nextFrom <= target) {
           const end = nextFrom + range - 1n;
@@ -104,10 +116,11 @@ export function createDiscoveryService(deps: DiscoveryDependencies): DiscoverySe
           active += 1;
           source.scanAccount(account, slot.range).then(
             (value): ChunkOutcome => ({ ok: true, ...value }),
-            (error: unknown): ChunkOutcome => ({ ok: false, error }),
+            (error): ChunkOutcome => ({ ok: false, error }),
           ).then((outcome) => {
             slot.outcome = outcome;
             active -= 1;
+
             if (outcome.ok) adapt(slot.range, outcome.heavy);
             else stopped = true; // commit what precedes the failure, start nothing new
             launch();
@@ -118,12 +131,15 @@ export function createDiscoveryService(deps: DiscoveryDependencies): DiscoverySe
 
       try {
         launch();
+
         while (window.length > 0) {
           const outcome = window[0].outcome;
+
           if (!outcome) {
             await settled();
             continue;
           }
+
           if (!outcome.ok) throw outcome.error;
           const { range: done } = window.shift()!;
           await deps.store.applyScanChunk(adapter.network, account, done, outcome.aggregate);
@@ -133,7 +149,9 @@ export function createDiscoveryService(deps: DiscoveryDependencies): DiscoverySe
         }
       } finally {
         stopped = true;
+
         while (active > 0) await settled();
+
         if (source.adaptiveRange && range !== persisted) await deps.store.setLogsRange(adapter.network, account, range);
       }
     }
@@ -144,35 +162,45 @@ export function createDiscoveryService(deps: DiscoveryDependencies): DiscoverySe
   const startBackfill = (adapter: ChainAdapter, account: Address): Promise<BackfillStats> => {
     const key = `${adapter.network}:${account}`;
     let pending = inFlight.get(key);
+
     if (!pending) {
       pending = limiter.run(() => backfill(adapter, account)).finally(() => inFlight.delete(key));
       inFlight.set(key, pending);
     }
+
     return pending;
   };
 
   return {
     async discover(network: string, input: string, requestedFinality?: 'latest' | 'finalized'): Promise<DiscoveryResult | SyncingResult> {
-      const adapter = deps.adapters[network];
-      const follower = deps.followers[network];
+      // Own-property lookup: names like `constructor` must 404, not hit Object.prototype.
+      const adapter = Object.hasOwn(deps.adapters, network) ? deps.adapters[network] : undefined;
+      const follower = Object.hasOwn(deps.followers, network) ? deps.followers[network] : undefined;
+
       if (!adapter || !follower) {
         throw Object.assign(new Error(`Unknown network: ${network}`), { statusCode: 404 });
       }
+
       const account = adapter.normalizeAddress(input);
+
       if (!account) throw Object.assign(new Error('Invalid account address'), { statusCode: 400 });
 
       const status = follower.status();
+
       if (status.unhealthy) throw unavailable(status.unhealthy, 30);
       // Tracked first (target = follower cursor, atomically), then backfilled up to that target.
       let tracking = await deps.store.getTracking(network, account) ?? await deps.store.trackAccount(network, account, now());
       follower.track(account);
 
       let scan: BackfillStats = { newBlocks: 0n, rpcCalls: 0, ms: 0 };
+
       if (!backfilled(adapter, tracking)) {
         const done = await withDeadline(startBackfill(adapter, account), requestDeadlineMs, () => undefined);
+
         if (!done) {
           tracking = await deps.store.getTracking(network, account) ?? tracking;
           const blocks = (to: bigint | undefined): bigint => to !== undefined && to >= adapter.startBlock ? to - adapter.startBlock + 1n : 0n;
+
           return {
             status: 'syncing',
             network,
@@ -183,30 +211,43 @@ export function createDiscoveryService(deps: DiscoveryDependencies): DiscoverySe
             followerLagBlocks: status.lagBlocks,
           };
         }
+
         scan = done;
       }
 
       // Pure database read from here on: no RPC on the request path once the account is backfilled.
       const view = await deps.store.readAccount(network, account);
+
       if (!view) throw unavailable('Follower has no cursor yet', 5);
       const { cursor } = view;
-      const tailStatus = deps.tails?.[network]?.status();
+      const tailStatus = (deps.tails && Object.hasOwn(deps.tails, network) ? deps.tails[network] : undefined)?.status();
       const wantsLatest = requestedFinality !== 'finalized' && tailStatus !== undefined;
-      const serveLatest = wantsLatest && tailStatus.healthy && view.tailTip !== undefined;
+      const tipAgeMs = view.tailTip && now() - Number(view.tailTip.timestamp) * 1000;
+
+      const tipTooOld = wantsLatest && deps.maxTailTipAgeMs !== undefined && tipAgeMs !== undefined
+        && tipAgeMs > deps.maxTailTipAgeMs;
+
+      const serveLatest = wantsLatest && tailStatus.healthy && view.tailTip !== undefined && !tipTooOld;
       let holdings = view.holdings;
       let nftItems = view.nftItems;
+
       if (serveLatest) {
         const aggregate = emptyAggregate();
+
         for (const event of view.tailTransfers) addTransfer(aggregate, account, event);
         const byToken = new Map(holdings.map((holding) => [holding.token, { ...holding }]));
+
         for (const [token, tail] of aggregate.tokens) {
           const base = byToken.get(token);
+
           if (base) {
             base.firstBlock = tail.firstBlock < base.firstBlock ? tail.firstBlock : base.firstBlock;
             base.lastBlock = tail.lastBlock > base.lastBlock ? tail.lastBlock : base.lastBlock;
             base.sentCount += tail.sentCount;
             base.receivedCount += tail.receivedCount;
+
             if (tail.sentCount > 0) base.unfinalizedSentCount = tail.sentCount;
+
             if (tail.receivedCount > 0) base.unfinalizedReceivedCount = tail.receivedCount;
           } else {
             byToken.set(token, {
@@ -217,9 +258,11 @@ export function createDiscoveryService(deps: DiscoveryDependencies): DiscoverySe
             });
           }
         }
+
         holdings = [...byToken.values()].sort((a, b) => a.lastBlock === b.lastBlock
           ? a.token.localeCompare(b.token) : a.lastBlock > b.lastBlock ? -1 : 1);
         const byItem = new Map(nftItems.map((item) => [`${item.token}:${item.tokenId}`, { ...item }]));
+
         for (const [key, item] of aggregate.nfts) byItem.set(key, {
           token: item.token,
           tokenId: item.tokenId,
@@ -230,9 +273,11 @@ export function createDiscoveryService(deps: DiscoveryDependencies): DiscoverySe
         nftItems = [...byItem.values()].sort((a, b) => a.lastBlock === b.lastBlock
           ? `${a.token}:${a.tokenId}`.localeCompare(`${b.token}:${b.tokenId}`) : a.lastBlock > b.lastBlock ? -1 : 1);
       }
+
       const served = serveLatest ? view.tailTip! : cursor;
       const latest = tailStatus?.latestNumber ?? adapter.cachedLatestBlockNumber?.() ?? served.number;
       const head = status.headNumber ?? cursor.number;
+
       return {
         status: 'ready',
         network,
@@ -243,8 +288,12 @@ export function createDiscoveryService(deps: DiscoveryDependencies): DiscoverySe
         blockTimestamp: served.timestamp,
         finality: serveLatest ? 'latest' : 'finalized',
         ...(serveLatest && { finalizedBlockHeight: cursor.number, finalizedBlockHash: cursor.hash }),
-        ...(wantsLatest && !serveLatest && { tailError: tailStatus?.tailError ?? 'Tail has no complete snapshot yet' }),
-        lastProgressAt: serveLatest ? tailStatus!.lastAdvanceAt : cursor.updatedAt,
+        ...(wantsLatest && !serveLatest && {
+          tailError: tailStatus?.tailError
+            ?? (tipTooOld ? `Tail tip is ${Math.round(tipAgeMs! / 1000)} s old` : 'Tail has no complete snapshot yet'),
+        }),
+        // The shared tip's block time, not process memory: identical in every process, leader or not.
+        lastProgressAt: serveLatest ? Number(view.tailTip!.timestamp) * 1000 : cursor.updatedAt,
         stale: serveLatest ? false : status.stale,
         lagBlocks: latest > served.number ? latest - served.number : 0n,
         followerLagBlocks: head > cursor.number ? head - cursor.number : 0n,

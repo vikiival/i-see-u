@@ -19,15 +19,20 @@ export interface PostgresHandle {
   followerLock(network: string): LeaderLock;
 }
 
-export async function openPostgresStore(databaseUrl: string): Promise<PostgresHandle> {
-  const pool = new Pool({ connectionString: databaseUrl });
+export async function openPostgresStore(
+  databaseUrl: string,
+  opts: { max?: number; connectionTimeoutMillis?: number } = {},
+): Promise<PostgresHandle> {
+  const pool = new Pool({ connectionString: databaseUrl, max: opts.max, connectionTimeoutMillis: opts.connectionTimeoutMillis });
   const db = drizzle(pool, { schema });
+
   try {
     await migrate(db, { migrationsFolder });
   } catch (error) {
     await pool.end();
     throw error;
   }
+
   return {
     store: createStore(db, () => pool.end()),
     followerLock: (network) => pgLeaderLock(pool, advisoryKey(`follower:${network}`)),

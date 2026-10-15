@@ -1,8 +1,9 @@
-import { afterEach, expect, test, vi } from 'vitest';
+import { afterEach, assert, expect, test, vi } from 'vitest';
 import { mainnet } from 'viem/chains';
 import type { RpcClient, RpcStats } from '../src/core/types.ts';
 import { createHeadTracker } from '../src/chains/evm/head.ts';
 import { createRpcClient } from '../src/rpc/client.ts';
+import { staged } from './helpers.ts';
 import { RpcError, classify } from '../src/rpc/errors.ts';
 
 afterEach(() => {
@@ -39,6 +40,7 @@ test('classify recognizes provider, HTTP, and network failures', () => {
     [undefined, { message: 'execution reverted' }, 'fatal'],
     [undefined, { code: -32602, message: 'invalid params' }, 'fatal'],
   ];
+
   for (const [status, error, expected] of cases) expect(classify(status, error), String(error)).toBe(expected);
 
   const parsed = new RpcError('too_large', 'Try with this block range [0x18E2D98, 0x18E4B00]');
@@ -54,17 +56,21 @@ test('client retries on a fallback and opens the failing endpoint breaker', asyn
   vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
     if (String(input).startsWith('https://primary.example')) {
       failedCalls += 1;
+
       return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code: -32000, message: 'temporarily unavailable' } }), {
         status: 503,
         headers: { 'content-type': 'application/json' },
       });
     }
+
     goodCalls += 1;
+
     return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: '0x2a' }), {
       status: 200,
       headers: { 'content-type': 'application/json' },
     });
   }));
+
   const client = createRpcClient({
     urls: ['https://primary.example/api-key?secret=yes', 'https://fallback.example/other-key'],
     timeoutMs: 1_000,
@@ -91,22 +97,26 @@ test('client retries on a fallback and opens the failing endpoint breaker', asyn
 test('finalized head is single-flight, cached, records the latest number, and serves stale on failure', async () => {
   let calls = 0;
   let fail = false;
+
   const rpc: RpcClient = {
     async request<T>(_method: string, params: unknown[]): Promise<T> {
       calls += 1;
+
       if (fail) throw new Error('offline');
       await Promise.resolve();
       const tag = params[0];
       const number = tag === 'latest' ? '0xa' : '0x8';
-      return {
+
+      return staged<T>({
         number,
         hash: `0x${number.slice(2).padStart(64, 'a')}`,
         parentHash: `0x${number.slice(2).padStart(64, 'b')}`,
         timestamp: '0x64',
-      } as T;
+      });
     },
     stats: rpcStats,
   };
+
   const tracker = createHeadTracker(rpc, { cacheMs: 60_000, maxNoProgressMs: 60_000, chain: mainnet });
   const [first, concurrent] = await Promise.all([tracker.finalizedHead(), tracker.finalizedHead()]);
   expect(first.block.number).toBe(8n);
@@ -129,19 +139,23 @@ test('finalized head is single-flight, cached, records the latest number, and se
 test('finalized head never moves backwards and marks a lagging observation stale', async () => {
   let number = 10n;
   const tags: unknown[] = [];
+
   const block = (value: bigint) => ({
     number: `0x${value.toString(16)}`,
     hash: `0x${value.toString(16).padStart(64, 'a')}`,
     parentHash: `0x${(value - 1n).toString(16).padStart(64, 'b')}`,
     timestamp: `0x${(1_000n + value).toString(16)}`,
   });
+
   const rpc: RpcClient = {
     async request<T>(_method: string, params: unknown[]): Promise<T> {
       tags.push(params[0]);
-      return block(number) as T;
+
+      return staged<T>(block(number));
     },
     stats: rpcStats,
   };
+
   const tracker = createHeadTracker(rpc, { cacheMs: 0, maxNoProgressMs: 60_000, chain: mainnet });
   const first = await tracker.finalizedHead();
   number = 9n;
@@ -159,22 +173,27 @@ test('result validation fails over from a null head response', async () => {
   vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
     // finalizedHead() also refreshes 'latest' in the background; track only the finalized lookups.
     const [tag] = JSON.parse(String(init?.body)).params;
+
     if (tag === 'finalized') called.push(String(input));
+
     const result = String(input).startsWith('https://primary.example')
       ? null
       : { number: '0xa', hash: '0xabc', parentHash: '0xdef', timestamp: '0x64' };
+
     return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result }), {
       status: 200,
       headers: { 'content-type': 'application/json' },
     });
   }));
   vi.spyOn(Math, 'random').mockReturnValue(0);
+
   const client = createRpcClient({
     urls: ['https://primary.example/key', 'https://fallback.example/key'],
     timeoutMs: 1_000,
     maxAttempts: 2,
     maxRps: 1_000,
   });
+
   const tracker = createHeadTracker(client, { cacheMs: 0, maxNoProgressMs: 60_000, chain: mainnet });
   const observation = await tracker.finalizedHead();
   expect(observation.block.number).toBe(10n);
@@ -188,17 +207,19 @@ test('an unchanged finalized block becomes stale and progress resets on advance'
   vi.useFakeTimers();
   vi.setSystemTime(1_000);
   let number = 10n;
+
   const rpc: RpcClient = {
     async request<T>(): Promise<T> {
-      return {
+      return staged<T>({
         number: `0x${number.toString(16)}`,
         hash: `0x${number.toString(16).padStart(64, 'a')}`,
         parentHash: `0x${(number - 1n).toString(16).padStart(64, 'b')}`,
         timestamp: '0x64',
-      } as T;
+      });
     },
     stats: rpcStats,
   };
+
   const tracker = createHeadTracker(rpc, { cacheMs: 0, maxNoProgressMs: 100, chain: mainnet });
   const first = await tracker.finalizedHead();
   await vi.advanceTimersByTimeAsync(101);
@@ -213,15 +234,32 @@ test('an unchanged finalized block becomes stale and progress resets on advance'
   expect(advanced.lastProgressAt).toBe(1_102);
 });
 
-const json = (body: unknown, status = 200, headers: Record<string, string> = {}): Response =>
+interface RpcEnvelope {
+  jsonrpc: '2.0';
+  id: number;
+  result?: string | string[];
+  error?: { code: number; message: string };
+}
+
+const json = (body: RpcEnvelope, status = 200, headers: Record<string, string> = {}): Response =>
   new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json', ...headers } });
+
+/** The next link of an error's cause chain, if any. */
+const causeOf = (value: NonNullable<unknown>): NonNullable<unknown> | undefined => {
+  if (!(value instanceof Object) || !('cause' in value)) return undefined;
+  const { cause } = value;
+
+  return cause === null || cause === undefined ? undefined : cause;
+};
 
 const stubFetch = (respond: (url: string, call: number) => Response) => {
   const urls: string[] = [];
   vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
     urls.push(String(input));
+
     return respond(String(input), urls.length);
   }));
+
   return urls;
 };
 
@@ -230,11 +268,12 @@ test('-32005 with "more than 10000 results" is too_large with the suggested rang
     jsonrpc: '2.0', id: 1,
     error: { code: -32005, message: 'query returned more than 10000 results. Try with this block range [0x1, 0x2].' },
   }));
+
   const client = createRpcClient({ urls: ['https://a.example/key', 'https://b.example/key'], timeoutMs: 1_000, maxAttempts: 4, maxRps: 1_000 });
-  const error = await client.request('eth_getLogs', []).catch((e: unknown) => e);
-  expect(error).toBeInstanceOf(RpcError);
+  const error = await client.request('eth_getLogs', []).catch((e: Error) => e);
+  assert.instanceOf(error, RpcError);
   expect(error).toMatchObject({ kind: 'too_large', code: -32005, suggestedRange: { fromBlock: 1n, toBlock: 2n } });
-  expect((error as RpcError).cause).toMatchObject({ code: -32005 });
+  expect(error.cause).toMatchObject({ code: -32005 });
   expect(urls.length).toBe(1);
   expect(client.stats().attempts).toBe(1);
 });
@@ -252,9 +291,11 @@ test('Quicknode -32010 is retried as rate_limited', async () => {
 test('HTTP 429 Retry-After is honoured only up to the cap', async () => {
   vi.useFakeTimers();
   vi.spyOn(Math, 'random').mockReturnValue(0);
+
   const urls = stubFetch((_url, call) => call === 1
     ? new Response('Too Many Requests', { status: 429, headers: { 'retry-after': '3600' } })
     : json({ jsonrpc: '2.0', id: 1, result: '0x1' }));
+
   const client = createRpcClient({ urls: ['https://only.example/key'], timeoutMs: 1_000, maxAttempts: 2, maxRps: 1_000 });
   let settled = false;
   const pending = client.request('eth_blockNumber', []).finally(() => { settled = true; });
@@ -276,25 +317,30 @@ test('HTTP 401 is fatal: one attempt, no failover', async () => {
 test('endpoint path and key never leak into thrown errors or stats', async () => {
   const secret = 'SECRET-KEY-123';
   vi.spyOn(Math, 'random').mockReturnValue(0);
+
   const responses = [
     () => new Response('bad gateway', { status: 502 }),
     () => json({ jsonrpc: '2.0', id: 1, error: { code: -32000, message: 'execution reverted' } }),
     () => { throw new TypeError('fetch failed', { cause: { code: 'ECONNRESET' } }); },
     () => new Response('not json', { status: 200 }),
   ];
-  const errors: unknown[] = [];
+
+  const errors: RpcError[] = [];
+
   for (const respond of responses) {
     vi.stubGlobal('fetch', vi.fn(async () => respond()));
     const client = createRpcClient({ urls: [`https://node.example/${secret}?token=${secret}`], timeoutMs: 1_000, maxAttempts: 1, maxRps: 1_000 });
-    const error = await client.request('eth_call', []).catch((e: unknown) => e);
-    expect(error).toBeInstanceOf(RpcError);
+    const error = await client.request('eth_call', []).catch((e: Error) => e);
+    assert.instanceOf(error, RpcError);
     errors.push(error);
     expect(JSON.stringify(client.stats())).not.toContain(secret);
   }
-  expect(errors.map(error => (error as RpcError).kind)).toEqual(['transient', 'fatal', 'transient', 'fatal']);
+
+  expect(errors.map(error => error.kind)).toEqual(['transient', 'fatal', 'transient', 'fatal']);
+
   // Walk the whole cause chain (what a logger would print), not just the top-level message.
   for (const error of errors) {
-    for (let current: unknown = error; current; current = (current as { cause?: unknown }).cause) {
+    for (let current: NonNullable<unknown> | undefined = error; current; current = causeOf(current)) {
       const text = current instanceof Error ? `${current.message} ${current.stack}` : JSON.stringify(current);
       expect(text).not.toContain(secret);
     }
@@ -306,7 +352,9 @@ test('a viem transport timeout is transient and fails over', async () => {
   const urls: string[] = [];
   vi.stubGlobal('fetch', vi.fn((input: string, init?: RequestInit) => {
     urls.push(input);
+
     if (!input.startsWith('https://slow.example')) return Promise.resolve(json({ jsonrpc: '2.0', id: 1, result: '0x1' }));
+
     return new Promise((_resolve, reject) => init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError'))));
   }));
   const client = createRpcClient({ urls: ['https://slow.example/key', 'https://fast.example/key'], timeoutMs: 20, maxAttempts: 2, maxRps: 1_000 });
@@ -319,12 +367,15 @@ test('failFastOnTimeout throws a flagged timeout after one attempt without tripp
   let calls = 0;
   vi.stubGlobal('fetch', vi.fn((_input: string, init?: RequestInit) => {
     calls += 1;
+
     return new Promise((_resolve, reject) => init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError'))));
   }));
   const client = createRpcClient({ urls: ['https://slow.example/key'], timeoutMs: 10, maxAttempts: 3, maxRps: 1_000 });
+
   for (let i = 0; i < 6; i += 1) {
     await expect(client.request('eth_getLogs', [], { failFastOnTimeout: true })).rejects.toMatchObject({ kind: 'transient', timeout: true });
   }
+
   expect(calls).toBe(6);
   expect(client.stats().errors).toEqual({ transient: 6 });
   expect(client.stats().endpoints[0]).toMatchObject({ state: 'closed', failures: 0 });

@@ -3,6 +3,7 @@ import { decodeEventLog, encodeEventTopics, isAddress, isHex, pad, parseAbiItem 
 import { addTransfer, aggregateLogCount, emptyAggregate } from '../../core/aggregate.ts';
 import type { Address, BlockRange, ChunkScan, Hex, RpcClient, TransferDirection, TransferEvent } from '../../core/types.ts';
 import { RpcError, rpcErrorOf } from '../../rpc/errors.ts';
+import { isString, toLowerHex } from '../../core/parse.ts';
 
 const erc20Transfer = parseAbiItem('event Transfer(address indexed from, address indexed to, uint256 value)');
 const erc721Transfer = parseAbiItem('event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)');
@@ -10,8 +11,10 @@ export const TRANSFER_TOPIC = encodeEventTopics({ abi: [erc20Transfer] })[0];
 
 /** A response above this many bytes marks the chunk heavy. */
 const HEAVY_BYTES = 50_000_000;
+
 /** A successful attempt slower than this marks the chunk heavy, if its response exceeds HEAVY_BYTES / 10. */
 const HEAVY_MS = 3_000;
+
 /** Rough JSON size of one address-filtered Transfer log; used when the provider compresses (no Content-Length). */
 const APPROX_LOG_BYTES = 640;
 
@@ -27,8 +30,12 @@ export interface WireLog {
   removed?: unknown;
 }
 
-const quantity = (value: unknown): bigint => {
+/** A hex quantity field of a wire log; throws unless it is a hex string BigInt accepts. */
+const quantity = (log: WireLog, field: 'blockNumber' | 'logIndex'): bigint => {
+  const value = log[field];
+
   if (!isHex(value)) throw new Error('not a hex quantity');
+
   return BigInt(value);
 };
 
@@ -36,37 +43,48 @@ const quantity = (value: unknown): bigint => {
 export function decodeTransferLog(log: WireLog): TransferEvent | undefined {
   if (log.removed === true) return undefined;
   const { topics } = log;
+
   if (!Array.isArray(topics) || (topics.length !== 3 && topics.length !== 4)) return undefined;
-  if (typeof log.address !== 'string' || !isAddress(log.address, { strict: false })) return undefined;
+
+  if (!isString(log.address) || !isAddress(log.address, { strict: false })) return undefined;
+
   if (!isHex(log.transactionHash) || !isHex(log.blockHash) || !isHex(log.data)) return undefined;
+
   try {
     const standard = topics.length === 3 ? 'erc20' : 'erc721';
+
     const { args } = decodeEventLog({
       abi: [standard === 'erc20' ? erc20Transfer : erc721Transfer],
       data: log.data,
       strict: true,
+      // SAFETY: only satisfies decodeEventLog's static signature; with strict: true it checks every topic against the
+      // ABI and throws (caught below) on a malformed one.
       topics: topics as [Hex, ...Hex[]],
     });
-    const { from, to, value, tokenId } = args as { from: Address; to: Address; value?: bigint; tokenId?: bigint };
-    const logIndex = quantity(log.logIndex);
+
+    const { from, to } = args;
+    const value = 'value' in args ? args.value : args.tokenId;
+    const logIndex = quantity(log, 'logIndex');
+
     if (logIndex > BigInt(Number.MAX_SAFE_INTEGER)) return undefined;
+
     return {
       standard,
-      token: log.address.toLowerCase() as Address,
-      from: from.toLowerCase() as Address,
-      to: to.toLowerCase() as Address,
-      value: (value ?? tokenId)!,
-      blockNumber: quantity(log.blockNumber),
-      blockHash: log.blockHash.toLowerCase() as Hex,
+      token: toLowerHex(log.address),
+      from: toLowerHex(from),
+      to: toLowerHex(to),
+      value,
+      blockNumber: quantity(log, 'blockNumber'),
+      blockHash: toLowerHex(log.blockHash),
       logIndex: Number(logIndex),
-      transactionHash: log.transactionHash.toLowerCase() as Hex,
+      transactionHash: toLowerHex(log.transactionHash),
     };
   } catch {
     return undefined;
   }
 }
 
-const getLogs = (rpc: RpcClient, filter: Record<string, unknown>): Promise<WireLog[]> => rpc.request('eth_getLogs', [filter], {
+const getLogs = (rpc: RpcClient, filter: { blockHash: Hex; topics: Hex[] }): Promise<WireLog[]> => rpc.request('eth_getLogs', [filter], {
   validate: Array.isArray,
 });
 
@@ -74,14 +92,19 @@ const getLogs = (rpc: RpcClient, filter: Record<string, unknown>): Promise<WireL
 export async function transfersInBlock(rpc: RpcClient, blockHash: Hex): Promise<TransferEvent[]> {
   const raw = await getLogs(rpc, { blockHash, topics: [TRANSFER_TOPIC] });
   const events: TransferEvent[] = [];
+
   for (const log of raw) {
     if (log.removed === true) continue;
+
     if (!isHex(log.blockHash) || log.blockHash.toLowerCase() !== blockHash) {
       throw new RpcError('transient', 'Log block hash does not match requested block');
     }
+
     const event = decodeTransferLog(log);
+
     if (event) events.push(event);
   }
+
   return events;
 }
 
@@ -99,17 +122,22 @@ export async function transfersInRange(
   await scanLogs(rpc, [TRANSFER_TOPIC], range, (log) => {
     if (log.removed === true) return;
     let number: bigint;
+
     try {
-      number = quantity(log.blockNumber);
+      number = quantity(log, 'blockNumber');
     } catch {
       throw new RpcError('transient', 'Log has no valid block number');
     }
+
     if (!isHex(log.blockHash) || expected.get(number) !== log.blockHash.toLowerCase()) {
       throw new RpcError('transient', `Log block hash does not match header at ${number}`);
     }
+
     const event = decodeTransferLog(log);
+
     if (event) events.push(event);
   });
+
   return events;
 }
 
@@ -142,6 +170,7 @@ async function scanLogs(
     let bytes: number | undefined;
     let ms = 0;
     let raw: WireLog[];
+
     try {
       raw = await rpc.request<WireLog[]>('eth_getLogs', [{
           fromBlock: `0x${part.fromBlock.toString(16)}`,
@@ -159,23 +188,47 @@ async function scanLogs(
     } catch (error) {
       const rpcError = rpcErrorOf(error);
       const splittable = rpcError?.kind === 'too_large' || (rpcError?.kind === 'transient' && rpcError.timeout === true);
+
       if (!splittable) throw rpcError ?? error;
+
       if (part.fromBlock === part.toBlock) throw rpcError;
 
       stats.split = true;
       const suggested = rpcError.suggestedRange;
+
       const splitAt = suggested && suggested.fromBlock === part.fromBlock && suggested.toBlock < part.toBlock
         ? suggested.toBlock
         : part.fromBlock + (part.toBlock - part.fromBlock) / 2n;
+
       await fetchRange({ fromBlock: part.fromBlock, toBlock: splitAt });
       await fetchRange({ fromBlock: splitAt + 1n, toBlock: part.toBlock });
+
       return;
     }
+
     stats.maxBytes = Math.max(stats.maxBytes, bytes ?? raw.length * APPROX_LOG_BYTES);
     stats.maxMs = Math.max(stats.maxMs, ms);
+
+    for (const log of raw) {
+      if (log.removed === true) continue;
+      let number: bigint;
+
+      try {
+        number = quantity(log, 'blockNumber');
+      } catch {
+        throw new RpcError('transient', 'Log has no valid block number');
+      }
+
+      if (number < part.fromBlock || number > part.toBlock) {
+        throw new RpcError('transient', `Log block ${number} outside requested range ${part.fromBlock}-${part.toBlock}`);
+      }
+    }
+
     for (const log of raw) onLog(log);
   };
+
   await fetchRange(range);
+
   return stats;
 }
 
@@ -189,18 +242,25 @@ export async function scanTransfers(
   shouldStop: () => boolean = () => false,
 ): Promise<LogsScanStats> {
   const accountTopic = pad(account, { size: 32 });
+
   const topics = direction === 'from'
     ? [TRANSFER_TOPIC, accountTopic, null]
     : [TRANSFER_TOPIC, null, accountTopic];
+
   return scanLogs(rpc, topics, range, (log) => {
     const event = decodeTransferLog(log);
+
     if (event) onTransfer(event);
   }, shouldStop);
 }
 
-/** The address in a 32-byte indexed topic, lowercase; undefined if the topic is not a padded address. */
-const topicAddress = (topic: unknown): Address | undefined =>
-  typeof topic === 'string' && /^0x0{24}[0-9a-fA-F]{40}$/.test(topic) ? `0x${topic.slice(26).toLowerCase()}` as Address : undefined;
+const paddedAddress = /^0x0{24}[0-9a-fA-F]{40}$/;
+
+/** A 32-byte indexed topic that holds a left-padded address. */
+const isAddressTopic = (topic: unknown): topic is Hex => isString(topic) && paddedAddress.test(topic);
+
+/** The address in a padded address topic, lowercase. */
+const topicAddress = (topic: Hex): Address => `0x${topic.slice(26).toLowerCase()}`;
 
 /**
  * Every Transfer in range, without an address filter (about 450 KB of JSON per mainnet block, so keep ranges at
@@ -211,16 +271,26 @@ export async function scanAllTransfers(
   range: BlockRange,
   onTransfer: (event: TransferEvent) => void,
   accept?: (address: Address) => boolean,
+  onSkipped?: (from: Address, to: Address, decode: () => TransferEvent | undefined) => void,
 ): Promise<{ calls: number }> {
   const { calls } = await scanLogs(rpc, [TRANSFER_TOPIC], range, (log) => {
     if (accept && Array.isArray(log.topics)) {
-      const from = topicAddress(log.topics[1]);
-      const to = topicAddress(log.topics[2]);
-      if (from && to && !accept(from) && !accept(to)) return;
+      const [, fromTopic, toTopic] = log.topics;
+      const from = isAddressTopic(fromTopic) ? topicAddress(fromTopic) : undefined;
+      const to = isAddressTopic(toTopic) ? topicAddress(toTopic) : undefined;
+
+      if (from && to && !accept(from) && !accept(to)) {
+        onSkipped?.(from, to, () => decodeTransferLog(log));
+
+        return;
+      }
     }
+
     const event = decodeTransferLog(log);
+
     if (event) onTransfer(event);
   });
+
   return { calls };
 }
 
@@ -230,13 +300,16 @@ export async function scanAccountChunk(rpc: RpcClient, account: Address, range: 
   let failed = false;
   let firstError: unknown;
   const onTransfer = (event: TransferEvent): void => addTransfer(aggregate, account, event);
+
   const run = (direction: TransferDirection) => scanTransfers(rpc, account, direction, range, onTransfer, () => failed)
-    .catch((error: unknown) => {
+    .catch((error) => {
       if (!failed) firstError = error;
       failed = true; // don't spend more calls on a chunk that already failed
       throw error;
     });
+
   const [sent, received] = await Promise.allSettled([run('from'), run('to')]);
+
   if (sent.status === 'rejected' || received.status === 'rejected') throw firstError;
   const a = sent.value;
   const b = received.value;
@@ -244,5 +317,6 @@ export async function scanAccountChunk(rpc: RpcClient, account: Address, range: 
   // and shrinking a slow small request would only add requests.
   const bytes = Math.max(a.maxBytes, b.maxBytes);
   const heavy = a.split || b.split || bytes > HEAVY_BYTES || (bytes > HEAVY_BYTES / 10 && Math.max(a.maxMs, b.maxMs) > HEAVY_MS);
+
   return { aggregate, calls: a.calls + b.calls, logs: aggregateLogCount(aggregate), heavy };
 }

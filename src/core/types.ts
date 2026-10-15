@@ -1,6 +1,7 @@
 // Shared contracts. Runs on Node's native type stripping: no enums, no parameter properties, `import type` for types.
 
 export type Hex = `0x${string}`;
+
 /** Always lowercase 0x-prefixed 20-byte address. */
 export type Address = `0x${string}`;
 
@@ -22,6 +23,8 @@ export interface HeadObservation {
   /** Epoch milliseconds when the head last advanced to a higher block number. */
   lastProgressAt: number;
   stale: boolean;
+  /** True when the latest refresh failed and this is the cached observation (then also stale). */
+  refreshFailed?: boolean;
 }
 
 export interface BlockRange {
@@ -133,12 +136,14 @@ export interface ChainAdapter {
   transfersInRange(range: BlockRange, headers: BlockHeader[]): Promise<TransferEvent[]>;
   /**
    * Every Transfer in range, unfiltered by address (the follower's source); callers keep ranges <= followerMaxRange.
-   * `accept` pre-filters by the from/to address before decoding. Splits on too_large/timeout like scanChunk.
+   * `accept` pre-filters by the from/to address before decoding; `onSkipped` exposes logs skipped by accept,
+   * decodable later. Splits on too_large/timeout like scanChunk.
    */
   scanAllTransfers(
     range: BlockRange,
     onTransfer: (event: TransferEvent) => void,
     accept?: (address: Address) => boolean,
+    onSkipped?: (from: Address, to: Address, decode: () => TransferEvent | undefined) => void,
   ): Promise<{ calls: number }>;
   /** balanceOf for each (account, token) pair, in input order, batched across accounts, pinned to one block hash. */
   erc20BalancePairs(pairs: BalancePair[], blockHash: Hex): Promise<BalanceResult[]>;
@@ -151,8 +156,9 @@ export interface BalancePair {
   token: Address;
 }
 
-export type BalanceResult = { status: 'ok'; balance: bigint } | { status: 'error'; error: string };
-export type OwnerResult = { status: 'ok'; owner: Address } | { status: 'error'; error: string };
+export type BalanceResult = { status: 'ok'; balance: bigint } | { status: 'error'; error: string; transient?: true };
+
+export type OwnerResult = { status: 'ok'; owner: Address } | { status: 'error'; error: string; transient?: true };
 
 // ---------------------------------------------------------------------------
 // Low-level JSON-RPC client (src/rpc). Resilience lives here.
@@ -166,6 +172,7 @@ export interface RpcClient {
 
 export interface RpcRequestOptions {
   /** Treat a syntactically successful but unusable result as a transient endpoint failure. */
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- boundary parser: validate inspects the raw JSON-RPC result before it is typed
   validate?: (result: unknown) => boolean;
   /** Throw a timeout (error.timeout) at once instead of retrying it, e.g. so the caller can split a log range. */
   failFastOnTimeout?: boolean;
@@ -238,6 +245,17 @@ export interface Tracking {
   progress?: bigint;
 }
 
+/** What the balance refresh needs to decide whether a pair must be re-read. */
+export interface Erc20RefreshState extends BalancePair {
+  /** Block of the pair's latest Transfer: max(holdings.last_block, tail Transfers). */
+  lastTransferBlock: bigint;
+  /**
+   * The stored snapshot, if any: `ok` = the read succeeded, `zero` = it succeeded with balance 0, `canonical` = its
+   * block is at or below the follower cursor, or its hash is the tail block at that height (false when orphaned).
+   */
+  snapshot?: { blockNumber: bigint; zero: boolean; ok: boolean; canonical: boolean };
+}
+
 export interface BalanceSnapshot {
   token: Address;
   result: BalanceResult;
@@ -286,8 +304,10 @@ export interface Store {
   getTailTip(network: string): Promise<BlockHeader | undefined>;
   /** Compare-and-append a contiguous hash chain in one transaction. */
   appendTailBlocks(network: string, expectedParentHash: Hex, blocks: TailBlock[]): Promise<void>;
-  rewindTail(network: string, aboveNumber: bigint): Promise<void>;
-  wipeTail(network: string): Promise<void>;
+  /** Delete tail blocks above `aboveNumber`; TailConflictError unless the locked tip hash is `expectedTipHash`. */
+  rewindTail(network: string, aboveNumber: bigint, expectedTipHash: Hex): Promise<void>;
+  /** Delete the whole tail; when `expectedTipHash` is given, TailConflictError unless it is the locked tip hash. */
+  wipeTail(network: string, expectedTipHash?: Hex): Promise<void>;
   /** Highest backfilled block, even if the backfill has not reached its target yet. */
   getProgress(network: string, account: Address): Promise<bigint | undefined>;
   /**
@@ -306,8 +326,15 @@ export interface Store {
   nftItems(network: string, account: Address): Promise<NftItem[]>;
   /** Every ERC-20 (account, token) pair of these accounts. */
   erc20Pairs(network: string, accounts: Address[]): Promise<BalancePair[]>;
-  /** Upsert balance snapshots read at `block`; a row never moves to an older block. */
-  saveBalances(network: string, block: BlockRef, rows: (BalancePair & { result: BalanceResult })[]): Promise<void>;
+  /** The same pairs as erc20Pairs, each with its latest Transfer block and stored snapshot state. */
+  erc20RefreshState(network: string, accounts: Address[]): Promise<Erc20RefreshState[]>;
+  /** Upsert balance snapshots read at `block`; a row moves backward only for a canonical-tip reorg refresh. */
+  saveBalances(
+    network: string,
+    block: BlockRef,
+    rows: (BalancePair & { result: BalanceResult })[],
+    opts?: { replaceNewer?: boolean },
+  ): Promise<void>;
   balances(network: string, account: Address): Promise<BalanceSnapshot[]>;
   close(): Promise<void>;
 }

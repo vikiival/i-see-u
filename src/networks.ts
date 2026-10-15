@@ -14,7 +14,7 @@ export interface EvmNetworkDefinition {
 }
 
 /** Static per-network facts. Adding an EVM network starts with one entry here. */
-export const networkRegistry: Record<string, EvmNetworkDefinition> = {
+export const networkRegistry = {
   ethereum: {
     name: 'ethereum',
     chainId: mainnet.id,
@@ -23,4 +23,4 @@ export const networkRegistry: Record<string, EvmNetworkDefinition> = {
     hypersyncUrl: 'https://eth.hypersync.xyz',
     multicall3: MULTICALL3,
   },
-};
+} satisfies Record<string, EvmNetworkDefinition>;

@@ -1,42 +1,56 @@
+import type { Address } from './core/types.ts';
 import { networkRegistry } from './networks.ts';
 
 try {
   process.loadEnvFile(new URL('../.env', import.meta.url));
 } catch (error) {
-  if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error;
 }
 
 const env = (k: string, d?: string): string => {
   const v = process.env[k] ?? d;
+
   if (v === undefined) throw new Error(`Missing env ${k}`);
+
   return v;
 };
 
 /** Every numeric knob is a positive integer; fail at startup rather than mid-scan. */
 const int = (k: string, d: string): number => {
   const v = Number(env(k, d));
+
   if (!Number.isSafeInteger(v) || v < 1) throw new Error(`${k} must be a positive integer`);
+
   return v;
 };
 
 const choice = <T extends string>(k: string, values: readonly T[], d: T): T => {
   const value = env(k, d);
-  if (!values.includes(value as T)) throw new Error(`${k} must be one of ${values.join(', ')}`);
-  return value as T;
+  const match = values.find((candidate) => candidate === value);
+
+  if (match === undefined) throw new Error(`${k} must be one of ${values.join(', ')}`);
+
+  return match;
 };
 
 const bool = (k: string, d: boolean): boolean => {
   const value = env(k, d ? 'true' : 'false');
+
   if (value === 'true' || value === '1') return true;
+
   if (value === 'false' || value === '0') return false;
   throw new Error(`${k} must be true or false`);
 };
 
 const intList = (k: string, d: string): number[] => env(k, d).split(',').map((part) => {
   const value = Number(part.trim());
+
   if (!Number.isSafeInteger(value) || value < 0) throw new Error(`${k} must contain non-negative integers`);
+
   return value;
 });
+
+const isLowercaseAddress = (value: string): value is Address => /^0x[0-9a-f]{40}$/.test(value);
 
 const tailEnabled = bool('TAIL_ENABLED', true);
 
@@ -54,8 +68,10 @@ const evmTuning = {
   /** Max blocks per unfiltered follower getLogs (~450 KB of JSON per block; must stay <= 1000). */
   followerMaxRange: BigInt(int('ETH_FOLLOWER_MAX_RANGE', '500')),
 };
+
 const networks = Object.fromEntries(Object.values(networkRegistry)
   .map((network) => [network.name, { ...network, ...evmTuning }]));
+
 const ethereum = networks.ethereum;
 
 export const config = {
@@ -92,11 +108,31 @@ export const config = {
     enabled: tailEnabled,
     maxDepth: BigInt(int('TAIL_MAX_DEPTH', '64')),
     pollOffsetsMs: intList('TAIL_POLL_OFFSETS_MS', '2500,5000,9000'),
+    /** Serve `latest` only while the tail tip block is at most this old (5 slots: up to 4 missed slots). */
+    maxTipAgeMs: int('TAIL_MAX_TIP_AGE_MS', '60000'),
+    /** Stop appending this far above the finalized cursor (~3.4 h; normally 64-95): bounds the tail if finality stalls. */
+    maxAheadBlocks: BigInt(int('TAIL_MAX_AHEAD_BLOCKS', '1024')),
   },
   balances: {
     /** Accounts whose balances were requested within this window are refreshed by the shared worker. */
     activeAccountTtlMs: int('ACTIVE_ACCOUNT_TTL_MS', '300000'),
     refreshMs: int('BALANCE_REFRESH_MS', '60000'),
+    /** Between refreshes only Transfer-touched pairs are re-read; this often every non-zero pair is (catches non-Transfer changes). */
+    fullSweepMs: int('BALANCE_FULL_SWEEP_MS', '3600000'),
+    /** Tokens whose balance changes without a Transfer (WETH Deposit, stETH rebase): re-read every refresh. */
+    alwaysRefreshTokens: env('BALANCE_ALWAYS_REFRESH_TOKENS',
+      '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2,0xae7ab96520de3a18e5e111b5eaab095312d7fe84')
+      .split(',').map((token) => token.trim().toLowerCase()).filter(Boolean).map((token) => {
+        if (!isLowercaseAddress(token)) throw new Error('BALANCE_ALWAYS_REFRESH_TOKENS must contain addresses');
+
+        return token;
+      }),
+  },
+  db: {
+    /** Postgres pool size (one connection is held permanently by the follower leader lock). */
+    poolMax: int('DB_POOL_MAX', '20'),
+    /** Fail pool acquisition after this long (surfaces as 503) instead of queueing forever. */
+    connectTimeoutMs: int('DB_CONNECT_TIMEOUT_MS', '5000'),
   },
   request: {
     /** Per-request deadline for RPC work left on the request path (cold backfill wait, first balance read). */
@@ -107,6 +143,8 @@ export const config = {
     /** Concurrent request-path RPC reads (first balance read, ownership), and how many more may wait. */
     rpcConcurrency: int('REQUEST_RPC_CONCURRENCY', '16'),
     rpcQueue: int('REQUEST_RPC_QUEUE', '256'),
+    /** verifyOwnership is skipped (not an error) when an account holds more NFT items than this. */
+    maxVerifyOwnershipItems: int('MAX_VERIFY_OWNERSHIP_ITEMS', '2000'),
   },
   /** Refuse discovery when the follower has not advanced for longer than this. */
   maxHeadProgressAgeMs: int('MAX_HEAD_AGE_MS', '1800000'),
@@ -116,13 +154,16 @@ for (const network of Object.values(config.networks)) {
   if (network.logsMinRange > network.logsMaxRange) {
     throw new Error('ETH_LOGS_MIN_RANGE must not exceed ETH_LOGS_MAX_RANGE');
   }
+
   if (network.followerMaxRange > 1_000n) {
     throw new Error('ETH_FOLLOWER_MAX_RANGE must not exceed 1000 (unfiltered responses are ~450 KB per block)');
   }
 }
+
 if (config.logSource === 'hypersync' && !config.hypersync.apiToken) {
   throw new Error('LOG_SOURCE=hypersync requires HYPERSYNC_API_KEY');
 }
+
 if (config.tail.pollOffsetsMs.length === 0 || config.tail.pollOffsetsMs.some((offset) => offset >= 12_000)) {
   throw new Error('TAIL_POLL_OFFSETS_MS must contain offsets within a 12-second slot');
 }
