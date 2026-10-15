@@ -1,16 +1,27 @@
 import { createPublicClient, custom } from 'viem';
 import type { Chain } from 'viem';
 
-import type { BlockHeader, HeadObservation, Hex, RpcClient } from '../../core/types.ts';
+import { isObject, isString, toLowerHex } from '../../core/parse.ts';
+import type { BlockHeader, HeadObservation, RpcClient } from '../../core/types.ts';
 
 const hexPattern = /^0x[0-9a-f]+$/i;
 
-const validBlock = (value: unknown): boolean => {
-  if (!value || typeof value !== 'object') return false;
-  const block = value as Record<string, unknown>;
+/** The header fields of an eth_getBlockByNumber result that viem's formatter needs, before formatting. */
+interface WireBlockHeader {
+  number: string;
+  hash: string;
+  parentHash: string;
+  timestamp: string;
+}
 
-  return ['number', 'hash', 'parentHash', 'timestamp'].every(key => typeof block[key] === 'string' && hexPattern.test(block[key]));
-};
+const isHexString = (value: unknown): value is string => isString(value) && hexPattern.test(value);
+
+const validBlock = (value: unknown): value is WireBlockHeader =>
+  isObject(value)
+  && 'number' in value && isHexString(value.number)
+  && 'hash' in value && isHexString(value.hash)
+  && 'parentHash' in value && isHexString(value.parentHash)
+  && 'timestamp' in value && isHexString(value.timestamp);
 
 export interface HeadTracker {
   /** Cached for cacheMs and single-flight; on failure or a lagging node, the newer cached block is served stale. */
@@ -42,12 +53,12 @@ export function createHeadTracker(
   let latest: bigint | undefined;
 
   const fetchBlock = async (at: 'finalized' | 'latest' | bigint): Promise<BlockHeader> => {
-    const block = await client.getBlock(typeof at === 'bigint' ? { blockNumber: at } : { blockTag: at });
+    const block = await client.getBlock(at === 'finalized' || at === 'latest' ? { blockTag: at } : { blockNumber: at });
 
     return {
       number: block.number,
-      hash: block.hash.toLowerCase() as Hex,
-      parentHash: block.parentHash.toLowerCase() as Hex,
+      hash: toLowerHex(block.hash),
+      parentHash: toLowerHex(block.parentHash),
       timestamp: block.timestamp,
     };
   };

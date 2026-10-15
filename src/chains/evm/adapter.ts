@@ -1,6 +1,7 @@
 import { isAddress } from 'viem';
 import type { Chain } from 'viem';
 
+import { toLowerHex } from '../../core/parse.ts';
 import type { AccountLogSource, Address, ChainAdapter, RpcClient } from '../../core/types.ts';
 import { createHeadTracker } from './head.ts';
 import { scanAllTransfers, transfersInBlock, transfersInRange } from './logs.ts';
@@ -34,7 +35,7 @@ export function createEvmAdapter(rpc: RpcClient, o: EvmAdapterOptions): ChainAda
     accountLogs: o.accountLogs,
     scanConcurrency: o.scanConcurrency,
     followerMaxRange: o.followerMaxRange,
-    normalizeAddress: (input) => isAddress(input, { strict: false }) ? input.toLowerCase() as Address : undefined,
+    normalizeAddress: (input) => isAddress(input, { strict: false }) ? toLowerHex(input) : undefined,
     finalizedHead: head.finalizedHead,
     latestHeader: head.latestHeader,
     cachedLatestBlockNumber: head.latestBlockNumber,

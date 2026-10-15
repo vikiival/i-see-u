@@ -3,6 +3,7 @@ import type { Log, Query, QueryResponse, StreamConfig } from '@envio-dev/hypersy
 
 import { addTransfer, aggregateLogCount, emptyAggregate } from '../core/aggregate.ts';
 import type { AccountLogSource, AccountLogSourceStats, Address, BlockRange } from '../core/types.ts';
+import { isNumber, isObject, thrownMessage } from '../core/parse.ts';
 import { decodeTransferLog } from '../chains/evm/logs.ts';
 import type { WireLog } from '../chains/evm/logs.ts';
 import { TRANSFER_TOPIC } from '../chains/evm/logs.ts';
@@ -31,11 +32,11 @@ export interface HypersyncSourceOptions {
   clientFactory?: () => Promise<HypersyncFactoryResult>;
 }
 
-const integer = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0;
+const integer = (value: unknown): value is number => isNumber(value) && Number.isSafeInteger(value) && value >= 0;
 const quantity = (value: number): `0x${string}` => `0x${value.toString(16)}`;
 
-const redact = (value: unknown, secrets: string[]): string => {
-  let message = value instanceof Error ? value.message : String(value);
+const redact = (raw: string, secrets: string[]): string => {
+  let message = raw;
 
   for (const secret of secrets) if (secret) message = message.split(secret).join('[redacted]');
   message = message
@@ -142,7 +143,7 @@ export function createHypersyncLogSource(options: HypersyncSourceOptions): Accou
         nextBlock = response.nextBlock;
 
         for (const raw of response.data.logs) {
-          if (!raw || typeof raw !== 'object' || !Array.isArray(raw.topics)) throw new Error('HyperSync returned a malformed log');
+          if (!isObject(raw) || !Array.isArray(raw.topics)) throw new Error('HyperSync returned a malformed log');
           const event = decodeTransferLog(wireLog(raw));
 
           if (event) addTransfer(aggregate, account, event);
@@ -188,7 +189,7 @@ export function createHypersyncLogSource(options: HypersyncSourceOptions): Accou
         return result;
       } catch (error) {
         state.failures += 1;
-        state.lastError = redact(error, secrets);
+        state.lastError = redact(thrownMessage(error), secrets);
         throw new Error(state.lastError);
       } finally {
         clearTimeout(timer);
