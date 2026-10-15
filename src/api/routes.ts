@@ -274,6 +274,9 @@ export function createApp(deps: RouteDeps, opts: { requestLog?: boolean } = {}):
           at: new Date(lastRefresh.at).toISOString(),
           block: lastRefresh.block?.toString(),
           pairs: lastRefresh.pairs,
+          candidates: lastRefresh.candidates,
+          read: lastRefresh.read,
+          fullSweep: lastRefresh.fullSweep,
         },
       }];
     })),

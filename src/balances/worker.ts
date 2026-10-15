@@ -14,6 +14,10 @@ export interface BalanceWorkerOptions {
   /** An account is active (refreshed by the worker) for this long after its last balances request. */
   activeTtlMs: number;
   refreshMs: number;
+  /** Every this often a refresh also re-reads unchanged pairs, except ok zero balances (default: 1 h). */
+  fullSweepMs?: number;
+  /** Tokens whose balance changes without a Transfer (WETH Deposit, stETH rebase): re-read every refresh. */
+  alwaysRefreshTokens?: readonly Address[];
   requestRpc: RequestRpc;
   /** When enabled, balances refresh at the persisted tail tip instead of the finalized cursor. */
   tailTip?: () => Promise<BlockRef | undefined>;
@@ -27,13 +31,29 @@ export interface BalanceWorker {
    * Only when a token has no snapshot at all is the account read immediately, at `at` (single-flight per account+block).
    */
   forAccount(account: Address, tokens: Address[], at: BlockRef): Promise<BalanceSnapshot[]>;
-  /** Read every (active account, ERC-20 token) pair at the follower cursor, batched across accounts. */
+  /**
+   * Re-read the (active account, ERC-20 token) pairs that may have changed, batched across accounts, at one block:
+   * pairs without a snapshot, pairs with a Transfer after their snapshot's block and always-refresh tokens; when the
+   * full sweep is due also every other pair except ok zero balances; after a reorg every pair. `pairs` = pairs read.
+   */
   refresh(): Promise<{ pairs: number; block?: bigint }>;
   /** Refresh now (the follower advanced) and restart the interval. */
   kick(opts?: { reorg?: boolean }): void;
   start(): void;
   stop(): Promise<void>;
-  stats(): { activeAccounts: number; lastRefresh?: { at: number; block?: bigint; pairs: number } };
+  stats(): { activeAccounts: number; lastRefresh?: RefreshStats };
+}
+
+export interface RefreshStats {
+  at: number;
+  block?: bigint;
+  /** Pairs read (same as `read`, kept for compatibility). */
+  pairs: number;
+  /** Pairs of active accounts considered. */
+  candidates: number;
+  read: number;
+  /** This refresh was a full sweep (interval due, or a reorg re-read every pair). */
+  fullSweep: boolean;
 }
 
 export function createBalanceWorker(o: BalanceWorkerOptions): BalanceWorker {
@@ -49,7 +69,12 @@ export function createBalanceWorker(o: BalanceWorkerOptions): BalanceWorker {
   let pendingReorg = false;
   let stopped = true;
   let timer: ReturnType<typeof setTimeout> | undefined;
-  let lastRefresh: { at: number; block?: bigint; pairs: number } | undefined;
+  let lastRefresh: RefreshStats | undefined;
+  let lastFullSweepAt: number | undefined;
+  const fullSweepMs = o.fullSweepMs ?? 3_600_000;
+  const always = new Set<string>(o.alwaysRefreshTokens ?? []);
+  /** Pairs whose last refresh read failed transiently: their old snapshot passes the change test, so retry them. */
+  let retry = new Set<string>();
 
   const readNow = async (account: Address, tokens: Address[], at: BlockRef): Promise<void> => {
     const results = await adapter.erc20BalancePairs(tokens.map((token) => ({ account, token })), at.hash);
@@ -60,28 +85,43 @@ export function createBalanceWorker(o: BalanceWorkerOptions): BalanceWorker {
   };
 
   const refresh = (): Promise<{ pairs: number; block?: bigint }> => {
-    refreshing ??= (async () => {
+    refreshing ??= (async (): Promise<Omit<RefreshStats, 'at'>> => {
       const replaceNewer = pendingReorg;
       pendingReorg = false;
       const cutoff = now() - o.activeTtlMs;
       for (const [account, seenAt] of active) if (seenAt < cutoff) active.delete(account);
       const cursor = await store.getFollowerCursor(network);
-      if (!cursor || active.size === 0) return { pairs: 0 };
+      if (!cursor || active.size === 0) return { pairs: 0, candidates: 0, read: 0, fullSweep: false };
       const at = await o.tailTip?.() ?? cursor;
-      const pairs = await store.erc20Pairs(network, [...active.keys()]);
-      if (pairs.length === 0) return { pairs: 0, block: at.number };
-      // One block for every pair, pinned by hash; a balance read at N is never reported for a later block.
-      const results = await adapter.erc20BalancePairs(pairs, at.hash);
-      const rows = pairs
-        .map((pair, i) => ({ ...pair, result: results[i] }))
-        .filter((row) => row.result.status !== 'error' || !row.result.transient);
-      if (rows.length > 0) {
-        await store.saveBalances(network, at, rows, replaceNewer ? { replaceNewer: true } : undefined);
+      const states = await store.erc20RefreshState(network, [...active.keys()]);
+      const sweepDue = lastFullSweepAt === undefined || now() - lastFullSweepAt >= fullSweepMs;
+      // A reorg may have orphaned any snapshot's block, so the Transfer test cannot be trusted: read every pair.
+      const fullSweep = replaceNewer || sweepDue;
+      const pairs = states.filter(({ account, token, lastTransferBlock, snapshot }) => replaceNewer
+        || !snapshot
+        || lastTransferBlock > snapshot.blockNumber
+        || always.has(token)
+        || retry.has(`${account}:${token}`)
+        // A zero balance only becomes non-zero through a Transfer, which the test above catches.
+        || (sweepDue && !(snapshot.ok && snapshot.zero)))
+        .map(({ account, token }) => ({ account, token }));
+      const done = { candidates: states.length, read: pairs.length, pairs: pairs.length, fullSweep, block: at.number };
+      if (pairs.length > 0) {
+        // One block for every pair, pinned by hash; a balance read at N is never reported for a later block.
+        const results = await adapter.erc20BalancePairs(pairs, at.hash);
+        const read = pairs.map((pair, i) => ({ ...pair, result: results[i] }));
+        const transient = (row: (typeof read)[number]) => row.result.status === 'error' && row.result.transient === true;
+        retry = new Set(read.filter(transient).map((row) => `${row.account}:${row.token}`));
+        const rows = read.filter((row) => !transient(row));
+        if (rows.length > 0) {
+          await store.saveBalances(network, at, rows, replaceNewer ? { replaceNewer: true } : undefined);
+        }
       }
-      return { pairs: pairs.length, block: at.number };
+      if (fullSweep) lastFullSweepAt = now();
+      return done;
     })().then((result) => {
       lastRefresh = { at: now(), ...result };
-      return result;
+      return { pairs: result.pairs, ...(result.block !== undefined && { block: result.block }) };
     }).finally(() => { refreshing = undefined; });
     return refreshing;
   };

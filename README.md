@@ -43,6 +43,8 @@ Optional env (numeric values must be positive integers; invalid values fail at s
 | `MAX_HEAD_AGE_MS` | 1800000 | Discovery returns 503 after the follower has not advanced for this long |
 | `ACTIVE_ACCOUNT_TTL_MS` | 300000 | Accounts that requested balances within this window are refreshed by the balance worker |
 | `BALANCE_REFRESH_MS` | 60000 | Balance worker interval (it also runs whenever the follower advances) |
+| `BALANCE_FULL_SWEEP_MS` | 3600000 | How often a refresh also re-reads pairs with no Transfer since their snapshot (ok zero balances are still skipped) |
+| `BALANCE_ALWAYS_REFRESH_TOKENS` | WETH, stETH | Comma-separated lowercase token addresses re-read every refresh because their balances change without `Transfer` (may be empty) |
 | `ETH_MULTICALL_BATCH` | 1000 | `balanceOf` calls per Multicall3 `aggregate3` |
 | `ETH_LOGS_MAX_RANGE` / `ETH_LOGS_MIN_RANGE` | 3000 / 500 | Adaptive range of address-filtered backfill `getLogs` |
 | `ETH_SCAN_CONCURRENCY` | 8 | Backfill chunks in flight per account |

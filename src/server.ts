@@ -45,6 +45,8 @@ const balances = Object.fromEntries(Object.values(adapters).map((adapter) => [ad
   store,
   activeTtlMs: config.balances.activeAccountTtlMs,
   refreshMs: config.balances.refreshMs,
+  fullSweepMs: config.balances.fullSweepMs,
+  alwaysRefreshTokens: config.balances.alwaysRefreshTokens,
   requestRpc,
   tailTip: config.tail.enabled ? () => store.getTailTip(adapter.network) : undefined,
   onError: logError('balance refresh'),
