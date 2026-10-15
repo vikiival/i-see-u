@@ -263,6 +263,44 @@ test('balance snapshots keep the block they were read at and never move to an ol
   }
 });
 
+test('erc20RefreshState: latest Transfer block takes the tail max over holdings; snapshot zero/ok are reported', async () => {
+  const { store } = await createTestStore();
+  try {
+    const tailOnly = '0xdddddddddddddddddddddddddddddddddddddddd' as Address;
+    const failing = '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' as Address;
+    await applyScan(store, [event(), event({ token: failing, blockNumber: 12n, logIndex: 1 })], block(15n));
+    await store.initFollowerCursor('ethereum', block(20n), 1);
+    const header = (number: bigint) => ({ ...block(number), parentHash: block(number - 1n).hash });
+    const inTail = (n: bigint, overrides: Partial<TransferEvent>) =>
+      event({ from: other, to: account, blockNumber: n, blockHash: block(n).hash, ...overrides });
+    await store.appendTailBlocks('ethereum', block(20n).hash, [
+      { header: header(21n), transfers: [inTail(21n, { token: tailOnly }), inTail(21n, { logIndex: 1 })] },
+      { header: header(22n), transfers: [inTail(22n, {})] },
+    ]);
+    await store.saveBalances('ethereum', block(21n), [
+      { account, token, result: { status: 'ok', balance: 0n } },
+      { account, token: tailOnly, result: { status: 'ok', balance: 5n } },
+      { account, token: failing, result: { status: 'error', error: 'reverted' } },
+    ]);
+
+    const states = await store.erc20RefreshState('ethereum', [account]);
+    expect(states).toHaveLength(3);
+    expect(states).toEqual(expect.arrayContaining([
+      { account, token, lastTransferBlock: 22n, snapshot: { blockNumber: 21n, ok: true, zero: true } },
+      { account, token: tailOnly, lastTransferBlock: 21n, snapshot: { blockNumber: 21n, ok: true, zero: false } },
+      { account, token: failing, lastTransferBlock: 12n, snapshot: { blockNumber: 21n, ok: false, zero: false } },
+    ]));
+    // The counterparty is not a tracked holder here, so only its tail pairs appear, without snapshots.
+    expect(await store.erc20RefreshState('ethereum', [other])).toEqual(expect.arrayContaining([
+      { account: other, token, lastTransferBlock: 22n },
+      { account: other, token: tailOnly, lastTransferBlock: 21n },
+    ]));
+    expect((await store.erc20Pairs('ethereum', [account])).length).toBe(3);
+  } finally {
+    await store.close();
+  }
+});
+
 test('a reorg refresh can replace a balance snapshot from a newer orphaned block', async () => {
   const { store } = await createTestStore();
   try {
