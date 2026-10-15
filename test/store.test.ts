@@ -1,20 +1,20 @@
 import { migrate } from 'drizzle-orm/pglite/migrator';
 import { expect, test } from 'vitest';
 
-import type { Address, BlockRef, Hex, Store, TransferEvent } from '../src/core/types.ts';
+import type { Address, BlockRef, Store, TransferEvent } from '../src/core/types.ts';
 import { addTransfer, emptyAggregate } from '../src/core/aggregate.ts';
 import { advisoryKey, singleConnectionLeaderLock, withAdvisoryLock } from '../src/store/advisory-lock.ts';
 import { migrationsFolder } from '../src/store/postgres.ts';
 import { TailConflictError } from '../src/store/store.ts';
 import { createTestStore } from './store-fixture.ts';
 
-const account = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' as Address;
-const other = '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' as Address;
-const token = '0xcccccccccccccccccccccccccccccccccccccccc' as Address;
+const account: Address = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+const other: Address = '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+const token: Address = '0xcccccccccccccccccccccccccccccccccccccccc';
 
 const block = (number: bigint): BlockRef => ({
   number,
-  hash: `0x${number.toString(16)}` as Hex,
+  hash: `0x${number.toString(16)}`,
   timestamp: number * 10n,
 });
 
@@ -41,7 +41,7 @@ function event(overrides: Partial<TransferEvent> = {}): TransferEvent {
     blockNumber: 10n,
     blockHash: block(10n).hash,
     logIndex: 0,
-    transactionHash: '0x01' as Hex,
+    transactionHash: '0x01',
     ...overrides,
   };
 }
@@ -76,7 +76,7 @@ test('NFT held flag only follows the newest block and log index', async () => {
       value: 42n,
       blockNumber: 20n,
       logIndex: 3,
-      transactionHash: '0x02' as Hex,
+      transactionHash: '0x02',
     });
 
     const olderOutgoing = event({
@@ -86,7 +86,7 @@ test('NFT held flag only follows the newest block and log index', async () => {
       value: 42n,
       blockNumber: 20n,
       logIndex: 2,
-      transactionHash: '0x03' as Hex,
+      transactionHash: '0x03',
     });
 
     const newerOutgoing = event({
@@ -96,7 +96,7 @@ test('NFT held flag only follows the newest block and log index', async () => {
       value: 42n,
       blockNumber: 21n,
       logIndex: 0,
-      transactionHash: '0x04' as Hex,
+      transactionHash: '0x04',
     });
 
     await applyScan(store, [incoming, olderOutgoing], block(20n));
@@ -168,7 +168,7 @@ test('the chunk aggregate dedupes only self-transfers and keeps the latest ERC-7
     value: 7n,
     blockNumber,
     logIndex,
-    transactionHash: `0x${blockNumber}${logIndex}` as Hex,
+    transactionHash: `0x${blockNumber}${logIndex}`,
   });
 
   // Both directions return the self-transfer; insertion order of the NFT logs is arbitrary.
@@ -285,8 +285,8 @@ test('erc20RefreshState: latest Transfer block takes the tail max over holdings;
   const { store } = await createTestStore();
 
   try {
-    const tailOnly = '0xdddddddddddddddddddddddddddddddddddddddd' as Address;
-    const failing = '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' as Address;
+    const tailOnly: Address = '0xdddddddddddddddddddddddddddddddddddddddd';
+    const failing: Address = '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
     await applyScan(store, [event(), event({ token: failing, blockNumber: 12n, logIndex: 1 })], block(15n));
     await store.initFollowerCursor('ethereum', block(20n), 1);
     const header = (number: bigint) => ({ ...block(number), parentHash: block(number - 1n).hash });
@@ -303,12 +303,12 @@ test('erc20RefreshState: latest Transfer block takes the tail max over holdings;
       { account, token: tailOnly, result: { status: 'ok', balance: 5n } },
       { account, token: failing, result: { status: 'error', error: 'reverted' } },
     ]);
-    const orphaned = '0x9999999999999999999999999999999999999999' as Address;
-    const finalized = '0x8888888888888888888888888888888888888888' as Address;
+    const orphaned: Address = '0x9999999999999999999999999999999999999999';
+    const finalized: Address = '0x8888888888888888888888888888888888888888';
     const later = (overrides: Partial<TransferEvent>) => event({ blockNumber: 16n, blockHash: block(16n).hash, ...overrides });
     await applyScan(store, [later({ token: orphaned, logIndex: 2 }), later({ token: finalized, logIndex: 3 })], block(18n));
     // A read at another hash of tail height 22 (orphaned), and one at or below the cursor (finalized since).
-    await store.saveBalances('ethereum', { ...block(22n), hash: '0xdead' as Hex }, [
+    await store.saveBalances('ethereum', { ...block(22n), hash: '0xdead' }, [
       { account, token: orphaned, result: { status: 'ok', balance: 1n } },
     ]);
     await store.saveBalances('ethereum', block(20n), [{ account, token: finalized, result: { status: 'ok', balance: 1n } }]);

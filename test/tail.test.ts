@@ -199,7 +199,7 @@ test('finalization prunes matching rows without double count and wipes a mismatc
     expect(view?.holdings[0].receivedCount).toBe(2);
     expect(view?.tailTransfers).toHaveLength(1);
 
-    const fork: BlockHeader = { number: 104n, hash: '0xdead' as Hex, parentHash: blockHash(103n), timestamp: 1_248n };
+    const fork: BlockHeader = { number: 104n, hash: '0xdead', parentHash: blockHash(103n), timestamp: 1_248n };
     await s.store.appendTailBlocks('ethereum', blockHash(103n), [{ header: fork, transfers: [] }]);
     await s.store.applyFollowerRange('ethereum', { fromBlock: 103n, toBlock: 104n }, blockRef(104n), 3,
       new Map(), new Set([account]));
@@ -526,13 +526,13 @@ test('a header that changes mid catch-up (load-balanced nodes) is retried, not c
 
   const adapter = {
     ...s.adapter,
-    headerByNumber: async (number: bigint) => {
+    headerByNumber: async (number: bigint): Promise<BlockHeader> => {
       const header = await s.adapter.headerByNumber(number);
 
       if (number !== 102n || !flaky) return header;
       flaky = false;
 
-      return { ...header, parentHash: '0xbad' as Hex };
+      return { ...header, parentHash: '0xbad' };
     },
   };
 

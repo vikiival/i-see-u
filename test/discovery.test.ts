@@ -3,6 +3,7 @@ import { expect, test } from 'vitest';
 import type {
   Address,
   AccountLogSource,
+  BlockHeader,
   BalanceResult,
   BlockRange,
   BlockRef,
@@ -10,7 +11,6 @@ import type {
   ChunkScan,
   DiscoveryResult,
   FollowerStatus,
-  Hex,
   HeadObservation,
   OwnerResult,
   SyncingResult,
@@ -19,10 +19,11 @@ import type {
 } from '../src/core/types.ts';
 import { addTransfer, emptyAggregate } from '../src/core/aggregate.ts';
 import { createDiscoveryService } from '../src/discovery/service.ts';
+import { lowerAddress } from './helpers.ts';
 import { createTestStore } from './store-fixture.ts';
 
-const account = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' as Address;
-const uppercaseAccount = `0x${account.slice(2).toUpperCase()}` as Address;
+const account: Address = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+const uppercaseAccount: Address = `0x${account.slice(2).toUpperCase()}`;
 
 class FakeAdapter implements ChainAdapter {
   readonly network = 'ethereum';
@@ -34,7 +35,7 @@ class FakeAdapter implements ChainAdapter {
   readonly accountLogs: AccountLogSource;
   head: BlockRef = {
     number: 110n,
-    hash: '0x110' as Hex,
+    hash: '0x110',
     timestamp: 1_000n,
   };
   calls: { account: Address; direction: TransferDirection; range: BlockRange }[] = [];
@@ -45,18 +46,20 @@ class FakeAdapter implements ChainAdapter {
   heavy?: (range: BlockRange) => boolean;
 
   constructor() {
-    const adapter = this;
+    const logsMaxRange = () => this.logsMaxRange;
+    const logsMinRange = () => this.logsMinRange;
+    const scanChunk = (requestedAccount: Address, range: BlockRange) => this.scanChunk(requestedAccount, range);
     this.accountLogs = {
       name: 'fake',
-      get preferredMaxRange() { return adapter.logsMaxRange; },
-      get adaptiveRange() { return { minRange: adapter.logsMinRange }; },
-      scanAccount: (requestedAccount, range) => adapter.scanChunk(requestedAccount, range),
+      get preferredMaxRange() { return logsMaxRange(); },
+      get adaptiveRange() { return { minRange: logsMinRange() }; },
+      scanAccount: (requestedAccount, range) => scanChunk(requestedAccount, range),
       stats: () => ({ fake: { requests: 0, chunks: 0, logs: 0, failures: 0, fallbacks: 0 } }),
     };
   }
 
   normalizeAddress(input: string): Address | undefined {
-    return /^0x[0-9a-f]{40}$/i.test(input) ? input.toLowerCase() as Address : undefined;
+    return /^0x[0-9a-f]{40}$/i.test(input) ? lowerAddress(input) : undefined;
   }
 
   async finalizedHead(): Promise<HeadObservation> {
@@ -67,8 +70,8 @@ class FakeAdapter implements ChainAdapter {
     };
   }
 
-  async latestHeader() {
-    return { ...this.head, parentHash: `0x${this.head.number - 1n}` as Hex };
+  async latestHeader(): Promise<BlockHeader> {
+    return { ...this.head, parentHash: `0x${this.head.number - 1n}` };
   }
 
   async scanChunk(requestedAccount: Address, range: BlockRange): Promise<ChunkScan> {
@@ -92,11 +95,11 @@ class FakeAdapter implements ChainAdapter {
   }
 
   async blockByNumber(number: bigint): Promise<BlockRef> {
-    return { number, hash: `0x${number}` as Hex, timestamp: number * 10n };
+    return { number, hash: `0x${number}`, timestamp: number * 10n };
   }
 
-  async headerByNumber(number: bigint) {
-    return { ...(await this.blockByNumber(number)), parentHash: `0x${number - 1n}` as Hex };
+  async headerByNumber(number: bigint): Promise<BlockHeader> {
+    return { ...(await this.blockByNumber(number)), parentHash: `0x${number - 1n}` };
   }
 
   async transfersInBlock(): Promise<TransferEvent[]> { return []; }
@@ -158,7 +161,7 @@ test('first discovery tracks the account and backfills [startBlock, follower cur
 
     // The follower advanced the global cursor: the account is served from the store, without scanning.
     await store.applyFollowerRange('ethereum', { fromBlock: 111n, toBlock: 115n },
-      { number: 115n, hash: '0x115' as Hex, timestamp: 1_100n }, Date.now(), new Map(), new Set([account]));
+      { number: 115n, hash: '0x115', timestamp: 1_100n }, Date.now(), new Map(), new Set([account]));
     const second = ready(await service.discover('ethereum', account));
     expect(second.blockHeight).toBe(115n);
     expect(second.blockHash).toBe('0x115');
@@ -218,7 +221,7 @@ test('network names inherited from Object.prototype are unknown networks (404), 
 test('legacy scan progress above the follower cursor is discarded and rebuilt, not double counted', async () => {
   const adapter = new FakeAdapter();
   const { store, service } = await setup(adapter);
-  const token = '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' as Address;
+  const token: Address = '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
 
   const transfer = {
     standard: 'erc20', token, from: account, to: token, value: 1n, blockNumber: 105n,
@@ -257,7 +260,7 @@ test('an unhealthy follower rejects with 503 before tracking or scanning', async
 test('a failed third chunk preserves two committed chunks and the next call resumes there', async () => {
   const adapter = new FakeAdapter();
   Object.defineProperty(adapter, 'logsMaxRange', { value: 2n });
-  adapter.head = { number: 109n, hash: '0x109' as Hex, timestamp: 1_090n };
+  adapter.head = { number: 109n, hash: '0x109', timestamp: 1_090n };
   const { store, service } = await setup(adapter);
   let fail = true;
   adapter.handler = async (direction, range) => {
@@ -284,7 +287,7 @@ test('a failed third chunk preserves two committed chunks and the next call resu
 
 test('a chunk is not committed when either direction fails', async () => {
   const adapter = new FakeAdapter();
-  adapter.head = { number: 100n, hash: '0x100' as Hex, timestamp: 1_000n };
+  adapter.head = { number: 100n, hash: '0x100', timestamp: 1_000n };
   adapter.handler = async (direction) => {
     if (direction === 'to') throw new Error('received direction failed');
 
@@ -292,14 +295,14 @@ test('a chunk is not committed when either direction fails', async () => {
       calls: 1,
       events: [{
         standard: 'erc20',
-        token: '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' as Address,
+        token: '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
         from: account,
-        to: '0xcccccccccccccccccccccccccccccccccccccccc' as Address,
+        to: '0xcccccccccccccccccccccccccccccccccccccccc',
         value: 1n,
         blockNumber: 100n,
-        blockHash: '0x100' as Hex,
+        blockHash: '0x100',
         logIndex: 0,
-        transactionHash: '0x01' as Hex,
+        transactionHash: '0x01',
       }],
     };
   };
@@ -317,18 +320,18 @@ test('a chunk is not committed when either direction fails', async () => {
 
 test('a self-transfer returned by both directions is counted once per side', async () => {
   const adapter = new FakeAdapter();
-  adapter.head = { number: 100n, hash: '0x100' as Hex, timestamp: 1_000n };
+  adapter.head = { number: 100n, hash: '0x100', timestamp: 1_000n };
 
   const transfer: TransferEvent = {
     standard: 'erc20',
-    token: '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' as Address,
+    token: '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
     from: account,
     to: account,
     value: 1n,
     blockNumber: 100n,
-    blockHash: '0x100' as Hex,
+    blockHash: '0x100',
     logIndex: 0,
-    transactionHash: '0x01' as Hex,
+    transactionHash: '0x01',
   };
 
   adapter.handler = async () => ({ events: [transfer], calls: 1 });
@@ -347,7 +350,7 @@ const tick = (): Promise<void> => new Promise<void>((resolve) => setImmediate(re
 test('a slow first chunk does not idle the other slots; commits stay in order and the buffer is bounded', async () => {
   const adapter = new FakeAdapter();
   Object.defineProperty(adapter, 'logsMaxRange', { value: 2n });
-  adapter.head = { number: 113n, hash: '0x113' as Hex, timestamp: 1_130n }; // 7 chunks
+  adapter.head = { number: 113n, hash: '0x113', timestamp: 1_130n }; // 7 chunks
   const { store, service } = await setup(adapter);
   let releaseFirst = (): void => {};
   const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
@@ -396,7 +399,7 @@ test('a slow first chunk does not idle the other slots; commits stay in order an
 test('a failed later chunk still commits the earlier ones, then rejects', async () => {
   const adapter = new FakeAdapter();
   Object.defineProperty(adapter, 'logsMaxRange', { value: 2n });
-  adapter.head = { number: 109n, hash: '0x109' as Hex, timestamp: 1_090n };
+  adapter.head = { number: 109n, hash: '0x109', timestamp: 1_090n };
   let releaseFirst = (): void => {};
   const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
   adapter.handler = async (_direction, range) => {
@@ -430,10 +433,10 @@ test('the range halves after a heavy chunk, doubles after three light ones, and 
   Object.defineProperty(adapter, 'logsMaxRange', { value: 8n });
   Object.defineProperty(adapter, 'logsMinRange', { value: 2n });
   Object.defineProperty(adapter, 'scanConcurrency', { value: 1 });
-  adapter.head = { number: 135n, hash: '0x135' as Hex, timestamp: 1_350n };
+  adapter.head = { number: 135n, hash: '0x135', timestamp: 1_350n };
   adapter.heavy = (range) => range.fromBlock === 100n;
-  const heavyAccount = '0xdddddddddddddddddddddddddddddddddddddddd' as Address;
-  const resumedAccount = '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' as Address;
+  const heavyAccount: Address = '0xdddddddddddddddddddddddddddddddddddddddd';
+  const resumedAccount: Address = '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
 
   const sizes = () => adapter.calls
     .filter((call) => call.direction === 'from')
@@ -469,7 +472,7 @@ test('concurrent heavy results shrink once from their own size, not repeatedly',
   Object.defineProperty(adapter, 'logsMaxRange', { value: 8n });
   Object.defineProperty(adapter, 'logsMinRange', { value: 1n });
   Object.defineProperty(adapter, 'scanConcurrency', { value: 4 });
-  adapter.head = { number: 131n, hash: '0x131' as Hex, timestamp: 1_310n };
+  adapter.head = { number: 131n, hash: '0x131', timestamp: 1_310n };
   adapter.heavy = (range) => range.toBlock - range.fromBlock + 1n === 8n;
   const { store, service } = await setup(adapter);
 

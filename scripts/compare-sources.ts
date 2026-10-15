@@ -4,7 +4,7 @@ import type { AccountLogSource, ChunkAggregate } from '../src/core/types.ts';
 try {
   process.loadEnvFile(new URL('../.env', import.meta.url));
 } catch (error) {
-  if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error;
 }
 
 const { createEvmAdapter } = await import('../src/chains/evm/adapter.ts');

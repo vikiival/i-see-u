@@ -4,6 +4,7 @@ import { decodeFunctionData, encodeFunctionResult } from 'viem';
 
 import { MULTICALL3, readErc20Balances, readErc721Owners } from '../src/chains/evm/multicall.ts';
 import type { Address, Hex, RpcClient, RpcRequestOptions, RpcStats } from '../src/core/types.ts';
+import { lowerAddress, rpcParam, staged } from './helpers.ts';
 import { RpcError } from '../src/rpc/errors.ts';
 
 const aggregate3Abi = [
@@ -47,20 +48,22 @@ const ownerOfAbi = [{
   outputs: [{ name: 'owner', type: 'address' }],
 }] as const;
 
-const address = (n: number): Address => `0x${n.toString(16).padStart(40, '0')}` as Address;
+const address = (n: number): Address => `0x${n.toString(16).padStart(40, '0')}`;
 const blockHash = (number: bigint): Hex => `0x${number.toString(16).padStart(64, 'a')}`;
 
 const emptyStats = (): RpcStats => ({ requests: 0, attempts: 0, byMethod: {}, errors: {}, endpoints: [] });
 
-class FakeRpc implements RpcClient {
-  readonly handler: (method: string, params: unknown[]) => unknown | Promise<unknown>;
+type RpcPayload = NonNullable<unknown>;
 
-  constructor(handler: (method: string, params: unknown[]) => unknown | Promise<unknown>) {
+class FakeRpc implements RpcClient {
+  readonly handler: (method: string, params: unknown[]) => RpcPayload | Promise<RpcPayload>;
+
+  constructor(handler: (method: string, params: unknown[]) => RpcPayload | Promise<RpcPayload>) {
     this.handler = handler;
   }
 
   async request<T>(method: string, params: unknown[]): Promise<T> {
-    return await this.handler(method, params) as T;
+    return staged<T>(await this.handler(method, params));
   }
 
   stats(): RpcStats {
@@ -70,9 +73,9 @@ class FakeRpc implements RpcClient {
 
 class ValidatingRpc implements RpcClient {
   attempts = 0;
-  readonly responses: unknown[];
+  readonly responses: RpcPayload[];
 
-  constructor(responses: unknown[]) {
+  constructor(responses: RpcPayload[]) {
     this.responses = responses;
   }
 
@@ -80,7 +83,7 @@ class ValidatingRpc implements RpcClient {
     for (const response of this.responses) {
       this.attempts += 1;
 
-      if (!opts?.validate || opts.validate(response)) return response as T;
+      if (!opts?.validate || opts.validate(response)) return staged<T>(response);
     }
 
     throw new RpcError('transient', 'RPC endpoint returned an invalid result');
@@ -92,7 +95,7 @@ class ValidatingRpc implements RpcClient {
 }
 
 const callsFrom = (params: unknown[]) => {
-  const transaction = params[0] as { to: Address; data: Hex };
+  const transaction = rpcParam<{ to: Address; data: Hex }>(params, 0);
   expect(transaction.to).toBe(MULTICALL3);
   const decoded = decodeFunctionData({ abi: aggregate3Abi, data: transaction.data });
 
@@ -150,7 +153,7 @@ test('out-of-gas failures recursively halve and preserve input order', async () 
     seenSizes.push(calls.length);
 
     if (calls.length > 1) throw new RpcError('fatal', 'execution ran out of gas');
-    const value = BigInt(tokens.indexOf(calls[0].target.toLowerCase() as Address) + 100);
+    const value = BigInt(tokens.indexOf(lowerAddress(calls[0].target)) + 100);
 
     return encodeFunctionResult({
       abi: aggregate3Abi,
@@ -200,7 +203,7 @@ test('one failed chunk preserves successful chunks and input order', async () =>
         returnData: encodeFunctionResult({
           abi: balanceOfAbi,
           functionName: 'balanceOf',
-          result: BigInt(tokens.indexOf(call.target.toLowerCase() as Address) + 100),
+          result: BigInt(tokens.indexOf(lowerAddress(call.target)) + 100),
         }),
       })),
     });
