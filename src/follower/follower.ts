@@ -62,12 +62,15 @@ export function createFollower(o: FollowerOptions): Follower {
     const known = new Set(tracked);
     const aggregates = new Map<Address, ChunkAggregate>();
     const skipped: { from: Address; to: Address; decode: () => TransferEvent | undefined }[] = [];
+    /** Every event folded so far: an endpoint tracked later was unknown when it was folded, so it is added on refold. */
+    const folded: TransferEvent[] = [];
     const add = (account: Address, event: TransferEvent): void => {
       let aggregate = aggregates.get(account);
       if (!aggregate) aggregates.set(account, aggregate = emptyAggregate());
       addTransfer(aggregate, account, event);
     };
     const fold = (event: TransferEvent): void => {
+      folded.push(event);
       if (known.has(event.from)) add(event.from, event);
       if (event.to !== event.from && known.has(event.to)) add(event.to, event);
     };
@@ -85,6 +88,10 @@ export function createFollower(o: FollowerOptions): Follower {
       for (const account of newlyKnown) {
         tracked!.add(account);
         known.add(account);
+      }
+      for (const event of folded) {
+        if (newlyKnown.has(event.from)) add(event.from, event);
+        if (event.to !== event.from && newlyKnown.has(event.to)) add(event.to, event);
       }
       for (let i = skipped.length - 1; i >= 0; i -= 1) {
         const entry = skipped[i];

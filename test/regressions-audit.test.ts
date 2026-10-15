@@ -11,17 +11,17 @@ import { advisoryKey, singleConnectionLeaderLock } from '../src/store/advisory-l
 import { address, blockRef, FakeChain, gate } from './fake-chain.ts';
 import { createTestStore } from './store-fixture.ts';
 
-// Reproductions of three audit claims against feat/improve. Each test is expected to FAIL until the bug is fixed.
+// Regression tests for three audit findings on feat/improve (follower refold, same-height balances, stale head).
 
 /** Same wiring as test/follower.test.ts. */
-async function stack(chain: FakeChain) {
+async function stack(chain: FakeChain, opts: { followerStore?: (store: Store) => Store } = {}) {
   const { db, store } = await createTestStore();
   const clock = { t: 1_800_000_000_000 };
   const now = () => clock.t;
   const adapter = chain.adapter();
   const follower = createFollower({
     adapter,
-    store,
+    store: opts.followerStore?.(store) ?? store,
     lock: singleConnectionLeaderLock(db, advisoryKey('follower:ethereum')),
     pollMs: 60_000,
     maxLagBlocks: 96n,
@@ -91,7 +91,101 @@ test('claim 1: a transfer from a tracked account to an account tracked mid-range
     await ticking;
     expect(s.follower.status()).toMatchObject({ lastError: undefined, cursor: { number: 210n } });
     await expectTruth(s.store, chain, a, 100n, 210n);
-    await expectTruth(s.store, chain, b, 100n, 210n); // fails: B never gets the 180 transfer
+    await expectTruth(s.store, chain, b, 100n, 210n);
+  } finally {
+    await s.close();
+  }
+});
+
+/** Gate the first unfiltered follower getLogs; resolves once the follower is waiting on it. */
+async function holdFollowerLogs(chain: FakeChain) {
+  const followerGate = gate();
+  const counter = { unfiltered: 0 };
+  chain.beforeLogs = (filter) => {
+    if (filter.filtered) return undefined;
+    counter.unfiltered += 1;
+    return counter.unfiltered === 1 ? followerGate.opened : undefined;
+  };
+  return { followerGate, counter };
+}
+
+test('claim 1: an account tracked mid-range that both receives from and sends to a tracked account is folded fully', async () => {
+  const chain = new FakeChain(150n);
+  const a = address(82);
+  const b = address(83);
+  const token = address(38);
+  chain.addTransfer({ token: address(36), from: address(33), to: a, value: 1n, blockNumber: 120n });
+  chain.addTransfer({ token, from: a, to: b, value: 5n, blockNumber: 170n });
+  chain.addTransfer({ token, from: b, to: a, value: 2n, blockNumber: 180n });
+  chain.addTransfer({ token, from: b, to: b, value: 1n, blockNumber: 190n }); // self-transfer, skipped at scan
+  const s = await stack(chain);
+  try {
+    await s.follower.tick();
+    expect((await s.get(`/v1/ethereum/accounts/${a}/erc20`)).status).toBe(200);
+    chain.finalized = 210n;
+    const { followerGate, counter } = await holdFollowerLogs(chain);
+    const ticking = s.follower.tick();
+    while (counter.unfiltered === 0) await new Promise((resolve) => setImmediate(resolve));
+    expect((await s.get(`/v1/ethereum/accounts/${b}/erc20`)).status).toBe(200);
+
+    followerGate.release();
+    await ticking;
+    expect(counter.unfiltered).toBe(1);
+    expect(s.follower.status()).toMatchObject({ lastError: undefined, cursor: { number: 210n } });
+    await expectTruth(s.store, chain, a, 100n, 210n);
+    await expectTruth(s.store, chain, b, 100n, 210n);
+  } finally {
+    await s.close();
+  }
+});
+
+test('claim 1: accounts tracked in two different refold rounds each get every log of the range', async () => {
+  const chain = new FakeChain(150n);
+  const a = address(84);
+  const b = address(85);
+  const c = address(86);
+  const token = address(39);
+  chain.addTransfer({ token: address(36), from: address(33), to: a, value: 1n, blockNumber: 120n });
+  chain.addTransfer({ token, from: a, to: b, value: 5n, blockNumber: 160n }); // folded for A at scan
+  chain.addTransfer({ token, from: b, to: c, value: 4n, blockNumber: 170n }); // skipped, refolded in round 1
+  chain.addTransfer({ token, from: c, to: a, value: 3n, blockNumber: 180n }); // folded for A at scan
+  chain.addTransfer({ token, from: address(33), to: c, value: 2n, blockNumber: 190n }); // skipped until round 2
+  let commits = 0;
+  let trackC: (() => Promise<void>) | undefined;
+  const s = await stack(chain, {
+    followerStore: (store) => ({
+      ...store,
+      async applyFollowerRange(...args: Parameters<Store['applyFollowerRange']>) {
+        const result = await store.applyFollowerRange(...args);
+        commits += 1;
+        if (!result.applied && trackC) {
+          const track = trackC;
+          trackC = undefined;
+          await track(); // C is tracked between the first and the second commit attempt
+        }
+        return result;
+      },
+    }),
+  });
+  try {
+    await s.follower.tick();
+    expect((await s.get(`/v1/ethereum/accounts/${a}/erc20`)).status).toBe(200);
+    chain.finalized = 210n;
+    commits = 0;
+    const { followerGate, counter } = await holdFollowerLogs(chain);
+    const ticking = s.follower.tick();
+    while (counter.unfiltered === 0) await new Promise((resolve) => setImmediate(resolve));
+    expect((await s.get(`/v1/ethereum/accounts/${b}/erc20`)).status).toBe(200);
+    trackC = async () => { expect((await s.get(`/v1/ethereum/accounts/${c}/erc20`)).status).toBe(200); };
+
+    followerGate.release();
+    await ticking;
+    expect(counter.unfiltered).toBe(1);
+    expect(commits).toBe(3); // missing [B], missing [C], applied
+    expect(s.follower.status()).toMatchObject({ lastError: undefined, cursor: { number: 210n } });
+    await expectTruth(s.store, chain, a, 100n, 210n);
+    await expectTruth(s.store, chain, b, 100n, 210n);
+    await expectTruth(s.store, chain, c, 100n, 210n);
   } finally {
     await s.close();
   }
@@ -136,7 +230,7 @@ test('claim 2: a delayed old-fork request-path read does not overwrite the canon
 
     readGate.release();
     await request;
-    // fails: the orphaned read (111 @ 0xddd..) replaced the canonical snapshot (222 @ 0xeee..)
+    // The orphaned read (111 @ 0xddd..) must not replace the canonical snapshot (222 @ 0xeee..).
     expect((await store.balances('ethereum', account))[0]).toMatchObject({
       result: { status: 'ok', balance: 222n }, blockNumber: 160n, blockHash: canonical.hash,
     });
@@ -154,7 +248,7 @@ test('claim 3: a failed finalized-head poll is reported as stale', async () => {
     chain.failHead = true;
     s.clock.t += 60_000;
     await s.follower.tick();
-    // fails: head.ts serves the cached head with stale: true, but the follower clears lastError and ignores it
+    // head.ts serves the cached head flagged stale; the follower must surface it.
     expect(s.follower.status().stale).toBe(true);
   } finally {
     await s.close();
