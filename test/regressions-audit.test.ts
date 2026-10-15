@@ -19,6 +19,7 @@ async function stack(chain: FakeChain, opts: { followerStore?: (store: Store) =>
   const clock = { t: 1_800_000_000_000 };
   const now = () => clock.t;
   const adapter = chain.adapter();
+
   const follower = createFollower({
     adapter,
     store: opts.followerStore?.(store) ?? store,
@@ -29,11 +30,14 @@ async function stack(chain: FakeChain, opts: { followerStore?: (store: Store) =>
     maxNoAdvanceMs: 1_800_000,
     now,
   });
+
   const requestRpc = { limiter: createLimiter(8, 1_000), deadlineMs: 30_000 };
   const balances = createBalanceWorker({ adapter, store, activeTtlMs: 300_000, refreshMs: 60_000, requestRpc, now });
+
   const discovery = createDiscoveryService({
     adapters: { ethereum: adapter }, store, followers: { ethereum: follower }, requestDeadlineMs: 30_000, now,
   });
+
   const app = createApp({
     discovery,
     adapters: { ethereum: adapter },
@@ -43,10 +47,13 @@ async function stack(chain: FakeChain, opts: { followerStore?: (store: Store) =>
     rpcStats: () => chain.rpc.stats(),
     startedAt: 0,
   });
+
   const get = async (path: string) => {
     const response = await app.request(path);
+
     return { status: response.status, body: await response.json() };
   };
+
   return {
     store, follower, clock, get,
     close: async () => { await follower.stop(); await balances.stop(); await store.close(); },
@@ -69,6 +76,7 @@ test('claim 1: a transfer from a tracked account to an account tracked mid-range
   chain.addTransfer({ token: address(36), from: address(33), to: a, value: 1n, blockNumber: 120n });
   chain.addTransfer({ token, from: a, to: b, value: 5n, blockNumber: 180n }); // A -> B, above B's target
   const s = await stack(chain);
+
   try {
     await s.follower.tick(); // C = 150
     expect((await s.get(`/v1/ethereum/accounts/${a}/erc20`)).status).toBe(200); // A tracked before the range
@@ -78,9 +86,12 @@ test('claim 1: a transfer from a tracked account to an account tracked mid-range
     chain.beforeLogs = (filter) => {
       if (filter.filtered) return undefined;
       unfiltered += 1;
+
       return unfiltered === 1 ? followerGate.opened : undefined;
     };
+
     const ticking = s.follower.tick();
+
     while (unfiltered === 0) await new Promise((resolve) => setImmediate(resolve));
 
     // B is tracked while (150, 210] is decoded with known = {A}: the A -> B log is folded for A only, not skipped.
@@ -104,8 +115,10 @@ async function holdFollowerLogs(chain: FakeChain) {
   chain.beforeLogs = (filter) => {
     if (filter.filtered) return undefined;
     counter.unfiltered += 1;
+
     return counter.unfiltered === 1 ? followerGate.opened : undefined;
   };
+
   return { followerGate, counter };
 }
 
@@ -119,12 +132,14 @@ test('claim 1: an account tracked mid-range that both receives from and sends to
   chain.addTransfer({ token, from: b, to: a, value: 2n, blockNumber: 180n });
   chain.addTransfer({ token, from: b, to: b, value: 1n, blockNumber: 190n }); // self-transfer, skipped at scan
   const s = await stack(chain);
+
   try {
     await s.follower.tick();
     expect((await s.get(`/v1/ethereum/accounts/${a}/erc20`)).status).toBe(200);
     chain.finalized = 210n;
     const { followerGate, counter } = await holdFollowerLogs(chain);
     const ticking = s.follower.tick();
+
     while (counter.unfiltered === 0) await new Promise((resolve) => setImmediate(resolve));
     expect((await s.get(`/v1/ethereum/accounts/${b}/erc20`)).status).toBe(200);
 
@@ -152,21 +167,25 @@ test('claim 1: accounts tracked in two different refold rounds each get every lo
   chain.addTransfer({ token, from: address(33), to: c, value: 2n, blockNumber: 190n }); // skipped until round 2
   let commits = 0;
   let trackC: (() => Promise<void>) | undefined;
+
   const s = await stack(chain, {
     followerStore: (store) => ({
       ...store,
       async applyFollowerRange(...args: Parameters<Store['applyFollowerRange']>) {
         const result = await store.applyFollowerRange(...args);
         commits += 1;
+
         if (!result.applied && trackC) {
           const track = trackC;
           trackC = undefined;
           await track(); // C is tracked between the first and the second commit attempt
         }
+
         return result;
       },
     }),
   });
+
   try {
     await s.follower.tick();
     expect((await s.get(`/v1/ethereum/accounts/${a}/erc20`)).status).toBe(200);
@@ -174,6 +193,7 @@ test('claim 1: accounts tracked in two different refold rounds each get every lo
     commits = 0;
     const { followerGate, counter } = await holdFollowerLogs(chain);
     const ticking = s.follower.tick();
+
     while (counter.unfiltered === 0) await new Promise((resolve) => setImmediate(resolve));
     expect((await s.get(`/v1/ethereum/accounts/${b}/erc20`)).status).toBe(200);
     trackC = async () => { expect((await s.get(`/v1/ethereum/accounts/${c}/erc20`)).status).toBe(200); };
@@ -199,6 +219,7 @@ test('claim 2: a delayed old-fork request-path read does not overwrite the canon
   const orphan: BlockRef = { number: 160n, hash: `0x${'d'.repeat(64)}` as Hex, timestamp: 1920n };
   const canonical: BlockRef = { number: 160n, hash: `0x${'e'.repeat(64)}` as Hex, timestamp: 1920n };
   chain.balanceOf = (_account, _token, at) => (at === orphan.hash ? 111n : 222n);
+
   try {
     await store.initFollowerCursor('ethereum', blockRef(150n), 0);
     const aggregate = emptyAggregate();
@@ -216,12 +237,14 @@ test('claim 2: a delayed old-fork request-path read does not overwrite the canon
       requestRpc: { limiter: createLimiter(8, 1_000), deadlineMs: 30_000 },
       tailTip: async () => canonical,
     });
+
     const readGate = gate();
     let multicalls = 0;
     chain.beforeMulticall = () => (++multicalls === 1 ? readGate.opened : undefined);
 
     // A request served at the tail tip just before it was reorged out: first read for this token, held in flight.
     const request = worker.forAccount(account, [token], orphan);
+
     while (multicalls === 0) await new Promise((resolve) => setImmediate(resolve));
 
     // The reorg refresh reads the canonical block at the same height and commits first.
@@ -242,6 +265,7 @@ test('claim 2: a delayed old-fork request-path read does not overwrite the canon
 test('claim 3: a failed finalized-head poll is reported as stale', async () => {
   const chain = new FakeChain(150n);
   const s = await stack(chain);
+
   try {
     await s.follower.tick();
     expect(s.follower.status()).toMatchObject({ stale: false, cursor: { number: 150n } });

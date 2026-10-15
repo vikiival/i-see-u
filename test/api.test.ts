@@ -71,6 +71,7 @@ const adapterWith = (overrides: Partial<ChainAdapter> = {}): ChainAdapter => ({
   },
   async finalizedHead() {
     const now = Date.now();
+
     return {
       block: { number: 1n, hash: hash(1), timestamp: BigInt(Math.floor(now / 1_000)) },
       lastProgressAt: now,
@@ -121,19 +122,24 @@ test('serializes bigint fields and labels each balance with the block it was rea
   let receivedAt: BlockRef | undefined;
   let receivedAccount: Address | undefined;
   let balanceCalls = 0;
+
   const discovery: DiscoveryService = {
     async discover(network) {
       expect(network).toBe('ethereum');
+
       return resultFor();
     },
   };
+
   const balances = balancesWith(async (normalizedAccount, tokens, at): Promise<BalanceSnapshot[]> => {
     balanceCalls += 1;
     receivedAccount = normalizedAccount;
     receivedAt = at;
     expect(tokens).toEqual([erc20]);
+
     return [{ token: erc20, result: { status: 'ok', balance: 987_654_321n }, blockNumber: 26_000_091n, blockHash: hash(8) }];
   });
+
   const app = appWith(discovery, adapterWith(), balances);
 
   const response = await app.request(`/v1/ethereum/accounts/${account}/erc20?balances=true`);
@@ -180,12 +186,15 @@ async function erc20With(snapshots: BalanceSnapshot[], extra: DiscoveryResult['h
   const discovery: DiscoveryService = {
     async discover() {
       const result = resultFor();
+
       return result.status === 'ready' ? { ...result, holdings: [...result.holdings, ...extra] } : result;
     },
   };
+
   const balances = balancesWith(async (_account, tokens) => tokens.map((token) => snapshots.find((s) => s.token === token)!));
   const response = await appWith(discovery, adapterWith(), balances, always).request(`/v1/ethereum/accounts/${account}/erc20?balances=true`);
   expect(response.status).toBe(200);
+
   return response.json();
 }
 
@@ -199,12 +208,14 @@ test('balanceCurrent: a snapshot older than blockHeight with no Transfer since (
 test('balanceCurrent: false when a Transfer came after the snapshot (lastSeenBlock > balanceBlock), the read failed, or it is above blockHeight', async () => {
   const [failed, above] = [address(4), address(6)];
   const holding = (token: Address) => ({ token, standard: 'erc20' as const, firstBlock: 26_000_000n, lastBlock: 26_000_000n, sentCount: 0, receivedCount: 1 });
+
   const body = await erc20With([
     { token: erc20, result: { status: 'ok', balance: 5n }, blockNumber: 26_000_099n, blockHash: hash(7) },
     { token: failed, result: { status: 'error', error: 'reverted' }, blockNumber: 26_000_110n, blockHash: hash(7) },
     // Read at the tail tip while serving the finalized view: a tail Transfer may sit between blockHeight and the read.
     { token: above, result: { status: 'ok', balance: 1n }, blockNumber: 26_000_130n, blockHash: hash(10) },
   ], [holding(failed), holding(above)]);
+
   const byToken = Object.fromEntries(body.tokens.map((t: { contract: string }) => [t.contract, t]));
   expect(byToken[erc20]).toMatchObject({ lastSeenBlock: '26000100', balanceBlock: '26000099', balanceCurrent: false });
   expect(byToken[failed]).toMatchObject({ balanceStatus: 'error', balanceCurrent: false });
@@ -214,11 +225,13 @@ test('balanceCurrent: false when a Transfer came after the snapshot (lastSeenBlo
 
 test('balanceCurrent: an always-refresh token is current only when read at blockHeight', async () => {
   const atHeight = address(5);
+
   const body = await erc20With([
     { token: erc20, result: { status: 'ok', balance: 5n }, blockNumber: 26_000_110n, blockHash: hash(7) },
     { token: atHeight, result: { status: 'ok', balance: 6n }, blockNumber: 26_000_123n, blockHash: hash(9) },
   ], [{ token: atHeight, standard: 'erc20', firstBlock: 26_000_000n, lastBlock: 26_000_000n, sentCount: 0, receivedCount: 1 }],
   [erc20, atHeight]);
+
   const byToken = Object.fromEntries(body.tokens.map((t: { contract: string }) => [t.contract, t]));
   expect(byToken[erc20]).toMatchObject({ balanceBlock: '26000110', balanceCurrent: false });
   expect(byToken[atHeight]).toMatchObject({ balanceBlock: '26000123', balanceCurrent: true });
@@ -231,6 +244,7 @@ test('a syncing account answers 202 with progress; overload answers 503 with Ret
       return { status: 'syncing', network: 'ethereum', account, fromBlock: 100n, progressBlocks: 40n, targetBlocks: 120n, followerLagBlocks: 3n };
     },
   };
+
   const response = await appWith(syncing).request(`/v1/ethereum/accounts/${account}/erc721`);
   expect(response.status).toBe(202);
   expect(response.headers.get('retry-after')).toBe('2');
@@ -241,6 +255,7 @@ test('a syncing account answers 202 with progress; overload answers 503 with Ret
   const busy: DiscoveryService = {
     async discover() { throw Object.assign(new Error('Server busy'), { statusCode: 503, retryAfterS: 7 }); },
   };
+
   const overloaded = await appWith(busy).request(`/v1/ethereum/accounts/${account}/erc20`);
   expect(overloaded.status).toBe(503);
   expect(overloaded.headers.get('retry-after')).toBe('7');
@@ -250,16 +265,19 @@ test('verifies only ERC-721 items currently held according to seen logs', async 
   let receivedItems: { token: Address; tokenId: bigint }[] | undefined;
   let receivedBlockHash: Hex | undefined;
   const discovery: DiscoveryService = { async discover() { return resultFor(); } };
+
   const adapter = adapterWith({
     async erc721Owners(items, blockHash) {
       receivedItems = items.map(({ token, tokenId }) => ({ token, tokenId }));
       receivedBlockHash = blockHash;
+
       return [{ status: 'ok', owner: account }];
     },
   });
 
   const response = await appWith(discovery, adapter)
     .request(`/v1/ethereum/accounts/${account}/erc721?verifyOwnership=true`);
+
   expect(response.status).toBe(200);
   expect(receivedItems).toEqual([{ token: erc721, tokenId: 7n }]);
   expect(receivedBlockHash).toBe(hash(9));
@@ -273,10 +291,13 @@ test('shares one ownership sweep between concurrent and repeated requests at a b
   const discovery: DiscoveryService = { async discover() { return resultFor(); } };
   let release!: () => void;
   const gate = new Promise<void>((resolve) => { release = resolve; });
+
   const erc721Owners = vi.fn<ChainAdapter['erc721Owners']>(async () => {
     await gate;
+
     return [{ status: 'ok', owner: account }];
   });
+
   const app = appWith(discovery, adapterWith({ erc721Owners }));
   const url = `/v1/ethereum/accounts/${account}/erc721?verifyOwnership=true`;
 
@@ -295,6 +316,7 @@ test('shares one ownership sweep between concurrent and repeated requests at a b
 test('skips ownership verification above the held-item cap', async () => {
   const discovery: DiscoveryService = { async discover() { return resultFor(); } };
   const erc721Owners = vi.fn<ChainAdapter['erc721Owners']>(async () => []);
+
   const app = createApp({
     discovery,
     adapters: { ethereum: adapterWith({ erc721Owners }) },
@@ -350,6 +372,7 @@ test('returns normalized JSON for unknown routes', async () => {
 
 test('rejects an invalid boolean query before discovery', async () => {
   const discover = vi.fn<DiscoveryService['discover']>();
+
   const response = await appWith({ discover })
     .request(`/v1/ethereum/accounts/${account}/erc20?balances=maybe`);
 

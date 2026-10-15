@@ -11,6 +11,7 @@ export function createRpcLogSource(
 ): AccountLogSource {
   const name = options.name ?? 'rpc';
   const state: AccountLogSourceStats = { requests: 0, chunks: 0, logs: 0, failures: 0, fallbacks: 0 };
+
   return {
     name,
     preferredMaxRange: options.preferredMaxRange,
@@ -18,16 +19,20 @@ export function createRpcLogSource(
     async scanAccount(account: Address, range: BlockRange) {
       state.chunks += 1;
       let calls = 0;
+
       const counted: RpcClient = {
         request<T>(method: string, params: unknown[], requestOptions?: RpcRequestOptions) {
           calls += 1;
+
           return rpc.request<T>(method, params, requestOptions);
         },
         stats: () => rpc.stats(),
       };
+
       try {
         const result = await scanAccountChunk(counted, account, range);
         state.logs += result.logs;
+
         return result;
       } catch (error) {
         state.failures += 1;

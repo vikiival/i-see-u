@@ -5,6 +5,7 @@ import { createLimiter } from '../src/core/limiter.ts';
 const gate = () => {
   let open!: () => void;
   const promise = new Promise<void>((resolve) => { open = resolve; });
+
   return { promise, open };
 };
 

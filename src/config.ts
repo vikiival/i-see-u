@@ -9,33 +9,43 @@ try {
 
 const env = (k: string, d?: string): string => {
   const v = process.env[k] ?? d;
+
   if (v === undefined) throw new Error(`Missing env ${k}`);
+
   return v;
 };
 
 /** Every numeric knob is a positive integer; fail at startup rather than mid-scan. */
 const int = (k: string, d: string): number => {
   const v = Number(env(k, d));
+
   if (!Number.isSafeInteger(v) || v < 1) throw new Error(`${k} must be a positive integer`);
+
   return v;
 };
 
 const choice = <T extends string>(k: string, values: readonly T[], d: T): T => {
   const value = env(k, d);
+
   if (!values.includes(value as T)) throw new Error(`${k} must be one of ${values.join(', ')}`);
+
   return value as T;
 };
 
 const bool = (k: string, d: boolean): boolean => {
   const value = env(k, d ? 'true' : 'false');
+
   if (value === 'true' || value === '1') return true;
+
   if (value === 'false' || value === '0') return false;
   throw new Error(`${k} must be true or false`);
 };
 
 const intList = (k: string, d: string): number[] => env(k, d).split(',').map((part) => {
   const value = Number(part.trim());
+
   if (!Number.isSafeInteger(value) || value < 0) throw new Error(`${k} must contain non-negative integers`);
+
   return value;
 });
 
@@ -55,8 +65,10 @@ const evmTuning = {
   /** Max blocks per unfiltered follower getLogs (~450 KB of JSON per block; must stay <= 1000). */
   followerMaxRange: BigInt(int('ETH_FOLLOWER_MAX_RANGE', '500')),
 };
+
 const networks = Object.fromEntries(Object.values(networkRegistry)
   .map((network) => [network.name, { ...network, ...evmTuning }]));
+
 const ethereum = networks.ethereum;
 
 export const config = {
@@ -109,6 +121,7 @@ export const config = {
       '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2,0xae7ab96520de3a18e5e111b5eaab095312d7fe84')
       .split(',').map((token) => token.trim().toLowerCase()).filter(Boolean).map((token) => {
         if (!/^0x[0-9a-f]{40}$/.test(token)) throw new Error('BALANCE_ALWAYS_REFRESH_TOKENS must contain addresses');
+
         return token as Address;
       }),
   },
@@ -138,13 +151,16 @@ for (const network of Object.values(config.networks)) {
   if (network.logsMinRange > network.logsMaxRange) {
     throw new Error('ETH_LOGS_MIN_RANGE must not exceed ETH_LOGS_MAX_RANGE');
   }
+
   if (network.followerMaxRange > 1_000n) {
     throw new Error('ETH_FOLLOWER_MAX_RANGE must not exceed 1000 (unfiltered responses are ~450 KB per block)');
   }
 }
+
 if (config.logSource === 'hypersync' && !config.hypersync.apiToken) {
   throw new Error('LOG_SOURCE=hypersync requires HYPERSYNC_API_KEY');
 }
+
 if (config.tail.pollOffsetsMs.length === 0 || config.tail.pollOffsetsMs.some((offset) => offset >= 12_000)) {
   throw new Error('TAIL_POLL_OFFSETS_MS must contain offsets within a 12-second slot');
 }

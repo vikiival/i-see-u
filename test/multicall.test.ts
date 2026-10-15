@@ -79,8 +79,10 @@ class ValidatingRpc implements RpcClient {
   async request<T>(_method: string, _params: unknown[], opts?: RpcRequestOptions): Promise<T> {
     for (const response of this.responses) {
       this.attempts += 1;
+
       if (!opts?.validate || opts.validate(response)) return response as T;
     }
+
     throw new RpcError('transient', 'RPC endpoint returned an invalid result');
   }
 
@@ -93,6 +95,7 @@ const callsFrom = (params: unknown[]) => {
   const transaction = params[0] as { to: Address; data: Hex };
   expect(transaction.to).toBe(MULTICALL3);
   const decoded = decodeFunctionData({ abi: aggregate3Abi, data: transaction.data });
+
   return decoded.args[0];
 };
 
@@ -102,11 +105,13 @@ test('ERC-20 calls round-trip through aggregate3 and are pinned to the requested
   let receivedMethod: string | undefined;
   let receivedParams: unknown[] | undefined;
   let receivedCalls: ReturnType<typeof callsFrom> | undefined;
+
   const rpc = new FakeRpc((method, params) => {
     receivedMethod = method;
     receivedParams = params;
     const calls = callsFrom(params);
     receivedCalls = calls;
+
     return encodeFunctionResult({
       abi: aggregate3Abi,
       functionName: 'aggregate3',
@@ -122,11 +127,13 @@ test('ERC-20 calls round-trip through aggregate3 and are pinned to the requested
   expect(receivedMethod).toBe('eth_call');
   expect(receivedParams?.[1]).toEqual({ blockHash: blockHash(123n) });
   expect(receivedCalls?.map((call) => call.target.toLowerCase())).toEqual(tokens);
+
   for (const call of receivedCalls ?? []) {
     expect(call.allowFailure).toBe(true);
     const inner = decodeFunctionData({ abi: balanceOfAbi, data: call.callData });
     expect(inner.args[0].toLowerCase()).toBe(account);
   }
+
   expect(result).toEqual([
     { status: 'ok', balance: 11n },
     { status: 'error', error: 'inner call failed' },
@@ -137,11 +144,14 @@ test('ERC-20 calls round-trip through aggregate3 and are pinned to the requested
 test('out-of-gas failures recursively halve and preserve input order', async () => {
   const tokens = [address(10), address(11), address(12), address(13)];
   const seenSizes: number[] = [];
+
   const rpc = new FakeRpc((_method, params) => {
     const calls = callsFrom(params);
     seenSizes.push(calls.length);
+
     if (calls.length > 1) throw new RpcError('fatal', 'execution ran out of gas');
     const value = BigInt(tokens.indexOf(calls[0].target.toLowerCase() as Address) + 100);
+
     return encodeFunctionResult({
       abi: aggregate3Abi,
       functionName: 'aggregate3',
@@ -166,6 +176,7 @@ test('malformed outer aggregate result is rejected by RPC validation and retried
       returnData: encodeFunctionResult({ abi: balanceOfAbi, functionName: 'balanceOf', result: 17n }),
     }],
   });
+
   const rpc = new ValidatingRpc(['0x12', valid]);
 
   expect(await readErc20Balances(rpc, address(50), [address(10)], blockHash(77n), 4))
@@ -175,9 +186,12 @@ test('malformed outer aggregate result is rejected by RPC validation and retried
 
 test('one failed chunk preserves successful chunks and input order', async () => {
   const tokens = Array.from({ length: 6 }, (_, index) => address(index + 10));
+
   const rpc = new FakeRpc((_method, params) => {
     const calls = callsFrom(params);
+
     if (calls[0].target.toLowerCase() === tokens[2]) throw new RpcError('transient', 'upstream unavailable after retries');
+
     return encodeFunctionResult({
       abi: aggregate3Abi,
       functionName: 'aggregate3',
@@ -207,6 +221,7 @@ test('all failed chunks reject with the first error', async () => {
     const first = callsFrom(params)[0].target.toLowerCase();
     throw new RpcError('transient', `failed ${first}`);
   });
+
   const tokens = [address(10), address(11), address(12), address(13)];
 
   await expect(readErc20Balances(rpc, address(50), tokens, blockHash(77n), 2))
@@ -217,10 +232,12 @@ test('ERC-721 ownerOf results decode and normalize owner addresses', async () =>
   const token = address(70);
   const items = [{ token, tokenId: 5n }, { token, tokenId: 9n }];
   const owner = address(88);
+
   const rpc = new FakeRpc((_method, params) => {
     expect(params[1]).toEqual({ blockHash: blockHash(500n) });
     const calls = callsFrom(params);
     expect(calls.map((call) => decodeFunctionData({ abi: ownerOfAbi, data: call.callData }).args[0])).toEqual([5n, 9n]);
+
     return encodeFunctionResult({
       abi: aggregate3Abi,
       functionName: 'aggregate3',

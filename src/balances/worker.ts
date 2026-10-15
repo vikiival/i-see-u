@@ -78,9 +78,11 @@ export function createBalanceWorker(o: BalanceWorkerOptions): BalanceWorker {
 
   const readNow = async (account: Address, tokens: Address[], at: BlockRef): Promise<void> => {
     const results = await adapter.erc20BalancePairs(tokens.map((token) => ({ account, token })), at.hash);
+
     const rows = tokens
       .map((token, i) => ({ account, token, result: results[i] }))
       .filter((row) => row.result.status !== 'error' || !row.result.transient);
+
     if (rows.length > 0) await store.saveBalances(network, at, rows);
   };
 
@@ -89,14 +91,17 @@ export function createBalanceWorker(o: BalanceWorkerOptions): BalanceWorker {
       const replaceNewer = pendingReorg;
       pendingReorg = false;
       const cutoff = now() - o.activeTtlMs;
+
       for (const [account, seenAt] of active) if (seenAt < cutoff) active.delete(account);
       const cursor = await store.getFollowerCursor(network);
+
       if (!cursor || active.size === 0) return { pairs: 0, candidates: 0, read: 0, fullSweep: false };
       const at = await o.tailTip?.() ?? cursor;
       const states = await store.erc20RefreshState(network, [...active.keys()]);
       const sweepDue = lastFullSweepAt === undefined || now() - lastFullSweepAt >= fullSweepMs;
       // A reorg may have orphaned any snapshot's block, so the Transfer test cannot be trusted: read every pair.
       const fullSweep = replaceNewer || sweepDue;
+
       const pairs = states.filter(({ account, token, lastTransferBlock, snapshot }) => replaceNewer
         || !snapshot
         // Read at a block that is no longer canonical (a reorg this process's worker was not kicked for).
@@ -107,9 +112,12 @@ export function createBalanceWorker(o: BalanceWorkerOptions): BalanceWorker {
         // A zero balance only becomes non-zero through a Transfer, which the test above catches.
         || (sweepDue && !(snapshot.ok && snapshot.zero)))
         .map(({ account, token }) => ({ account, token }));
+
       const orphaned = new Set(states.filter(({ snapshot }) => snapshot && !snapshot.canonical)
         .map(({ account, token }) => `${account}:${token}`));
+
       const done = { candidates: states.length, read: pairs.length, pairs: pairs.length, fullSweep, block: at.number };
+
       if (pairs.length > 0) {
         // One block for every pair, pinned by hash; a balance read at N is never reported for a later block.
         const results = await adapter.erc20BalancePairs(pairs, at.hash);
@@ -120,41 +128,53 @@ export function createBalanceWorker(o: BalanceWorkerOptions): BalanceWorker {
         // A same-height read never replaces a snapshot of another hash, so an orphaned one is replaced explicitly.
         const replace = rows.filter((row) => replaceNewer || orphaned.has(`${row.account}:${row.token}`));
         const keep = rows.filter((row) => !replaceNewer && !orphaned.has(`${row.account}:${row.token}`));
+
         if (keep.length > 0) await store.saveBalances(network, at, keep);
+
         if (replace.length > 0) await store.saveBalances(network, at, replace, { replaceNewer: true });
       }
+
       if (fullSweep) lastFullSweepAt = now();
+
       return done;
     })().then((result) => {
       lastRefresh = { at: now(), ...result };
+
       return { pairs: result.pairs, ...(result.block !== undefined && { block: result.block }) };
     }).finally(() => { refreshing = undefined; });
+
     return refreshing;
   };
 
   const schedule = (): void => {
     clearTimeout(timer);
+
     if (!stopped) timer = setTimeout(() => void cycle(), o.refreshMs);
   };
+
   const cycle = async (): Promise<void> => {
     do {
       kicked = false;
+
       try {
         await refresh();
       } catch (error) {
         o.onError?.(error);
       }
     } while (kicked && !stopped);
+
     schedule();
   };
 
   return {
     async forAccount(account, tokens, at) {
       active.set(account, now());
+
       if (tokens.length === 0) return [];
       const snapshot = async () => new Map((await store.balances(network, account)).map((row) => [row.token, row]));
       let byToken = await snapshot();
       const missing = tokens.filter((token) => !byToken.has(token));
+
       if (missing.length > 0) {
         // Kept until the block changes (not just while in flight), so a request that read the snapshot before
         // another request's read committed still joins that read instead of starting a second one.
@@ -162,24 +182,30 @@ export function createBalanceWorker(o: BalanceWorkerOptions): BalanceWorker {
           reads.clear();
           readsAt = at.hash;
         }
+
         const previous = reads.get(account);
+
         const read = previous
           ? previous.then(async () => {
               const current = await snapshot();
               const stillMissing = tokens.filter((token) => !current.has(token));
+
               if (stillMissing.length > 0) {
                 await o.requestRpc.limiter.run(() => readNow(account, stillMissing, at));
               }
             })
           : o.requestRpc.limiter.run(() => readNow(account, missing, at));
+
         read.catch(() => { if (reads.get(account) === read) reads.delete(account); });
         reads.set(account, read);
         await withDeadline(read, o.requestRpc.deadlineMs, () => {
           throw unavailable('Balance read did not finish within the request deadline', 2);
         });
         byToken = await snapshot();
+
         if (tokens.some((token) => !byToken.has(token)) && reads.get(account) === read) reads.delete(account);
       }
+
       return tokens.map((token) => byToken.get(token) ?? {
         token,
         result: { status: 'error', error: 'no balance snapshot' },
@@ -192,7 +218,9 @@ export function createBalanceWorker(o: BalanceWorkerOptions): BalanceWorker {
 
     kick(opts) {
       if (stopped) return;
+
       if (opts?.reorg) pendingReorg = true;
+
       if (refreshing) kicked = true;
       else void cycle();
     },

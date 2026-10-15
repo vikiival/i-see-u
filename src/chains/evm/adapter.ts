@@ -27,6 +27,7 @@ export interface EvmAdapterOptions {
 /** Any EVM chain with a plain JSON-RPC endpoint: differs only by options. */
 export function createEvmAdapter(rpc: RpcClient, o: EvmAdapterOptions): ChainAdapter {
   const head = createHeadTracker(rpc, { cacheMs: o.headCacheMs ?? HEAD_CACHE_MS, maxNoProgressMs: o.finalizedMaxNoProgressMs, chain: o.chain });
+
   return {
     network: o.network,
     startBlock: o.startBlock,

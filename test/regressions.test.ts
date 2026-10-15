@@ -6,6 +6,7 @@ import { RpcError } from '../src/rpc/errors.ts';
 
 const failingRpc = (kind: RpcErrorKind, message: string = kind) => {
   let calls = 0;
+
   const rpc: RpcClient = {
     async request() {
       calls += 1;
@@ -13,6 +14,7 @@ const failingRpc = (kind: RpcErrorKind, message: string = kind) => {
     },
     stats: () => ({ requests: calls, attempts: calls, byMethod: {}, errors: {}, endpoints: [] }),
   };
+
   return { rpc, calls: () => calls };
 };
 

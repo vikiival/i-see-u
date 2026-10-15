@@ -19,6 +19,7 @@ import { unavailable } from '../core/limiter.ts';
 import * as schema from './schema.ts';
 
 export type StoreDatabase = PgDatabase<any, typeof schema>;
+
 type Executor = Pick<StoreDatabase, 'select' | 'insert' | 'update' | 'delete' | 'execute'>;
 
 /** Rows per multi-row INSERT, far below PostgreSQL's 65,535 bind-parameter limit. */
@@ -34,6 +35,7 @@ const cursorColumns = {
   timestamp: schema.followerCursor.blockTimestamp,
   updatedAt: schema.followerCursor.updatedAt,
 };
+
 const toCursor = (row: { number: bigint; hash: string; timestamp: bigint; updatedAt: number }): FollowerCursor =>
   ({ ...row, hash: row.hash as Hex });
 
@@ -43,6 +45,7 @@ const tailColumns = {
   parentHash: schema.tailBlocks.parentHash,
   timestamp: schema.tailBlocks.timestamp,
 };
+
 const toHeader = (row: { number: bigint; hash: string; parentHash: string; timestamp: bigint }): BlockHeader => ({
   ...row,
   hash: row.hash as Hex,
@@ -60,6 +63,7 @@ export class TailConflictError extends Error {
 async function upsertAggregates(tx: Executor, network: string, aggregates: Iterable<[Address, ChunkAggregate]>): Promise<void> {
   const holdingValues = [];
   const nftValues = [];
+
   for (const [account, chunk] of aggregates) {
     for (const [token, value] of chunk.tokens) {
       holdingValues.push({
@@ -73,6 +77,7 @@ async function upsertAggregates(tx: Executor, network: string, aggregates: Itera
         receivedCount: value.receivedCount,
       });
     }
+
     for (const value of chunk.nfts.values()) {
       nftValues.push({
         network,
@@ -85,6 +90,7 @@ async function upsertAggregates(tx: Executor, network: string, aggregates: Itera
       });
     }
   }
+
   await inBatches(holdingValues, (values) => tx.insert(schema.holdings).values(values).onConflictDoUpdate({
     target: [schema.holdings.network, schema.holdings.holder, schema.holdings.token],
     set: {
@@ -115,6 +121,7 @@ export function createStore(db: StoreDatabase, close: () => Promise<void> = asyn
         eq(schema.accountScanProgress.network, network),
         eq(schema.accountScanProgress.account, account),
       )).limit(1);
+
     return row?.progressTo;
   };
 
@@ -124,6 +131,7 @@ export function createStore(db: StoreDatabase, close: () => Promise<void> = asyn
         eq(schema.trackedAccounts.network, network),
         eq(schema.trackedAccounts.account, account),
       )).limit(1);
+
     return row?.target;
   };
 
@@ -139,6 +147,7 @@ export function createStore(db: StoreDatabase, close: () => Promise<void> = asyn
       eq(schema.holdings.network, network),
       eq(schema.holdings.holder, account),
     )).orderBy(desc(schema.holdings.lastBlock), asc(schema.holdings.token));
+
     return rows.map((row) => ({ ...row, token: row.token as Address }));
   };
 
@@ -152,6 +161,7 @@ export function createStore(db: StoreDatabase, close: () => Promise<void> = asyn
       eq(schema.nftItems.network, network),
       eq(schema.nftItems.holder, account),
     )).orderBy(desc(schema.nftItems.lastBlock), asc(schema.nftItems.token), asc(schema.nftItems.tokenId));
+
     return rows.map((row) => ({
       token: row.token as Address,
       tokenId: BigInt(row.tokenId),
@@ -163,13 +173,16 @@ export function createStore(db: StoreDatabase, close: () => Promise<void> = asyn
   const getFollowerCursor = async (tx: Executor, network: string, lock?: 'share' | 'update') => {
     const query = tx.select(cursorColumns).from(schema.followerCursor).where(eq(schema.followerCursor.network, network));
     const [row] = await (lock === 'update' ? query.for('update') : lock === 'share' ? query.for('share') : query);
+
     return row && toCursor(row);
   };
 
   const getTailTip = async (tx: Executor, network: string, lock?: 'update') => {
     const query = tx.select(tailColumns).from(schema.tailBlocks)
       .where(eq(schema.tailBlocks.network, network)).orderBy(desc(schema.tailBlocks.number)).limit(1);
+
     const [row] = await (lock === 'update' ? query.for('update') : query);
+
     return row && toHeader(row);
   };
 
@@ -184,12 +197,15 @@ export function createStore(db: StoreDatabase, close: () => Promise<void> = asyn
     await inBatches(accounts, async (batch) => {
       const members = new Set<string>(batch);
       const byPair = new Map<string, Erc20RefreshState>();
+
       const touch = (account: string, token: string, block: bigint) => {
         const key = `${account}:${token}`;
         const state = byPair.get(key);
+
         if (!state) byPair.set(key, { account: account as Address, token: token as Address, lastTransferBlock: block });
         else if (block > state.lastTransferBlock) state.lastTransferBlock = block;
       };
+
       const rows = await db.select({
         account: schema.holdings.holder, token: schema.holdings.token, lastBlock: schema.holdings.lastBlock,
       }).from(schema.holdings).where(and(
@@ -197,7 +213,9 @@ export function createStore(db: StoreDatabase, close: () => Promise<void> = asyn
         eq(schema.holdings.standard, 'erc20'),
         inArray(schema.holdings.holder, batch),
       )).orderBy(asc(schema.holdings.holder), asc(schema.holdings.token));
+
       for (const row of rows) touch(row.account, row.token, row.lastBlock);
+
       // Tail rows above the cursor are newer than any finalized Transfer folded into holdings.
       const tail = await db.select({
         from: schema.tailTransfers.from,
@@ -209,9 +227,11 @@ export function createStore(db: StoreDatabase, close: () => Promise<void> = asyn
         eq(schema.tailTransfers.standard, 'erc20'),
         or(inArray(schema.tailTransfers.from, batch), inArray(schema.tailTransfers.to, batch)),
       )).groupBy(schema.tailTransfers.from, schema.tailTransfers.to, schema.tailTransfers.token);
+
       for (const row of tail) for (const account of [row.from, row.to]) {
         if (members.has(account)) touch(account, row.token, BigInt(row.block));
       }
+
       const snapshots = await db.select({
         account: schema.balanceSnapshots.account,
         token: schema.balanceSnapshots.token,
@@ -222,27 +242,36 @@ export function createStore(db: StoreDatabase, close: () => Promise<void> = asyn
         eq(schema.balanceSnapshots.network, network),
         inArray(schema.balanceSnapshots.account, batch),
       ));
+
       // A snapshot above the cursor is canonical only while the tail still holds its hash at that height: a reorg
       // seen by another process's tail never kicks this worker, so the Transfer test alone would trust an orphan.
       const above = [...new Set(snapshots.map((row) => row.blockNumber).filter((n) => !cursor || n > cursor.number))];
       const tailHashes = new Map<bigint, string>();
+
       if (above.length > 0) {
         const rows = await db.select({ number: schema.tailBlocks.number, hash: schema.tailBlocks.hash })
           .from(schema.tailBlocks).where(and(
             eq(schema.tailBlocks.network, network), inArray(schema.tailBlocks.number, above),
           ));
+
         for (const row of rows) tailHashes.set(row.number, row.hash);
       }
+
       for (const row of snapshots) {
         const state = byPair.get(`${row.account}:${row.token}`);
+
         if (!state) continue;
         const ok = row.balance !== null;
+
         const canonical = (cursor !== undefined && row.blockNumber <= cursor.number)
           || tailHashes.get(row.blockNumber) === row.blockHash;
+
         state.snapshot = { blockNumber: row.blockNumber, ok, zero: ok && BigInt(row.balance!) === 0n, canonical };
       }
+
       states.push(...byPair.values());
     });
+
     return states;
   };
 
@@ -257,6 +286,7 @@ export function createStore(db: StoreDatabase, close: () => Promise<void> = asyn
         blockTimestamp: block.timestamp,
         updatedAt: at,
       }).onConflictDoNothing();
+
       return (await getFollowerCursor(db, network))!;
     },
 
@@ -264,11 +294,14 @@ export function createStore(db: StoreDatabase, close: () => Promise<void> = asyn
       return db.transaction(async (tx): Promise<Tracking> => {
         // FOR SHARE conflicts with the follower's FOR UPDATE: its commit is entirely before or after this one.
         const cursor = await getFollowerCursor(tx, network, 'share');
+
         if (!cursor) throw Object.assign(new Error('Follower has no cursor yet'), { statusCode: 503, retryAfterS: 5 });
         const existing = await getTarget(tx, network, account);
+
         if (existing !== undefined) return { target: existing, progress: await getProgress(tx, network, account) };
 
         let progress = await getProgress(tx, network, account);
+
         if (progress !== undefined && progress > cursor.number) {
           // Legacy scan data above the cursor would overlap the follower's blocks: rebuild the account from scratch.
           const { holdings: h, nftItems: n, accountScanProgress: p } = schema;
@@ -277,19 +310,24 @@ export function createStore(db: StoreDatabase, close: () => Promise<void> = asyn
           await tx.delete(p).where(and(eq(p.network, network), eq(p.account, account)));
           progress = undefined;
         }
+
         const inserted = await tx.insert(schema.trackedAccounts)
           .values({ network, account, backfillTarget: cursor.number, trackedAt: at })
           .onConflictDoNothing().returning({ target: schema.trackedAccounts.backfillTarget });
+
         if (inserted.length > 0) return { target: cursor.number, progress };
         // A concurrent first request won the insert: serve its target.
         const winner = await getTarget(tx, network, account);
+
         if (winner === undefined) throw unavailable('Account tracking raced; retry', 1);
+
         return { target: winner, progress: await getProgress(tx, network, account) };
       });
     },
 
     async getTracking(network, account) {
       const target = await getTarget(db, network, account);
+
       return target === undefined ? undefined : { target, progress: await getProgress(db, network, account) };
     },
 
@@ -297,25 +335,32 @@ export function createStore(db: StoreDatabase, close: () => Promise<void> = asyn
       const rows = await db.select({ account: schema.trackedAccounts.account })
         .from(schema.trackedAccounts).where(eq(schema.trackedAccounts.network, network))
         .orderBy(asc(schema.trackedAccounts.account));
+
       return rows.map((row) => row.account as Address);
     },
 
     async applyFollowerRange(network, range, to, at, aggregates, known) {
       return db.transaction(async (tx) => {
         const cursor = await getFollowerCursor(tx, network, 'update');
+
         if (cursor?.number !== range.fromBlock - 1n || to.number !== range.toBlock) {
           throw new Error(`Follower range ${range.fromBlock}-${range.toBlock} does not continue cursor ${cursor?.number}`);
         }
+
         // Accounts tracked while the range was being decoded are not in `known`: the follower re-folds its retained logs for them and retries.
         const tracked = await tx.select({ account: schema.trackedAccounts.account })
           .from(schema.trackedAccounts).where(eq(schema.trackedAccounts.network, network));
+
         const missing = tracked.map((row) => row.account as Address).filter((account) => !known.has(account));
+
         if (missing.length > 0) return { applied: false as const, missing };
 
         await upsertAggregates(tx, network, aggregates);
+
         const [overlap] = await tx.select({ hash: schema.tailBlocks.hash }).from(schema.tailBlocks).where(and(
           eq(schema.tailBlocks.network, network), eq(schema.tailBlocks.number, to.number),
         )).limit(1);
+
         if (overlap && overlap.hash !== to.hash) await wipeTail(tx, network);
         else {
           await tx.delete(schema.tailTransfers).where(and(
@@ -325,12 +370,14 @@ export function createStore(db: StoreDatabase, close: () => Promise<void> = asyn
             eq(schema.tailBlocks.network, network), lte(schema.tailBlocks.number, to.number),
           ));
         }
+
         await tx.update(schema.followerCursor).set({
           blockNumber: to.number,
           blockHash: to.hash,
           blockTimestamp: to.timestamp,
           updatedAt: at,
         }).where(eq(schema.followerCursor.network, network));
+
         return { applied: true as const };
       });
     },
@@ -338,6 +385,7 @@ export function createStore(db: StoreDatabase, close: () => Promise<void> = asyn
     async getTailBlocks(network) {
       const rows = await db.select(tailColumns).from(schema.tailBlocks)
         .where(eq(schema.tailBlocks.network, network)).orderBy(asc(schema.tailBlocks.number));
+
       return rows.map(toHeader);
     },
 
@@ -348,27 +396,34 @@ export function createStore(db: StoreDatabase, close: () => Promise<void> = asyn
       await db.transaction(async (tx) => {
         // The cursor lock serializes an empty-tail anchor against finalization/pruning.
         const cursor = await getFollowerCursor(tx, network, 'share');
+
         if (!cursor) throw new TailConflictError('Follower has no cursor for tail anchor');
         const tip = await getTailTip(tx, network, 'update');
         const anchorHash = tip?.hash ?? cursor.hash;
         const anchorNumber = tip?.number ?? cursor.number;
+
         if (anchorHash !== expectedParentHash) {
           throw new TailConflictError(`Tail parent changed from ${expectedParentHash} to ${anchorHash}`);
         }
+
         let parentHash = anchorHash;
         let number = anchorNumber + 1n;
+
         for (const block of blocks) {
           if (block.header.number !== number || block.header.parentHash !== parentHash) {
             throw new TailConflictError(`Non-contiguous tail block ${block.header.number}`);
           }
+
           for (const transfer of block.transfers) {
             if (transfer.blockNumber !== block.header.number || transfer.blockHash !== block.header.hash) {
               throw new TailConflictError(`Transfer does not belong to tail block ${block.header.number}`);
             }
           }
+
           parentHash = block.header.hash;
           number += 1n;
         }
+
         await inBatches(blocks, (values) => tx.insert(schema.tailBlocks).values(values.map(({ header }) => ({
           network,
           number: header.number,
@@ -376,6 +431,7 @@ export function createStore(db: StoreDatabase, close: () => Promise<void> = asyn
           parentHash: header.parentHash,
           timestamp: header.timestamp,
         }))));
+
         const transfers = blocks.flatMap((block) => block.transfers.map((event) => ({
           network,
           blockNumber: event.blockNumber,
@@ -389,6 +445,7 @@ export function createStore(db: StoreDatabase, close: () => Promise<void> = asyn
           tokenId: event.standard === 'erc721' ? event.value.toString() : null,
           txHash: event.transactionHash,
         })));
+
         await inBatches(transfers, (values) => tx.insert(schema.tailTransfers).values(values));
       });
     },
@@ -397,9 +454,11 @@ export function createStore(db: StoreDatabase, close: () => Promise<void> = asyn
       await db.transaction(async (tx) => {
         // Fenced like appendTailBlocks: a concurrent tail writer (failover) must not lose rows it just appended.
         const tip = await getTailTip(tx, network, 'update');
+
         if (tip?.hash !== expectedTipHash) {
           throw new TailConflictError(`Tail tip changed from ${expectedTipHash} to ${tip?.hash}`);
         }
+
         await tx.delete(schema.tailTransfers).where(and(
           eq(schema.tailTransfers.network, network), gt(schema.tailTransfers.blockNumber, aboveNumber),
         ));
@@ -412,9 +471,11 @@ export function createStore(db: StoreDatabase, close: () => Promise<void> = asyn
     async wipeTail(network, expectedTipHash) {
       await db.transaction(async (tx) => {
         const tip = await getTailTip(tx, network, 'update');
+
         if (expectedTipHash !== undefined && tip?.hash !== expectedTipHash) {
           throw new TailConflictError(`Tail tip changed from ${expectedTipHash} to ${tip?.hash}`);
         }
+
         await wipeTail(tx, network);
       });
     },
@@ -424,9 +485,11 @@ export function createStore(db: StoreDatabase, close: () => Promise<void> = asyn
     async applyScanChunk(network, account, range, chunk) {
       await db.transaction(async (tx) => {
         const target = await getTarget(tx, network, account);
+
         if (target !== undefined && range.toBlock > target) {
           throw new Error(`Chunk ${range.fromBlock}-${range.toBlock} is beyond backfill target ${target}`);
         }
+
         const claimed = await tx.insert(schema.accountScanProgress).values({
           network,
           account,
@@ -439,9 +502,11 @@ export function createStore(db: StoreDatabase, close: () => Promise<void> = asyn
 
         if (claimed.length === 0) {
           const appliedTo = await getProgress(tx, network, account) ?? -1n;
+
           if (range.toBlock <= appliedTo) return;
           throw new Error(`Chunk ${range.fromBlock}-${range.toBlock} overlaps applied progress ${appliedTo}`);
         }
+
         await upsertAggregates(tx, network, [[account, chunk]]);
       });
     },
@@ -452,6 +517,7 @@ export function createStore(db: StoreDatabase, close: () => Promise<void> = asyn
           eq(schema.accountScanRange.network, network),
           eq(schema.accountScanRange.account, account),
         )).limit(1);
+
       return row?.logsRange;
     },
 
@@ -465,7 +531,9 @@ export function createStore(db: StoreDatabase, close: () => Promise<void> = asyn
     async readAccount(network, account) {
       return db.transaction(async (tx): Promise<AccountView | undefined> => {
         const cursor = await getFollowerCursor(tx, network);
+
         if (!cursor) return undefined;
+
         const rows = await tx.select({
           standard: schema.tailTransfers.standard,
           token: schema.tailTransfers.token,
@@ -481,6 +549,7 @@ export function createStore(db: StoreDatabase, close: () => Promise<void> = asyn
           gt(schema.tailTransfers.blockNumber, cursor.number),
           or(eq(schema.tailTransfers.from, account), eq(schema.tailTransfers.to, account)),
         )).orderBy(asc(schema.tailTransfers.blockNumber), asc(schema.tailTransfers.logIndex));
+
         const tailTransfers: TransferEvent[] = rows.map((row) => ({
           ...row,
           token: row.token as Address,
@@ -490,6 +559,7 @@ export function createStore(db: StoreDatabase, close: () => Promise<void> = asyn
           blockHash: row.blockHash as Hex,
           transactionHash: row.transactionHash as Hex,
         }));
+
         return {
           cursor,
           holdings: await holdings(tx, network, account),
@@ -548,6 +618,7 @@ export function createStore(db: StoreDatabase, close: () => Promise<void> = asyn
         eq(schema.balanceSnapshots.network, network),
         eq(schema.balanceSnapshots.account, account),
       ));
+
       return rows.map((row) => ({
         token: row.token as Address,
         result: row.balance !== null

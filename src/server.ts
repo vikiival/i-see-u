@@ -15,13 +15,16 @@ import { openPostgresStore } from './store/postgres.ts';
 import { createTail } from './tail/tail.ts';
 
 const rpc = createRpcClient(config.rpc);
+
 const adapters = Object.fromEntries(Object.values(config.networks).map((network) => {
   const rpcLogs = createRpcLogSource(rpc, {
     preferredMaxRange: network.logsMaxRange,
     minRange: network.logsMinRange,
   });
+
   const useHypersync = config.logSource === 'hypersync'
     || (config.logSource === 'auto' && config.hypersync.apiToken !== undefined);
+
   const accountLogs = useHypersync
     ? withFallback(createHypersyncLogSource({
         url: config.hypersync.url ?? network.hypersyncUrl,
@@ -30,9 +33,12 @@ const adapters = Object.fromEntries(Object.values(config.networks).map((network)
         timeoutMs: config.hypersync.timeoutMs,
       }), rpcLogs)
     : rpcLogs;
+
   return [network.name, createEvmAdapter(rpc, { ...network, network: network.name, accountLogs })];
 }));
+
 const { store, followerLock } = await openPostgresStore(config.databaseUrl, { max: config.db.poolMax, connectionTimeoutMillis: config.db.connectTimeoutMs });
+
 const logError = (what: string) => (error: unknown) =>
   console.warn(`${what} failed:`, error instanceof Error ? error.message : String(error));
 
@@ -40,6 +46,7 @@ const requestRpc = {
   limiter: createLimiter(config.request.rpcConcurrency, config.request.rpcQueue),
   deadlineMs: config.request.deadlineMs,
 };
+
 const balances = Object.fromEntries(Object.values(adapters).map((adapter) => [adapter.network, createBalanceWorker({
   adapter,
   store,
@@ -51,6 +58,7 @@ const balances = Object.fromEntries(Object.values(adapters).map((adapter) => [ad
   tailTip: config.tail.enabled ? () => store.getTailTip(adapter.network) : undefined,
   onError: logError('balance refresh'),
 })]));
+
 const followers = Object.fromEntries(Object.values(adapters).map((adapter) => [adapter.network, createFollower({
   adapter,
   store,
@@ -63,6 +71,7 @@ const followers = Object.fromEntries(Object.values(adapters).map((adapter) => [a
   onAdvance: config.tail.enabled ? undefined : () => balances[adapter.network].kick(),
   onError: logError('follower tick'),
 })]));
+
 const tails = config.tail.enabled ? Object.fromEntries(Object.values(adapters).map((adapter) => [adapter.network, createTail({
   adapter,
   store,
@@ -75,6 +84,7 @@ const tails = config.tail.enabled ? Object.fromEntries(Object.values(adapters).m
   onEpoch: () => followers[adapter.network].kick(),
   onError: logError('tail tick'),
 })])) : {};
+
 const discovery = createDiscoveryService({
   adapters,
   store,
@@ -86,9 +96,13 @@ const discovery = createDiscoveryService({
 });
 
 await Promise.all(Object.values(followers).map((follower) => follower.load()));
+
 await Promise.all(Object.values(tails).map((tail) => tail.load()));
+
 for (const follower of Object.values(followers)) follower.start();
+
 for (const tail of Object.values(tails)) tail.start();
+
 for (const worker of Object.values(balances)) worker.start();
 
 const app = createApp(
@@ -100,7 +114,9 @@ const server = serve({ fetch: app.fetch, port: config.port, hostname: '0.0.0.0' 
   const configured = Object.values(config.networks).map((network) => `${network.name} from block ${network.startBlock}`).join(', ');
   console.log(`i-see-u listening on http://localhost:${info.port} (${configured})`);
 });
+
 let shuttingDown = false;
+
 const shutdown = () => {
   if (shuttingDown) return;
   shuttingDown = true;
@@ -108,11 +124,14 @@ const shutdown = () => {
     await Promise.all([...Object.values(tails), ...Object.values(followers), ...Object.values(balances)].map((part) => part.stop()));
     await Promise.all(Object.values(adapters).map((adapter) => adapter.accountLogs.close?.()));
     await store.close();
+
     if (error) {
       console.error('shutdown failed', error);
       process.exitCode = 1;
     }
   });
 };
+
 process.on('SIGINT', shutdown);
+
 process.on('SIGTERM', shutdown);

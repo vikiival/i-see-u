@@ -22,6 +22,7 @@ export function withFallback(
 
   const useFallback = async (account: Address, range: BlockRange) => {
     fallbacks += 1;
+
     return fallback.scanAccount(account, range);
   };
 
@@ -33,25 +34,31 @@ export function withFallback(
     adaptiveRange: primary.adaptiveRange,
     async scanAccount(account, range) {
       if (now() < cooldownUntil) return useFallback(account, range);
+
       try {
         const result = await primary.scanAccount(account, range);
         consecutiveFailures = 0;
         cooldownUntil = 0;
+
         return result;
       } catch {
         consecutiveFailures += 1;
+
         if (consecutiveFailures >= threshold) cooldownUntil = now() + cooldownMs;
+
         return useFallback(account, range);
       }
     },
     stats() {
       const stats = { ...primary.stats(), ...fallback.stats() };
       const primaryState = stats[primary.name];
+
       if (primaryState) stats[primary.name] = {
         ...primaryState,
         fallbacks: primaryState.fallbacks + fallbacks,
         cooldownUntil: cooldownUntil > now() ? cooldownUntil : undefined,
       };
+
       return stats;
     },
     async close() {

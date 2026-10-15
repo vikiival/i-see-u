@@ -7,4 +7,5 @@ try {
 }
 
 const { store } = await openPostgresStore(process.env.DATABASE_URL ?? DEV_DATABASE_URL);
+
 await store.close();

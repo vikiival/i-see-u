@@ -15,6 +15,7 @@ type CallOutcome = { ok: true; returnData: Hex } | { ok: false; error: string; t
 
 const shortReason = (error: unknown): string => {
   const message = error instanceof Error ? error.message : String(error);
+
   return (message.trim().replace(/\s+/g, ' ') || 'multicall failed').slice(0, 160);
 };
 
@@ -30,28 +31,36 @@ async function aggregateChunk(rpc: RpcClient, calls: EncodedCall[], blockHash: H
       functionName: 'aggregate3',
       args: [calls.map((call) => ({ ...call, allowFailure: true }))],
     });
+
     // EIP-1898: pinned to the exact block hash, never re-resolved against another block at the same height.
     const response = await rpc.request<Hex>('eth_call', [{ to: multicall3, data }, { blockHash }], {
       validate: (value) => {
         if (typeof value !== 'string' || !isHex(value)) return false;
+
         try {
           const decoded = decodeFunctionResult({ abi: multicall3Abi, functionName: 'aggregate3', data: value });
+
           return decoded.length === calls.length;
         } catch {
           return false;
         }
       },
     });
+
     const decoded = decodeFunctionResult({ abi: multicall3Abi, functionName: 'aggregate3', data: response });
+
     return decoded.map((result) =>
       result.success ? { ok: true, returnData: result.returnData } : { ok: false, error: 'inner call failed' });
   } catch (error) {
     const rpcError = rpcErrorOf(error);
+
     if (!splittable(rpcError)) throw rpcError ?? error;
+
     if (calls.length === 1) return [{ ok: false, error: shortReason(rpcError) }];
     const middle = Math.floor(calls.length / 2);
     const left = await aggregateChunk(rpc, calls.slice(0, middle), blockHash, multicall3);
     const right = await aggregateChunk(rpc, calls.slice(middle), blockHash, multicall3);
+
     return [...left, ...right];
   }
 }
@@ -67,12 +76,15 @@ async function readCalls<T>(
   multicall3: Address,
 ): Promise<({ status: 'ok'; value: T } | { status: 'error'; error: string; transient?: true })[]> {
   const chunks: EncodedCall[][] = [];
+
   for (let i = 0; i < calls.length; i += batchSize) chunks.push(calls.slice(i, i + batchSize));
   const chunksResults = new Array<{ outcomes: CallOutcome[] } | { error: unknown }>(chunks.length);
   let next = 0;
+
   const worker = async (): Promise<void> => {
     while (next < chunks.length) {
       const index = next++;
+
       try {
         chunksResults[index] = { outcomes: await aggregateChunk(rpc, chunks[index], blockHash, multicall3) };
       } catch (error) {
@@ -80,9 +92,12 @@ async function readCalls<T>(
       }
     }
   };
+
   await Promise.all(Array.from({ length: Math.min(2, chunks.length) }, worker));
   const failures = chunksResults.filter((result): result is { error: unknown } => 'error' in result);
+
   if (failures.length > 0 && failures.length === chunks.length) throw failures[0].error;
+
   const results = chunksResults.flatMap((result, index) => 'outcomes' in result
     ? result.outcomes
     : chunks[index].map((): CallOutcome => ({ ok: false, error: shortReason(result.error), transient: true })));
@@ -91,7 +106,9 @@ async function readCalls<T>(
     if (!outcome.ok) return outcome.transient
       ? { status: 'error', error: outcome.error, transient: true }
       : { status: 'error', error: outcome.error };
+
     if (!/^0x[0-9a-fA-F]{64}$/.test(outcome.returnData)) return { status: 'error', error: `invalid ${label} return data` };
+
     try {
       return { status: 'ok', value: decode(outcome.returnData) };
     } catch (error) {
@@ -109,13 +126,18 @@ export async function readErc20BalancePairs(
   multicall3: Address = MULTICALL3,
 ): Promise<BalanceResult[]> {
   const callData = new Map<Address, Hex>();
+
   const calls = pairs.map(({ account, token }) => {
     let data = callData.get(account);
+
     if (!data) callData.set(account, data = encodeFunctionData({ abi: erc20Abi, functionName: 'balanceOf', args: [account] }));
+
     return { target: token, callData: data };
   });
+
   const results = await readCalls(rpc, calls, blockHash, batchSize, 'balanceOf',
     (data) => decodeFunctionResult({ abi: erc20Abi, functionName: 'balanceOf', data }), multicall3);
+
   return results.map((r) => r.status === 'ok' ? { status: 'ok', balance: r.value } : r);
 }
 
@@ -138,7 +160,9 @@ export async function readErc721Owners(
     target: item.token,
     callData: encodeFunctionData({ abi: erc721Abi, functionName: 'ownerOf', args: [item.tokenId] }),
   }));
+
   const results = await readCalls(rpc, calls, blockHash, batchSize, 'ownerOf',
     (data) => decodeFunctionResult({ abi: erc721Abi, functionName: 'ownerOf', data }).toLowerCase() as Address, multicall3);
+
   return results.map((r) => r.status === 'ok' ? { status: 'ok', owner: r.value } : r);
 }

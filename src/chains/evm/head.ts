@@ -8,6 +8,7 @@ const hexPattern = /^0x[0-9a-f]+$/i;
 const validBlock = (value: unknown): boolean => {
   if (!value || typeof value !== 'object') return false;
   const block = value as Record<string, unknown>;
+
   return ['number', 'hash', 'parentHash', 'timestamp'].every(key => typeof block[key] === 'string' && hexPattern.test(block[key]));
 };
 
@@ -42,6 +43,7 @@ export function createHeadTracker(
 
   const fetchBlock = async (at: 'finalized' | 'latest' | bigint): Promise<BlockHeader> => {
     const block = await client.getBlock(typeof at === 'bigint' ? { blockNumber: at } : { blockTag: at });
+
     return {
       number: block.number,
       hash: block.hash.toLowerCase() as Hex,
@@ -56,9 +58,11 @@ export function createHeadTracker(
     fetchBlock('latest').then((block) => {
       if (latest === undefined || block.number > latest) latest = block.number;
     }, () => {});
+
     try {
       const block = await fetchBlock('finalized');
       checkedAt = Date.now();
+
       if (observation && block.number < observation.block.number) {
         // A lagging node: keep the newer block, but flag it.
         observation = { block: observation.block, lastProgressAt: observation.lastProgressAt, stale: true };
@@ -71,6 +75,7 @@ export function createHeadTracker(
       checkedAt = Date.now();
       observation = { ...observation, stale: true, refreshFailed: true };
     }
+
     return observation;
   };
 
@@ -78,6 +83,7 @@ export function createHeadTracker(
     finalizedHead() {
       if (observation && Date.now() - checkedAt < opts.cacheMs) return Promise.resolve(observation);
       inFlight ??= refresh().finally(() => { inFlight = undefined; });
+
       return inFlight;
     },
     latestBlockNumber: () => latest,

@@ -1,6 +1,7 @@
 // Shared contracts. Runs on Node's native type stripping: no enums, no parameter properties, `import type` for types.
 
 export type Hex = `0x${string}`;
+
 /** Always lowercase 0x-prefixed 20-byte address. */
 export type Address = `0x${string}`;
 
@@ -156,6 +157,7 @@ export interface BalancePair {
 }
 
 export type BalanceResult = { status: 'ok'; balance: bigint } | { status: 'error'; error: string; transient?: true };
+
 export type OwnerResult = { status: 'ok'; owner: Address } | { status: 'error'; error: string; transient?: true };
 
 // ---------------------------------------------------------------------------

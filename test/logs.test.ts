@@ -51,6 +51,7 @@ test('decodeEventLog-based decoding handles ERC-20 and ERC-721 wire logs', () =>
 
 test('a wrapped too_large RpcError drives suggested range splitting through the viem transport', async () => {
   const requested: Array<[bigint, bigint]> = [];
+
   const rpc: RpcClient = {
     async request<T>(method: string, params: unknown[]): Promise<T> {
       expect(method).toBe('eth_getLogs');
@@ -59,11 +60,15 @@ test('a wrapped too_large RpcError drives suggested range splitting through the 
       const from = BigInt(filter.fromBlock);
       const to = BigInt(filter.toBlock);
       requested.push([from, to]);
+
       if (to - from + 1n > 2n) {
         throw new RpcError('too_large', `query returned more than 10000 results. Try with this block range [0x${from.toString(16)}, 0x${(from + 1n).toString(16)}]`);
       }
+
       const logs = [];
+
       for (let block = from; block <= to; block += 1n) logs.push(wireLog(block));
+
       return logs as T;
     },
     stats,
@@ -78,6 +83,7 @@ test('a wrapped too_large RpcError drives suggested range splitting through the 
 
 test('fetchTransfers halves without a usable suggestion and stops at one block', async () => {
   let calls = 0;
+
   const rpc: RpcClient = {
     async request<T>(_method: string, params: unknown[]): Promise<T> {
       calls += 1;
@@ -85,11 +91,13 @@ test('fetchTransfers halves without a usable suggestion and stops at one block',
       expect(filter.topics).toEqual([TRANSFER_TOPIC, topic(ACCOUNT), null]);
       const from = BigInt(filter.fromBlock);
       const to = BigInt(filter.toBlock);
+
       if (from === to) throw new RpcError('too_large', 'response size exceeded');
       throw new RpcError('too_large', 'response size exceeded');
     },
     stats,
   };
+
   await expect(
     scanTransfers(rpc, ACCOUNT, 'from', { fromBlock: 10n, toBlock: 12n }, () => {}),
   ).rejects.toMatchObject({ kind: 'too_large' });
@@ -98,17 +106,21 @@ test('fetchTransfers halves without a usable suggestion and stops at one block',
 
 test('a timeout on a multi-block range splits it in half; a single block retries normally', async () => {
   const requested: Array<[bigint, bigint, boolean | undefined]> = [];
+
   const rpc: RpcClient = {
     async request<T>(_method: string, params: unknown[], opts?: RpcRequestOptions): Promise<T> {
       const filter = params[0] as { fromBlock: string; toBlock: string };
       const from = BigInt(filter.fromBlock);
       const to = BigInt(filter.toBlock);
       requested.push([from, to, opts?.failFastOnTimeout]);
+
       if (to - from + 1n > 2n) throw new RpcError('transient', 'RPC request timed out', { timeout: true });
+
       return [wireLog(from)] as T;
     },
     stats,
   };
+
   const events: TransferEvent[] = [];
   const result = await scanTransfers(rpc, ACCOUNT, 'to', { fromBlock: 1n, toBlock: 8n }, event => events.push(event));
   expect(result).toMatchObject({ calls: 7, split: true });
@@ -124,20 +136,25 @@ test('a timeout on a multi-block range splits it in half; a single block retries
 
 test('scanAccountChunk folds both directions into one aggregate and flags heavy chunks', async () => {
   const self = (block: bigint, logIndex: string) => ({ ...wireLog(block, [TRANSFER_TOPIC, topic(ACCOUNT), topic(ACCOUNT)]), logIndex });
+
   const responses = {
     from: [self(5n, '0x1'), self(5n, '0x2'), wireLog(4n, [TRANSFER_TOPIC, topic(ACCOUNT), topic(OTHER)])],
     to: [self(5n, '0x1'), self(5n, '0x2'), wireLog(6n)],
   };
+
   let bytes: number | undefined = 100;
   let durationMs = 10;
+
   const rpc: RpcClient = {
     async request<T>(_method: string, params: unknown[], opts?: RpcRequestOptions): Promise<T> {
       const filter = params[0] as { topics: unknown[] };
       opts?.onAttempt?.({ ok: true, durationMs, bytes });
+
       return (filter.topics[1] === null ? responses.to : responses.from) as T;
     },
     stats,
   };
+
   const range = { fromBlock: 1n, toBlock: 10n };
   const light = await scanAccountChunk(rpc, ACCOUNT, range);
   expect(light.calls).toBe(2);
@@ -159,11 +176,14 @@ test('scanAccountChunk rejects with the failing direction error', async () => {
   const rpc: RpcClient = {
     async request<T>(_method: string, params: unknown[]): Promise<T> {
       const filter = params[0] as { topics: unknown[] };
+
       if (filter.topics[1] === null) throw new RpcError('fatal', 'received side failed');
+
       return [] as T;
     },
     stats,
   };
+
   await expect(scanAccountChunk(rpc, ACCOUNT, { fromBlock: 1n, toBlock: 2n }))
     .rejects.toThrow('received side failed');
 });
@@ -174,11 +194,13 @@ test('a non-array eth_getLogs result fails over through RpcClient', async () => 
   vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
     urls.push(String(input));
     const result = String(input).startsWith('https://primary.example') ? null : [wireLog(7n)];
+
     return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result }), {
       status: 200,
       headers: { 'content-type': 'application/json' },
     });
   }));
+
   const rpc = createRpcClient({
     urls: ['https://primary.example/key', 'https://fallback.example/key'],
     timeoutMs: 1_000,
@@ -200,6 +222,7 @@ test('an out-of-range eth_getLogs response is rejected before any log is folded'
     },
     stats,
   };
+
   const events: TransferEvent[] = [];
   await expect(scanTransfers(rpc, ACCOUNT, 'to', { fromBlock: 7n, toBlock: 7n }, event => events.push(event)))
     .rejects.toMatchObject({ kind: 'transient', message: 'Log block 8 outside requested range 7-7' });

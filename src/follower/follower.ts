@@ -67,43 +67,60 @@ export function createFollower(o: FollowerOptions): Follower {
     const skipped: { from: Address; to: Address; decode: () => TransferEvent | undefined }[] = [];
     /** Every event folded so far: an endpoint tracked later was unknown when it was folded, so it is added on refold. */
     const folded: TransferEvent[] = [];
+
     const add = (account: Address, event: TransferEvent): void => {
       let aggregate = aggregates.get(account);
+
       if (!aggregate) aggregates.set(account, aggregate = emptyAggregate());
       addTransfer(aggregate, account, event);
     };
+
     const fold = (event: TransferEvent): void => {
       folded.push(event);
+
       if (known.has(event.from)) add(event.from, event);
+
       if (event.to !== event.from && known.has(event.to)) add(event.to, event);
     };
+
     await adapter.scanAllTransfers(range, fold, (address) => known.has(address),
       (from, to, decode) => skipped.push({ from, to, decode }));
     const to = range.toBlock === head.number ? head : await adapter.blockByNumber(range.toBlock);
     const at = now();
+
     for (let refolds = 0; refolds < MAX_REFOLDS; refolds += 1) {
       const result = await store.applyFollowerRange(network, range, to, at, aggregates, known);
+
       if (result.applied) {
         cursor = { number: to.number, hash: to.hash, timestamp: to.timestamp, updatedAt: at };
+
         return true;
       }
+
       const newlyKnown = new Set(result.missing);
+
       for (const account of newlyKnown) {
         tracked!.add(account);
         known.add(account);
       }
+
       for (const event of folded) {
         if (newlyKnown.has(event.from)) add(event.from, event);
+
         if (event.to !== event.from && newlyKnown.has(event.to)) add(event.to, event);
       }
+
       for (let i = skipped.length - 1; i >= 0; i -= 1) {
         const entry = skipped[i];
+
         if (!newlyKnown.has(entry.from) && !newlyKnown.has(entry.to)) continue;
         const event = entry.decode();
+
         if (event) fold(event);
         skipped.splice(i, 1);
       }
     }
+
     return false;
   };
 
@@ -111,15 +128,19 @@ export function createFollower(o: FollowerOptions): Follower {
     try {
       leader = false;
       leader = o.lock ? await o.lock.tryAcquire() : true;
+
       if (!leader) tracked = undefined;
       const head = await adapter.finalizedHead();
       headStale = head.stale;
+
       if (headNumber === undefined || head.block.number > headNumber) headNumber = head.block.number;
       cursor = await store.getFollowerCursor(network);
+
       if (leader) {
         cursor ??= await store.initFollowerCursor(network, head.block, now());
         tracked ??= new Set(await store.trackedAccounts(network));
         const startedAt = cursor.number;
+
         while (!stopped && cursor.number < head.block.number) {
           const end = cursor.number + adapter.followerMaxRange;
           await applyRange({
@@ -127,8 +148,10 @@ export function createFollower(o: FollowerOptions): Follower {
             toBlock: end < head.block.number ? end : head.block.number,
           }, head.block);
         }
+
         if (cursor.number > startedAt) o.onAdvance?.(cursor);
       }
+
       lastError = head.refreshFailed ? HEAD_REFRESH_FAILED : undefined;
     } catch (error) {
       lastError = messageOf(error);
@@ -138,6 +161,7 @@ export function createFollower(o: FollowerOptions): Follower {
 
   const tick = (): Promise<void> => {
     ticking ??= run().finally(() => { ticking = undefined; });
+
     return ticking;
   };
 
@@ -155,7 +179,9 @@ export function createFollower(o: FollowerOptions): Follower {
         while (!stopped) {
           kicked = false;
           await tick();
+
           if (stopped) break;
+
           if (kicked) continue;
           await new Promise<void>((resolve) => {
             const timer = setTimeout(resolve, o.pollMs);
@@ -183,11 +209,13 @@ export function createFollower(o: FollowerOptions): Follower {
       const lagBlocks = cursor && headNumber !== undefined && headNumber > cursor.number ? headNumber - cursor.number : 0n;
       const lastAdvanceAt = cursor?.updatedAt ?? 0;
       const idleMs = now() - lastAdvanceAt;
+
       const unhealthy = !cursor
         ? 'Follower has not initialized its cursor yet'
         : lagBlocks > o.maxLagBlocks
           ? `Follower is ${lagBlocks} blocks behind the finalized head`
           : idleMs > o.maxNoAdvanceMs ? 'Follower has not advanced recently enough' : undefined;
+
       return {
         ready: cursor !== undefined,
         leader: leader && (o.lock?.held() ?? true),

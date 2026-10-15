@@ -11,6 +11,7 @@ import { createTestStore } from './store-fixture.ts';
 const account = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' as Address;
 const other = '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' as Address;
 const token = '0xcccccccccccccccccccccccccccccccccccccccc' as Address;
+
 const block = (number: bigint): BlockRef => ({
   number,
   hash: `0x${number.toString(16)}` as Hex,
@@ -19,7 +20,9 @@ const block = (number: bigint): BlockRef => ({
 
 const aggregateOf = (events: TransferEvent[]) => {
   const aggregate = emptyAggregate();
+
   for (const e of events) addTransfer(aggregate, account, e);
+
   return aggregate;
 };
 
@@ -45,6 +48,7 @@ function event(overrides: Partial<TransferEvent> = {}): TransferEvent {
 
 test('applyScan is idempotent and progress is monotonic', async () => {
   const { store } = await createTestStore();
+
   try {
     const events = [event()];
     await applyScan(store, events, block(12n));
@@ -63,6 +67,7 @@ test('applyScan is idempotent and progress is monotonic', async () => {
 
 test('NFT held flag only follows the newest block and log index', async () => {
   const { store } = await createTestStore();
+
   try {
     const incoming = event({
       standard: 'erc721',
@@ -73,6 +78,7 @@ test('NFT held flag only follows the newest block and log index', async () => {
       logIndex: 3,
       transactionHash: '0x02' as Hex,
     });
+
     const olderOutgoing = event({
       standard: 'erc721',
       from: account,
@@ -82,6 +88,7 @@ test('NFT held flag only follows the newest block and log index', async () => {
       logIndex: 2,
       transactionHash: '0x03' as Hex,
     });
+
     const newerOutgoing = event({
       standard: 'erc721',
       from: account,
@@ -107,6 +114,7 @@ test('NFT held flag only follows the newest block and log index', async () => {
 
 test('running the Drizzle migrator twice is a no-op', async () => {
   const { db, store } = await createTestStore();
+
   try {
     await migrate(db, { migrationsFolder });
     await applyScan(store, [], block(15n));
@@ -119,6 +127,7 @@ test('running the Drizzle migrator twice is a no-op', async () => {
 
 test('a chunk straddling applied progress is rejected and the logs range round-trips', async () => {
   const { store } = await createTestStore();
+
   try {
     await store.applyScanChunk('ethereum', account, { fromBlock: 0n, toBlock: 10n }, aggregateOf([event()]));
     await store.applyScanChunk('ethereum', account, { fromBlock: 0n, toBlock: 10n }, aggregateOf([event()]));
@@ -138,6 +147,7 @@ test('a chunk straddling applied progress is rejected and the logs range round-t
 
 test('the advisory-lock helper runs its callback while holding the transaction lock', async () => {
   const { db, store } = await createTestStore();
+
   try {
     let called = 0;
     expect(await withAdvisoryLock(db, 42n, async () => ++called)).toBe(1);
@@ -149,6 +159,7 @@ test('the advisory-lock helper runs its callback while holding the transaction l
 
 test('the chunk aggregate dedupes only self-transfers and keeps the latest ERC-721 transfer', () => {
   const self = event({ to: account, blockNumber: 12n, logIndex: 1 });
+
   const nft = (blockNumber: bigint, logIndex: number, incoming: boolean) => event({
     standard: 'erc721',
     token: other,
@@ -159,11 +170,13 @@ test('the chunk aggregate dedupes only self-transfers and keeps the latest ERC-7
     logIndex,
     transactionHash: `0x${blockNumber}${logIndex}` as Hex,
   });
+
   // Both directions return the self-transfer; insertion order of the NFT logs is arbitrary.
   const aggregate = aggregateOf([
     self, event({ blockNumber: 15n, logIndex: 2 }), self, event({ to: account, blockNumber: 12n, logIndex: 3 }),
     nft(30n, 5, false), nft(30n, 4, true), nft(29n, 9, true),
   ]);
+
   expect(aggregate.tokens.get(token)).toEqual({ standard: 'erc20', firstBlock: 12n, lastBlock: 15n, sentCount: 3, receivedCount: 2 });
   expect(aggregate.tokens.get(other)).toMatchObject({ standard: 'erc721', firstBlock: 29n, lastBlock: 30n, sentCount: 1, receivedCount: 2 });
   expect([...aggregate.nfts.values()]).toEqual([{ token: other, tokenId: 7n, held: false, block: 30n, logIndex: 5 }]);
@@ -172,6 +185,7 @@ test('the chunk aggregate dedupes only self-transfers and keeps the latest ERC-7
 
 test('concurrent first trackAccount calls for one account both resolve to the same target', async () => {
   const { store } = await createTestStore();
+
   try {
     await store.initFollowerCursor('ethereum', block(20n), 1);
     const results = await Promise.all([store.trackAccount('ethereum', account, 1), store.trackAccount('ethereum', account, 2)]);
@@ -184,6 +198,7 @@ test('concurrent first trackAccount calls for one account both resolve to the sa
 
 test('trackAccount pins the backfill target to the follower cursor; the backfill cannot write above it', async () => {
   const { store } = await createTestStore();
+
   try {
     await expect(store.trackAccount('ethereum', account, 1)).rejects.toMatchObject({ statusCode: 503 });
     await store.initFollowerCursor('ethereum', block(20n), 1);
@@ -205,6 +220,7 @@ test('trackAccount pins the backfill target to the follower cursor; the backfill
 
 test('applyFollowerRange continues the cursor only, and applies nothing when a tracked account was not decoded', async () => {
   const { store } = await createTestStore();
+
   try {
     await store.initFollowerCursor('ethereum', block(20n), 1);
     await store.trackAccount('ethereum', account, 1);
@@ -227,6 +243,7 @@ test('applyFollowerRange continues the cursor only, and applies nothing when a t
 
 test('rewindTail/wipeTail with a stale expected tip throw TailConflictError and delete nothing', async () => {
   const { store } = await createTestStore();
+
   try {
     await store.initFollowerCursor('ethereum', block(20n), 1);
     const header = (number: bigint) => ({ ...block(number), parentHash: block(number - 1n).hash });
@@ -248,6 +265,7 @@ test('rewindTail/wipeTail with a stale expected tip throw TailConflictError and 
 
 test('balance snapshots keep the block they were read at and never move to an older block', async () => {
   const { store } = await createTestStore();
+
   try {
     const row = (balance: bigint) => ({ account, token, result: { status: 'ok' as const, balance } });
     await store.saveBalances('ethereum', block(30n), [row(5n), { account, token: other, result: { status: 'error', error: 'reverted' } }]);
@@ -265,14 +283,17 @@ test('balance snapshots keep the block they were read at and never move to an ol
 
 test('erc20RefreshState: latest Transfer block takes the tail max over holdings; snapshot zero/ok are reported', async () => {
   const { store } = await createTestStore();
+
   try {
     const tailOnly = '0xdddddddddddddddddddddddddddddddddddddddd' as Address;
     const failing = '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' as Address;
     await applyScan(store, [event(), event({ token: failing, blockNumber: 12n, logIndex: 1 })], block(15n));
     await store.initFollowerCursor('ethereum', block(20n), 1);
     const header = (number: bigint) => ({ ...block(number), parentHash: block(number - 1n).hash });
+
     const inTail = (n: bigint, overrides: Partial<TransferEvent>) =>
       event({ from: other, to: account, blockNumber: n, blockHash: block(n).hash, ...overrides });
+
     await store.appendTailBlocks('ethereum', block(20n).hash, [
       { header: header(21n), transfers: [inTail(21n, { token: tailOnly }), inTail(21n, { logIndex: 1 })] },
       { header: header(22n), transfers: [inTail(22n, {})] },
@@ -314,6 +335,7 @@ test('erc20RefreshState: latest Transfer block takes the tail max over holdings;
 
 test('a reorg refresh can replace a balance snapshot from a newer orphaned block', async () => {
   const { store } = await createTestStore();
+
   try {
     const row = (balance: bigint) => ({ account, token, result: { status: 'ok' as const, balance } });
     await store.saveBalances('ethereum', block(100n), [row(5n)]);
@@ -333,6 +355,7 @@ test('a reorg refresh can replace a balance snapshot from a newer orphaned block
 
 test('the session leader lock is acquired, re-verified and released', async () => {
   const { db, store } = await createTestStore();
+
   try {
     const lock = singleConnectionLeaderLock(db, advisoryKey('follower:ethereum'));
     expect(lock.held()).toBe(false);
