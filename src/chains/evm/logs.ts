@@ -1,5 +1,6 @@
 import { decodeEventLog, encodeEventTopics, isAddress, isHex, pad, parseAbiItem } from 'viem';
 
+import { ChainGapError } from '../../core/errors.ts';
 import { addTransfer, aggregateLogCount, emptyAggregate } from '../../core/aggregate.ts';
 import type { Address, BlockRange, ChunkScan, Hex, RpcClient, TransferDirection, TransferEvent } from '../../core/types.ts';
 import { RpcError, rpcErrorOf } from '../../rpc/errors.ts';
@@ -130,7 +131,7 @@ export async function transfersInRange(
     }
 
     if (!isHex(log.blockHash) || expected.get(number) !== log.blockHash.toLowerCase()) {
-      throw new RpcError('transient', `Log block hash does not match header at ${number}`);
+      throw new ChainGapError(`Log block hash does not match header at ${number}`);
     }
 
     const event = decodeTransferLog(log);
@@ -254,38 +255,13 @@ export async function scanTransfers(
   }, shouldStop);
 }
 
-const paddedAddress = /^0x0{24}[0-9a-fA-F]{40}$/;
-
-/** A 32-byte indexed topic that holds a left-padded address. */
-const isAddressTopic = (topic: unknown): topic is Hex => isString(topic) && paddedAddress.test(topic);
-
-/** The address in a padded address topic, lowercase. */
-const topicAddress = (topic: Hex): Address => `0x${topic.slice(26).toLowerCase()}`;
-
-/**
- * Every Transfer in range, without an address filter (about 450 KB of JSON per mainnet block, so keep ranges at
- * most ~1k blocks). Logs whose from/to are both rejected by `accept` are skipped before the (costlier) strict decode.
- */
+/** All decoded Transfer logs, unfiltered by account. Bootstrap may use this with independently verified headers. */
 export async function scanAllTransfers(
   rpc: RpcClient,
   range: BlockRange,
   onTransfer: (event: TransferEvent) => void,
-  accept?: (address: Address) => boolean,
-  onSkipped?: (from: Address, to: Address, decode: () => TransferEvent | undefined) => void,
 ): Promise<{ calls: number }> {
   const { calls } = await scanLogs(rpc, [TRANSFER_TOPIC], range, (log) => {
-    if (accept && Array.isArray(log.topics)) {
-      const [, fromTopic, toTopic] = log.topics;
-      const from = isAddressTopic(fromTopic) ? topicAddress(fromTopic) : undefined;
-      const to = isAddressTopic(toTopic) ? topicAddress(toTopic) : undefined;
-
-      if (from && to && !accept(from) && !accept(to)) {
-        onSkipped?.(from, to, () => decodeTransferLog(log));
-
-        return;
-      }
-    }
-
     const event = decodeTransferLog(log);
 
     if (event) onTransfer(event);

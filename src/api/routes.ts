@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import { logger } from 'hono/logger';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 
-import type { BalanceWorker, RequestRpc } from '../balances/worker.ts';
+import type { BalanceReader, RequestRpc } from '../balances/reader.ts';
 import { unavailable, withDeadline } from '../core/limiter.ts';
 import { isNumber } from '../core/parse.ts';
 import type {
@@ -10,11 +10,12 @@ import type {
   ChainAdapter,
   DiscoveryResult,
   DiscoveryService,
+  Finality,
   FollowerStatus,
   Hex,
+  TransferCursor,
   OwnerResult,
   RpcStats,
-  SyncingResult,
   TailStatus,
 } from '../core/types.ts';
 import { rpcErrorOf } from '../rpc/errors.ts';
@@ -22,7 +23,7 @@ import { rpcErrorOf } from '../rpc/errors.ts';
 export interface RouteDeps {
   discovery: DiscoveryService;
   adapters: Record<string, ChainAdapter>;
-  balances: Record<string, BalanceWorker>;
+  balances: Record<string, BalanceReader>;
   followers: Record<string, { status(): FollowerStatus }>;
   tails?: Record<string, { status(): TailStatus }>;
   /** Bounds request-path RPC that remains (ownership verification). */
@@ -31,8 +32,6 @@ export interface RouteDeps {
   maxVerifyOwnershipItems?: number;
   rpcStats: () => RpcStats;
   startedAt: number;
-  /** Tokens whose balance changes without Transfer: only current when read at the served block (default none). */
-  alwaysRefreshTokens?: readonly Address[];
 }
 
 const booleanQuery = (value: string | undefined, name: string): boolean => {
@@ -42,28 +41,30 @@ const booleanQuery = (value: string | undefined, name: string): boolean => {
   throw Object.assign(new Error(`Invalid boolean query value for ${name}`), { statusCode: 400 });
 };
 
-const finalityQuery = (value: string | undefined): 'latest' | 'finalized' | undefined => {
-  if (value === undefined) return undefined;
-
-  if (value === 'latest' || value === 'finalized') return value;
+const finalityQuery = (value: string | undefined): Finality | undefined => {
+  if (value === undefined || value === 'latest' || value === 'finalized') return value;
   throw Object.assign(new Error('Invalid finality; expected latest or finalized'), { statusCode: 400 });
 };
 
-const scanJson = (result: DiscoveryResult) => ({
-  newBlocks: result.scan.newBlocks.toString(),
-  rpcCalls: result.scan.rpcCalls,
-  ms: result.scan.ms,
+/** Latest responses also name the finalized block below the tail tip; a degraded latest request says why. */
+const finalityJson = (result: { finality: Finality; finalizedBlockHeight?: bigint; finalizedBlockHash?: Hex; tailError?: string }) => ({
+  finality: result.finality,
+  ...(result.finalizedBlockHeight !== undefined && { finalizedBlockHeight: result.finalizedBlockHeight.toString(), finalizedBlockHash: result.finalizedBlockHash }),
+  ...(result.tailError !== undefined && { tailError: result.tailError }),
 });
 
-const syncingJson = (result: SyncingResult) => ({
-  status: result.status,
-  network: result.network,
-  account: result.account,
-  fromBlock: result.fromBlock.toString(),
-  progressBlocks: result.progressBlocks.toString(),
-  targetBlocks: result.targetBlocks.toString(),
-  followerLagBlocks: result.followerLagBlocks.toString(),
-});
+const historyCursor = (value: string | undefined): TransferCursor | undefined => {
+  if (value === undefined) return undefined;
+
+  if (!/^\d{1,19}:\d{1,19}:\d{1,19}:\d{1,10}$/.test(value)) throw Object.assign(new Error('Invalid history cursor'), { statusCode: 400 });
+  const [throughBlock, revision, blockNumber, index] = value.split(':').map(BigInt);
+
+  if (blockNumber > throughBlock || throughBlock > 9223372036854775807n || revision > 9223372036854775807n || index > 2147483647n) {
+    throw Object.assign(new Error('Invalid history cursor'), { statusCode: 400 });
+  }
+
+  return { throughBlock, revision, blockNumber, logIndex: Number(index) };
+};
 
 const baseJson = (result: DiscoveryResult) => ({
   status: result.status,
@@ -72,10 +73,7 @@ const baseJson = (result: DiscoveryResult) => ({
   fromBlock: result.fromBlock.toString(),
   blockHeight: result.blockHeight.toString(),
   blockHash: result.blockHash,
-  finality: result.finality,
-  ...(result.finalizedBlockHeight !== undefined && { finalizedBlockHeight: result.finalizedBlockHeight.toString() }),
-  ...(result.finalizedBlockHash !== undefined && { finalizedBlockHash: result.finalizedBlockHash }),
-  ...(result.tailError !== undefined && { tailError: result.tailError }),
+  ...finalityJson(result),
   lastProgressAt: new Date(result.lastProgressAt).toISOString(),
   blockTimestamp: new Date(Number(result.blockTimestamp) * 1_000).toISOString(),
   dataAgeS: Math.max(0, Math.floor(Date.now() / 1_000) - Number(result.blockTimestamp)),
@@ -94,6 +92,19 @@ const statusJson = (status: FollowerStatus) => ({
   lastError: status.lastError,
   stale: status.stale,
   unhealthy: status.unhealthy,
+});
+
+const tailJson = (status: TailStatus) => ({
+  enabled: status.enabled,
+  tip: status.tipNumber === undefined ? undefined : { number: status.tipNumber.toString(), hash: status.tipHash },
+  latestNumber: status.latestNumber?.toString(),
+  lagBlocks: status.lagBlocks.toString(),
+  reorgs: status.reorgs,
+  lastReorgDepth: status.lastReorgDepth?.toString(),
+  lastAdvanceAt: status.lastAdvanceAt ? new Date(status.lastAdvanceAt).toISOString() : undefined,
+  healthy: status.healthy,
+  lastError: status.lastError,
+  tailError: status.tailError,
 });
 
 /** The 4xx/5xx `statusCode` (and `retryAfterS`) attached to an error with Object.assign, e.g. by unavailable(). */
@@ -147,7 +158,7 @@ export function createApp(deps: RouteDeps, opts: { requestLog?: boolean } = {}):
     if (status !== undefined) {
       if (status.retryAfterS !== undefined) c.header('Retry-After', String(status.retryAfterS));
 
-      return c.json({ error: error.message || 'Request failed' }, status.statusCode);
+      return c.json({ ...('serviceStatus' in error && { status: error.serviceStatus }), error: error.message || 'Request failed' }, status.statusCode);
     }
 
     const kind = rpcErrorOf(error)?.kind;
@@ -175,34 +186,23 @@ export function createApp(deps: RouteDeps, opts: { requestLog?: boolean } = {}):
   app.get('/v1/:network/accounts/:address/erc20', async (c) => {
     const includeBalances = booleanQuery(c.req.query('balances'), 'balances');
     const finality = finalityQuery(c.req.query('finality'));
-    const result = await deps.discovery.discover(c.req.param('network'), c.req.param('address'), finality);
-
-    if (result.status === 'syncing') {
-      c.header('Retry-After', '2');
-
-      return c.json(syncingJson(result), 202);
-    }
+    const result = await deps.discovery.discover(c.req.param('network'), c.req.param('address'), { finality, balances: includeBalances });
 
     const holdings = result.holdings.filter((holding) => holding.standard === 'erc20');
     const at = { number: result.blockHeight, hash: result.blockHash, timestamp: result.blockTimestamp };
 
-    const balances = includeBalances
-      ? await deps.balances[result.network].forAccount(result.account, holdings.map((h) => h.token), at)
-      : undefined;
-
-    const withTail = deps.tails?.[result.network] !== undefined;
-    const always = new Set<string>(deps.alwaysRefreshTokens ?? []);
-    const current: boolean[] = [];
+    // Pinned to the served block hash: the tail tip for latest, the finalized cursor otherwise.
+    const balances = includeBalances ? await deps.balances[result.network].forAccount(result.account, holdings, at, result.revision, result.balances) : undefined;
 
     const tokens = holdings.map((holding, i) => {
       const token = {
         contract: holding.token,
         firstSeenBlock: holding.firstBlock.toString(),
         lastSeenBlock: holding.lastBlock.toString(),
-        sentCount: holding.sentCount,
-        receivedCount: holding.receivedCount,
-        ...(holding.unfinalizedSentCount && { unfinalizedSentCount: holding.unfinalizedSentCount }),
-        ...(holding.unfinalizedReceivedCount && { unfinalizedReceivedCount: holding.unfinalizedReceivedCount }),
+        sentCount: holding.sentCount.toString(),
+        receivedCount: holding.receivedCount.toString(),
+        ...(holding.unfinalizedSentCount !== undefined && { unfinalizedSentCount: holding.unfinalizedSentCount.toString() }),
+        ...(holding.unfinalizedReceivedCount !== undefined && { unfinalizedReceivedCount: holding.unfinalizedReceivedCount.toString() }),
       };
 
       const snapshot = balances?.[i];
@@ -210,19 +210,13 @@ export function createApp(deps: RouteDeps, opts: { requestLog?: boolean } = {}):
       if (!snapshot) return token;
       const { result: balance } = snapshot;
 
-      // A tail-tip block can be reorged out, so with the tail the balance is also pinned by hash.
-      // Current: read at the served block, or no Transfer of this token touched the account between the read and it.
-      // A read above blockHeight (finalized view, tail on) may postdate a Transfer the finalized holdings do not show.
-      const balanceCurrent = (snapshot.blockNumber === result.blockHeight && snapshot.blockHash === result.blockHash)
-        || (balance.status === 'ok' && holding.lastBlock <= snapshot.blockNumber
-          && snapshot.blockNumber <= result.blockHeight && !always.has(holding.token));
-
-      current.push(balanceCurrent);
-
+      // balanceBlock is always the block actually read; balanceValidAt (= blockHeight) only when the value provably holds there.
       const at = {
         balanceBlock: snapshot.blockNumber.toString(),
-        ...(withTail && { balanceBlockHash: snapshot.blockHash }),
-        balanceCurrent,
+        balanceBlockHash: snapshot.blockHash,
+        balanceReadAt: new Date(snapshot.readAt).toISOString(),
+        balanceValidAt: snapshot.validAt?.toString(),
+        balanceCached: snapshot.cached,
       };
 
       return balance.status === 'ok'
@@ -230,25 +224,15 @@ export function createApp(deps: RouteDeps, opts: { requestLog?: boolean } = {}):
         : { ...token, balanceStatus: balance.status, balanceError: balance.error, ...at };
     });
 
-    // Balances are labelled with the block they were read at; true when every one was read at blockHeight.
-    const balancesAtBlockHeight = balances && balances.every((snapshot) =>
-      snapshot.blockNumber === result.blockHeight && snapshot.blockHash === result.blockHash);
+    const balancesCurrent = balances?.every((snapshot) => snapshot.validAt === result.blockHeight);
 
-    const balancesCurrent = balances && current.every(Boolean);
-
-    return c.json({ ...baseJson(result), balancesAtBlockHeight, balancesCurrent, tokens, scan: scanJson(result) });
+    return c.json({ ...baseJson(result), balancesCurrent, tokens });
   });
 
   app.get('/v1/:network/accounts/:address/erc721', async (c) => {
     const verifyOwnership = booleanQuery(c.req.query('verifyOwnership'), 'verifyOwnership');
     const finality = finalityQuery(c.req.query('finality'));
-    const result = await deps.discovery.discover(c.req.param('network'), c.req.param('address'), finality);
-
-    if (result.status === 'syncing') {
-      c.header('Retry-After', '2');
-
-      return c.json(syncingJson(result), 202);
-    }
+    const result = await deps.discovery.discover(c.req.param('network'), c.req.param('address'), { finality });
 
     const heldItems = result.nftItems.filter((item) => item.heldBySeenLogs);
     const adapter = deps.adapters[result.network];
@@ -257,7 +241,7 @@ export function createApp(deps: RouteDeps, opts: { requestLog?: boolean } = {}):
 
     const owners = verifyOwnership && !skipped && heldItems.length > 0
       ? await withDeadline(
-        ownersFor(`${result.network}:${result.account}:${result.blockHash}`, adapter, heldItems, result.blockHash),
+        ownersFor(`${result.network}:${result.account}:${result.blockHash}:${result.revision}`, adapter, heldItems, result.blockHash),
         deps.requestRpc.deadlineMs,
         () => { throw unavailable('Ownership verification did not finish within the request deadline', 2); },
       )
@@ -314,48 +298,53 @@ export function createApp(deps: RouteDeps, opts: { requestLog?: boolean } = {}):
       ...baseJson(result),
       ...(skipped && { ownershipError: `Too many held items to verify (${heldItems.length} > ${cap})` }),
       collections,
-      scan: scanJson(result),
     });
   });
 
-  app.get('/health', (c) => c.json({
-    status: 'ok',
-    uptimeS: Math.max(0, Math.floor((Date.now() - deps.startedAt) / 1_000)),
-    followers: Object.fromEntries(Object.entries(deps.followers).map(([network, f]) => [network, statusJson(f.status())])),
-    ...(deps.tails && Object.keys(deps.tails).length > 0 && { tails: Object.fromEntries(Object.entries(deps.tails).map(([network, tail]) => {
-      const status = tail.status();
+  app.get('/v1/:network/accounts/:address/transfers', async (c) => {
+    const requested = c.req.query('limit') ?? '50';
+    const limit = Number(requested);
 
-      return [network, {
-        enabled: status.enabled,
-        tip: status.tipNumber === undefined ? undefined : { number: status.tipNumber.toString(), hash: status.tipHash },
-        latestNumber: status.latestNumber?.toString(),
-        lagBlocks: status.lagBlocks.toString(),
-        reorgs: status.reorgs,
-        lastReorgDepth: status.lastReorgDepth?.toString(),
-        healthy: status.healthy,
-        lastError: status.lastError,
-        tailError: status.tailError,
-      }];
-    })) }),
-    balances: Object.fromEntries(Object.entries(deps.balances).map(([network, b]) => {
-      const { activeAccounts, lastRefresh } = b.stats();
+    if (!/^\d+$/.test(requested) || !Number.isInteger(limit) || limit < 1 || limit > 200) {
+      throw Object.assign(new Error('Limit must be between 1 and 200'), { statusCode: 400 });
+    }
 
-      return [network, {
-        activeAccounts,
-        lastRefresh: lastRefresh && {
-          at: new Date(lastRefresh.at).toISOString(),
-          block: lastRefresh.block?.toString(),
-          pairs: lastRefresh.pairs,
-          candidates: lastRefresh.candidates,
-          read: lastRefresh.read,
-          fullSweep: lastRefresh.fullSweep,
-        },
-      }];
-    })),
-    logSources: Object.fromEntries(Object.entries(deps.adapters)
-      .map(([network, adapter]) => [network, adapter.accountLogs.stats()])),
-    rpc: deps.rpcStats(),
-  }));
+    const before = historyCursor(c.req.query('before'));
+    const finality = finalityQuery(c.req.query('finality'));
+    const result = await deps.discovery.history(c.req.param('network'), c.req.param('address'), limit, before, finality);
+    const { network, account, page } = result;
+    const next = page.next;
+
+    // Rows above finalizedBlockHeight carry `unfinalized: true` and can still be reorged out.
+    return c.json({
+      status: 'ready', network, account, ...finalityJson(result), blockHeight: result.blockHeight.toString(), blockHash: result.blockHash,
+      throughBlock: page.throughBlock.toString(),
+      transfers: page.transfers.map((event) => ({ ...event, value: event.value.toString(), blockNumber: event.blockNumber.toString() })),
+      next: next ? `${next.throughBlock}:${next.revision}:${next.blockNumber}:${next.logIndex}` : null,
+    });
+  });
+
+  app.get('/health', async (c) => {
+    // Probe the same DB readiness rules as account reads; no RPC and no account-specific state.
+    const networks = await Promise.all(Object.keys(deps.adapters).map(async (network) => {
+      try {
+        return { network, ...await deps.discovery.status(network) };
+      } catch {
+        return { network, ready: false };
+      }
+    }));
+
+    const ready = networks.every((network) => network.ready);
+
+    return c.json({
+      status: ready ? 'ready' : 'not_ready',
+      networks,
+      uptimeS: Math.max(0, Math.floor((Date.now() - deps.startedAt) / 1_000)),
+      followers: Object.fromEntries(Object.entries(deps.followers).map(([network, f]) => [network, statusJson(f.status())])),
+      ...(deps.tails && { tails: Object.fromEntries(Object.entries(deps.tails).map(([network, tail]) => [network, tailJson(tail.status())])) }),
+      rpc: deps.rpcStats(),
+    }, ready ? 200 : 503);
+  });
 
   return app;
 }

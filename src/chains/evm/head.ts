@@ -28,6 +28,7 @@ export interface HeadTracker {
   finalizedHead(): Promise<HeadObservation>;
   /** Highest latest-block number seen by the background refresh in finalizedHead(); never triggers RPC. */
   latestBlockNumber(): bigint | undefined;
+  /** Uncached `latest` header (the tail polls it). */
   latestHeader(): Promise<BlockHeader>;
   /** Uncached header of one block by number. */
   blockByNumber(number: bigint): Promise<BlockHeader>;
