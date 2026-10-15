@@ -123,7 +123,7 @@ Assumptions: 5k active users with about 10 tokens each (50k pairs), 20 credits p
 | Follower, 1 unfiltered `getLogs` per finalized epoch (measured) | about 225/day | about 0.14M/month |
 | Tail: 1 `latest` header + 1 `getLogs({ blockHash })` per block (measured live 1.2–1.4 headers/block including the follower's epoch polls: blocks appear 2.0–3.8 s after the slot, so the +2.5 s poll is often early) | about 15.8–17.3k/day | about 9.5–10.4M/month |
 | Head polling: `finalized` + `latest` once per epoch (the tail wakes the follower; was every 30 s ≈ 3.5M) | about 450/day | about 0.3M/month |
-| Balance worker: 50 Multicalls per refresh, every 60 s plus once per tail reorg | about 72k/day | about 43M/month |
+| Balance worker, change-driven *(estimate)*: each 60 s refresh reads only pairs with a Transfer after their snapshot (assumed 1% of 50k = 500 pairs → 1 Multicall) plus always-refresh pairs held (WETH/stETH; ≤ 1 call/min per 1000 such pairs); hourly sweep of non-zero pairs (50k/1000 = 50 calls/h); all 50 calls once per tail reorg | about 2.6k/day, plus 1.4k/day per 1000 always-refresh pairs held | about 1.6M/month instead of about 43M; independent of zero-balance spam tokens |
 | First balance read for a newly active account | 1 per activation | small |
 | Requests for backfilled accounts (measured) | 0 | 0 |
 | **Total steady state** | | **about 53–54M/month; fits Build (80M)** |
