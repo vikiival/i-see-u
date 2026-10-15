@@ -172,6 +172,7 @@ export interface RpcClient {
 
 export interface RpcRequestOptions {
   /** Treat a syntactically successful but unusable result as a transient endpoint failure. */
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- boundary parser: validate inspects the raw JSON-RPC result before it is typed
   validate?: (result: unknown) => boolean;
   /** Throw a timeout (error.timeout) at once instead of retrying it, e.g. so the caller can split a log range. */
   failFastOnTimeout?: boolean;

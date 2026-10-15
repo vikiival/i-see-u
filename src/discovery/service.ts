@@ -116,7 +116,7 @@ export function createDiscoveryService(deps: DiscoveryDependencies): DiscoverySe
           active += 1;
           source.scanAccount(account, slot.range).then(
             (value): ChunkOutcome => ({ ok: true, ...value }),
-            (error: unknown): ChunkOutcome => ({ ok: false, error }),
+            (error): ChunkOutcome => ({ ok: false, error }),
           ).then((outcome) => {
             slot.outcome = outcome;
             active -= 1;

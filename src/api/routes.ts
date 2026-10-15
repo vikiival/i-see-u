@@ -4,6 +4,7 @@ import type { ContentfulStatusCode } from 'hono/utils/http-status';
 
 import type { BalanceWorker, RequestRpc } from '../balances/worker.ts';
 import { unavailable, withDeadline } from '../core/limiter.ts';
+import { isNumber } from '../core/parse.ts';
 import type {
   Address,
   ChainAdapter,
@@ -95,10 +96,18 @@ const statusJson = (status: FollowerStatus) => ({
   unhealthy: status.unhealthy,
 });
 
-const statusCodeOf = (error: unknown): number | undefined => {
-  const statusCode = (error as { statusCode?: unknown } | null)?.statusCode;
+/** The 4xx/5xx `statusCode` (and `retryAfterS`) attached to an error with Object.assign, e.g. by unavailable(). */
+const statusOf = (error: Error): { statusCode: ContentfulStatusCode; retryAfterS: number | undefined } | undefined => {
+  const statusCode = 'statusCode' in error ? error.statusCode : undefined;
 
-  return typeof statusCode === 'number' && statusCode >= 400 && statusCode <= 599 ? statusCode : undefined;
+  if (!isNumber(statusCode) || statusCode < 400 || statusCode > 599) return undefined;
+  const retryAfterS = 'retryAfterS' in error ? error.retryAfterS : undefined;
+
+  return {
+    // SAFETY: checked to be 400-599 above; every such status carries a body, and Hono sends the number unchanged.
+    statusCode: statusCode as ContentfulStatusCode,
+    retryAfterS: isNumber(retryAfterS) ? retryAfterS : undefined,
+  };
 };
 
 export function createApp(deps: RouteDeps, opts: { requestLog?: boolean } = {}): Hono {
@@ -123,20 +132,22 @@ export function createApp(deps: RouteDeps, opts: { requestLog?: boolean } = {}):
     ownerCache.set(key, promise);
     promise.catch(() => { if (ownerCache.get(key) === promise) ownerCache.delete(key); });
 
-    while (ownerCache.size > 1000) ownerCache.delete(ownerCache.keys().next().value as string);
+    // Evict oldest first (Map iterates in insertion order; deleting while iterating is safe).
+    for (const oldest of ownerCache.keys()) {
+      if (ownerCache.size <= 1000) break;
+      ownerCache.delete(oldest);
+    }
 
     return promise;
   };
 
   app.onError((error, c) => {
-    const statusCode = statusCodeOf(error);
+    const status = statusOf(error);
 
-    if (statusCode !== undefined) {
-      const retryAfterS = (error as { retryAfterS?: unknown }).retryAfterS;
+    if (status !== undefined) {
+      if (status.retryAfterS !== undefined) c.header('Retry-After', String(status.retryAfterS));
 
-      if (typeof retryAfterS === 'number') c.header('Retry-After', String(retryAfterS));
-
-      return c.json({ error: error.message || 'Request failed' }, statusCode as ContentfulStatusCode);
+      return c.json({ error: error.message || 'Request failed' }, status.statusCode);
     }
 
     const kind = rpcErrorOf(error)?.kind;

@@ -13,6 +13,7 @@ export async function withAdvisoryLock<T>(
 ): Promise<T | undefined> {
   return db.transaction(async (tx) => {
     const result = await tx.execute(sql<{ acquired: boolean }>`SELECT pg_try_advisory_xact_lock(${key}) AS acquired`);
+    // SAFETY: the statement returns one row with one column, `acquired`, and pg_try_advisory_xact_lock returns boolean.
     const [row] = (Array.isArray(result) ? result : result.rows) as { acquired: boolean }[];
 
     return row?.acquired ? fn() : undefined;
@@ -104,6 +105,7 @@ export function singleConnectionLeaderLock(db: StoreDatabase, key: bigint): Lead
 
   const query = async (statement: ReturnType<typeof sql>): Promise<boolean> => {
     const result = await db.execute(statement);
+    // SAFETY: every caller passes a pg_try_advisory_lock/pg_advisory_unlock SELECT aliased `ok`; both return boolean.
     const [row] = (Array.isArray(result) ? result : result.rows) as { ok: boolean }[];
 
     return row?.ok === true;

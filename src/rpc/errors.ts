@@ -1,17 +1,27 @@
 import type { BlockRange, RpcErrorKind } from '../core/types.ts';
+import { isNumber, isObject, isString } from '../core/parse.ts';
 
-const messageOf = (error: unknown): string => {
-  if (typeof error === 'string') return error;
+/** What classification reads from a failure: a numeric JSON-RPC code and the provider's message. */
+interface Failure {
+  readonly code: number | undefined;
+  readonly message: string;
+}
 
-  if (error && typeof error === 'object') {
-    const { message, code } = error as { message?: unknown; code?: unknown };
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- boundary parser: thrown values and JSON-RPC error bodies are untyped
+const parseFailure = (error: unknown): Failure => {
+  if (isString(error)) return { code: undefined, message: error };
 
-    if (typeof message === 'string') return message;
+  if (isObject(error)) {
+    const message = 'message' in error ? error.message : undefined;
+    const code = 'code' in error ? error.code : undefined;
 
-    if (typeof code === 'string') return code;
+    return {
+      code: isNumber(code) ? code : undefined,
+      message: isString(message) ? message : isString(code) ? code : String(error),
+    };
   }
 
-  return String(error ?? 'Unknown RPC error');
+  return { code: undefined, message: String(error ?? 'Unknown RPC error') };
 };
 
 const parseSuggestedRange = (message: string): BlockRange | undefined => {
@@ -25,6 +35,7 @@ const parseSuggestedRange = (message: string): BlockRange | undefined => {
 };
 
 /** Classify an HTTP, JSON-RPC, or network failure into caller-facing policy. */
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- boundary parser: takes any raw failure and parses it with parseFailure
 export function classify(httpStatus: number | undefined, error: unknown): RpcErrorKind {
   if (httpStatus === 429) return 'rate_limited';
 
@@ -34,8 +45,9 @@ export function classify(httpStatus: number | undefined, error: unknown): RpcErr
 
   if (httpStatus !== undefined && httpStatus >= 500) return 'transient';
 
-  const code = error && typeof error === 'object' ? (error as { code?: unknown }).code : undefined;
-  const message = messageOf(error).toLowerCase();
+  const failure = parseFailure(error);
+  const { code } = failure;
+  const message = failure.message.toLowerCase();
 
   if (
     /query returned more than \d+ results|ranges? over \d+ blocks? (?:are|is) not supported|max range\s*:|block range too large|response size exceeded/.test(message)
@@ -75,10 +87,11 @@ export class RpcError extends Error {
 }
 
 /** The RpcError inside a (possibly viem-wrapped) error's cause chain. */
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- boundary parser: walks the cause chain of an arbitrary thrown value
 export function rpcErrorOf(error: unknown): RpcError | undefined {
-  for (let current = error, depth = 0; current && typeof current === 'object' && depth < 16; depth += 1) {
+  for (let current = error, depth = 0; isObject(current) && depth < 16; depth += 1) {
     if (current instanceof RpcError) return current;
-    current = (current as { cause?: unknown }).cause;
+    current = 'cause' in current ? current.cause : undefined;
   }
 
   return undefined;

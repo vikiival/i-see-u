@@ -4,7 +4,7 @@ import { networkRegistry } from './networks.ts';
 try {
   process.loadEnvFile(new URL('../.env', import.meta.url));
 } catch (error) {
-  if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error;
 }
 
 const env = (k: string, d?: string): string => {
@@ -26,10 +26,11 @@ const int = (k: string, d: string): number => {
 
 const choice = <T extends string>(k: string, values: readonly T[], d: T): T => {
   const value = env(k, d);
+  const match = values.find((candidate) => candidate === value);
 
-  if (!values.includes(value as T)) throw new Error(`${k} must be one of ${values.join(', ')}`);
+  if (match === undefined) throw new Error(`${k} must be one of ${values.join(', ')}`);
 
-  return value as T;
+  return match;
 };
 
 const bool = (k: string, d: boolean): boolean => {
@@ -48,6 +49,8 @@ const intList = (k: string, d: string): number[] => env(k, d).split(',').map((pa
 
   return value;
 });
+
+const isLowercaseAddress = (value: string): value is Address => /^0x[0-9a-f]{40}$/.test(value);
 
 const tailEnabled = bool('TAIL_ENABLED', true);
 
@@ -120,9 +123,9 @@ export const config = {
     alwaysRefreshTokens: env('BALANCE_ALWAYS_REFRESH_TOKENS',
       '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2,0xae7ab96520de3a18e5e111b5eaab095312d7fe84')
       .split(',').map((token) => token.trim().toLowerCase()).filter(Boolean).map((token) => {
-        if (!/^0x[0-9a-f]{40}$/.test(token)) throw new Error('BALANCE_ALWAYS_REFRESH_TOKENS must contain addresses');
+        if (!isLowercaseAddress(token)) throw new Error('BALANCE_ALWAYS_REFRESH_TOKENS must contain addresses');
 
-        return token as Address;
+        return token;
       }),
   },
   db: {
