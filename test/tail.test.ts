@@ -411,6 +411,51 @@ test('a reorg refresh replaces balances from a newer orphaned tip', async () => 
   }
 });
 
+test('a reorg this worker was not kicked for (non-leader process) still re-reads the orphaned snapshot', async () => {
+  const chain = new FakeChain(100n);
+  chain.latest = 103n;
+  chain.addTransfer({ token, from: peer, to: account, value: 1n, blockNumber: 101n });
+  chain.addTransfer({ token, from: peer, to: account, value: 1n, blockNumber: 103n });
+  chain.balanceOf = (_account, _token, at) => at === blockHash(103n) ? 9n : 4n;
+  const s = await stack(chain);
+  const clock = { t: 1_800_000_000_000 };
+  const balances = createBalanceWorker({
+    adapter: s.adapter, store: s.store, activeTtlMs: 300_000, refreshMs: 60_000,
+    requestRpc: { limiter: createLimiter(2, 2), deadlineMs: 1_000 },
+    tailTip: () => s.store.getTailTip('ethereum'), now: () => clock.t,
+  });
+  try {
+    await s.tail.tick();
+    const tip = (await s.store.getTailTip('ethereum'))!;
+    await balances.forAccount(account, [token], tip);
+    await balances.refresh(); // the first refresh is a full sweep
+    expect((await s.store.balances('ethereum', account))[0]).toMatchObject({ blockNumber: 103n, blockHash: blockHash(103n) });
+
+    // The canonical chain now has the Transfer at 102 (<= the snapshot's 103), and this worker gets no reorg kick.
+    chain.reorg(2, [{ token, from: peer, to: account, value: 1n, blockNumber: 102n }]);
+    await s.tail.tick();
+    const newTip = (await s.store.getTailTip('ethereum'))!;
+    expect(newTip).toMatchObject({ number: 103n });
+    expect(newTip.hash).not.toBe(blockHash(103n));
+
+    clock.t += 60_000;
+    chain.multicallSizes = [];
+    expect(await balances.refresh()).toEqual({ pairs: 1, block: 103n });
+    expect(chain.multicallSizes).toEqual([1]);
+    expect(balances.stats().lastRefresh).toMatchObject({ read: 1, fullSweep: false });
+    expect((await s.store.balances('ethereum', account))[0]).toMatchObject({
+      result: { status: 'ok', balance: 4n }, blockNumber: 103n, blockHash: newTip.hash,
+    });
+
+    clock.t += 60_000;
+    chain.multicallSizes = [];
+    expect(await balances.refresh()).toEqual({ pairs: 0, block: 103n }); // canonical again: nothing to read
+  } finally {
+    await balances.stop();
+    await s.close();
+  }
+});
+
 test('a lagging head at the cursor height is ignored, not treated as a reorg that wipes the tail', async () => {
   const chain = new FakeChain(100n);
   chain.latest = 102n;

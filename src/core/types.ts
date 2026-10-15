@@ -246,8 +246,11 @@ export interface Tracking {
 export interface Erc20RefreshState extends BalancePair {
   /** Block of the pair's latest Transfer: max(holdings.last_block, tail Transfers). */
   lastTransferBlock: bigint;
-  /** The stored snapshot, if any: `ok` = the read succeeded, `zero` = it succeeded with balance 0. */
-  snapshot?: { blockNumber: bigint; zero: boolean; ok: boolean };
+  /**
+   * The stored snapshot, if any: `ok` = the read succeeded, `zero` = it succeeded with balance 0, `canonical` = its
+   * block is at or below the follower cursor, or its hash is the tail block at that height (false when orphaned).
+   */
+  snapshot?: { blockNumber: bigint; zero: boolean; ok: boolean; canonical: boolean };
 }
 
 export interface BalanceSnapshot {

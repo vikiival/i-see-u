@@ -282,20 +282,31 @@ test('erc20RefreshState: latest Transfer block takes the tail max over holdings;
       { account, token: tailOnly, result: { status: 'ok', balance: 5n } },
       { account, token: failing, result: { status: 'error', error: 'reverted' } },
     ]);
+    const orphaned = '0x9999999999999999999999999999999999999999' as Address;
+    const finalized = '0x8888888888888888888888888888888888888888' as Address;
+    const later = (overrides: Partial<TransferEvent>) => event({ blockNumber: 16n, blockHash: block(16n).hash, ...overrides });
+    await applyScan(store, [later({ token: orphaned, logIndex: 2 }), later({ token: finalized, logIndex: 3 })], block(18n));
+    // A read at another hash of tail height 22 (orphaned), and one at or below the cursor (finalized since).
+    await store.saveBalances('ethereum', { ...block(22n), hash: '0xdead' as Hex }, [
+      { account, token: orphaned, result: { status: 'ok', balance: 1n } },
+    ]);
+    await store.saveBalances('ethereum', block(20n), [{ account, token: finalized, result: { status: 'ok', balance: 1n } }]);
 
     const states = await store.erc20RefreshState('ethereum', [account]);
-    expect(states).toHaveLength(3);
+    expect(states).toHaveLength(5);
     expect(states).toEqual(expect.arrayContaining([
-      { account, token, lastTransferBlock: 22n, snapshot: { blockNumber: 21n, ok: true, zero: true } },
-      { account, token: tailOnly, lastTransferBlock: 21n, snapshot: { blockNumber: 21n, ok: true, zero: false } },
-      { account, token: failing, lastTransferBlock: 12n, snapshot: { blockNumber: 21n, ok: false, zero: false } },
+      { account, token, lastTransferBlock: 22n, snapshot: { blockNumber: 21n, ok: true, zero: true, canonical: true } },
+      { account, token: tailOnly, lastTransferBlock: 21n, snapshot: { blockNumber: 21n, ok: true, zero: false, canonical: true } },
+      { account, token: failing, lastTransferBlock: 12n, snapshot: { blockNumber: 21n, ok: false, zero: false, canonical: true } },
+      { account, token: orphaned, lastTransferBlock: 16n, snapshot: { blockNumber: 22n, ok: true, zero: false, canonical: false } },
+      { account, token: finalized, lastTransferBlock: 16n, snapshot: { blockNumber: 20n, ok: true, zero: false, canonical: true } },
     ]));
     // The counterparty is not a tracked holder here, so only its tail pairs appear, without snapshots.
     expect(await store.erc20RefreshState('ethereum', [other])).toEqual(expect.arrayContaining([
       { account: other, token, lastTransferBlock: 22n },
       { account: other, token: tailOnly, lastTransferBlock: 21n },
     ]));
-    expect((await store.erc20Pairs('ethereum', [account])).length).toBe(3);
+    expect((await store.erc20Pairs('ethereum', [account])).length).toBe(5);
   } finally {
     await store.close();
   }

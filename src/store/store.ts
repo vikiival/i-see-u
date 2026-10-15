@@ -180,6 +180,7 @@ export function createStore(db: StoreDatabase, close: () => Promise<void> = asyn
 
   const erc20RefreshState = async (network: string, accounts: Address[]): Promise<Erc20RefreshState[]> => {
     const states: Erc20RefreshState[] = [];
+    const cursor = await getFollowerCursor(db, network);
     await inBatches(accounts, async (batch) => {
       const members = new Set<string>(batch);
       const byPair = new Map<string, Erc20RefreshState>();
@@ -216,15 +217,29 @@ export function createStore(db: StoreDatabase, close: () => Promise<void> = asyn
         token: schema.balanceSnapshots.token,
         balance: schema.balanceSnapshots.balance,
         blockNumber: schema.balanceSnapshots.blockNumber,
+        blockHash: schema.balanceSnapshots.blockHash,
       }).from(schema.balanceSnapshots).where(and(
         eq(schema.balanceSnapshots.network, network),
         inArray(schema.balanceSnapshots.account, batch),
       ));
+      // A snapshot above the cursor is canonical only while the tail still holds its hash at that height: a reorg
+      // seen by another process's tail never kicks this worker, so the Transfer test alone would trust an orphan.
+      const above = [...new Set(snapshots.map((row) => row.blockNumber).filter((n) => !cursor || n > cursor.number))];
+      const tailHashes = new Map<bigint, string>();
+      if (above.length > 0) {
+        const rows = await db.select({ number: schema.tailBlocks.number, hash: schema.tailBlocks.hash })
+          .from(schema.tailBlocks).where(and(
+            eq(schema.tailBlocks.network, network), inArray(schema.tailBlocks.number, above),
+          ));
+        for (const row of rows) tailHashes.set(row.number, row.hash);
+      }
       for (const row of snapshots) {
         const state = byPair.get(`${row.account}:${row.token}`);
         if (!state) continue;
         const ok = row.balance !== null;
-        state.snapshot = { blockNumber: row.blockNumber, ok, zero: ok && BigInt(row.balance!) === 0n };
+        const canonical = (cursor !== undefined && row.blockNumber <= cursor.number)
+          || tailHashes.get(row.blockNumber) === row.blockHash;
+        state.snapshot = { blockNumber: row.blockNumber, ok, zero: ok && BigInt(row.balance!) === 0n, canonical };
       }
       states.push(...byPair.values());
     });

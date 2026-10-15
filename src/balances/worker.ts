@@ -99,12 +99,16 @@ export function createBalanceWorker(o: BalanceWorkerOptions): BalanceWorker {
       const fullSweep = replaceNewer || sweepDue;
       const pairs = states.filter(({ account, token, lastTransferBlock, snapshot }) => replaceNewer
         || !snapshot
+        // Read at a block that is no longer canonical (a reorg this process's worker was not kicked for).
+        || !snapshot.canonical
         || lastTransferBlock > snapshot.blockNumber
         || always.has(token)
         || retry.has(`${account}:${token}`)
         // A zero balance only becomes non-zero through a Transfer, which the test above catches.
         || (sweepDue && !(snapshot.ok && snapshot.zero)))
         .map(({ account, token }) => ({ account, token }));
+      const orphaned = new Set(states.filter(({ snapshot }) => snapshot && !snapshot.canonical)
+        .map(({ account, token }) => `${account}:${token}`));
       const done = { candidates: states.length, read: pairs.length, pairs: pairs.length, fullSweep, block: at.number };
       if (pairs.length > 0) {
         // One block for every pair, pinned by hash; a balance read at N is never reported for a later block.
@@ -113,9 +117,11 @@ export function createBalanceWorker(o: BalanceWorkerOptions): BalanceWorker {
         const transient = (row: (typeof read)[number]) => row.result.status === 'error' && row.result.transient === true;
         retry = new Set(read.filter(transient).map((row) => `${row.account}:${row.token}`));
         const rows = read.filter((row) => !transient(row));
-        if (rows.length > 0) {
-          await store.saveBalances(network, at, rows, replaceNewer ? { replaceNewer: true } : undefined);
-        }
+        // A same-height read never replaces a snapshot of another hash, so an orphaned one is replaced explicitly.
+        const replace = rows.filter((row) => replaceNewer || orphaned.has(`${row.account}:${row.token}`));
+        const keep = rows.filter((row) => !replaceNewer && !orphaned.has(`${row.account}:${row.token}`));
+        if (keep.length > 0) await store.saveBalances(network, at, keep);
+        if (replace.length > 0) await store.saveBalances(network, at, replace, { replaceNewer: true });
       }
       if (fullSweep) lastFullSweepAt = now();
       return done;
