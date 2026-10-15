@@ -15,6 +15,7 @@ class ChainMismatchError extends Error {}
 export interface TailOptions {
   adapter: ChainAdapter;
   store: Store;
+  /** Leadership comes from the follower's advisory lock: one tail writer per network. */
   follower: Pick<Follower, 'status'>;
   maxDepth?: bigint;
   /** Stop appending this many blocks above the finalized cursor (finality stalled): bounds rows and overlay cost. */
@@ -54,7 +55,10 @@ export function nextPollDelay(at: number, offsets: number[], tip?: BlockHeader):
 }
 
 
-/** Persistent unfinalized journal. Reorgs only replace these rows; finalized aggregates are never rolled back. */
+/**
+ * Persistent unfinalized journal of every Transfer above the finalized cursor. Reorgs only replace these rows; the
+ * finalized index is never rolled back. Leader-only, and only while the global index is within an epoch of finalized.
+ */
 export function createTail(o: TailOptions): Tail {
   const now = o.now ?? Date.now;
   const maxDepth = o.maxDepth ?? 64n;
@@ -145,7 +149,7 @@ export function createTail(o: TailOptions): Tail {
 
   const handleReorg = async (head: BlockHeader, cursor: BlockHeader): Promise<void> => {
     const oldTip = tip!;
-    const stored = new Map((await store.getTailBlocks(network)).map((block) => [block.number, block]));
+    const stored = new Map((await store.tailBlocks(network)).map((block) => [block.number, block]));
     let number = head.number < oldTip.number ? head.number : oldTip.number;
     let ancestor: BlockHeader | undefined;
 
@@ -190,20 +194,26 @@ export function createTail(o: TailOptions): Tail {
     if (!follower.leader) return;
 
     try {
-      const cursor = await store.getFollowerCursor(network);
+      const state = await store.indexState(network);
 
-      if (!cursor) throw new Error('Follower has no cursor for tail anchor');
+      if (!state?.head) {
+        tailError = 'Global index awaits bootstrap or finalized head'; // not a tail failure: wait quietly
 
-      if (follower.headNumber !== undefined && follower.headNumber > cursor.number + EPOCH_BLOCKS) {
-        // The follower is catching up (startup, outage): its commits prune the tail, so wait instead of fetching
+        return;
+      }
+
+      const { cursor } = state;
+
+      if (state.head.number > cursor.number + EPOCH_BLOCKS) {
+        // The global index is not ready (bootstrap, outage): its commits prune the tail, so wait instead of fetching
         // hundreds of headers it would make redundant.
         o.onEpoch?.();
 
         return;
       }
 
-      const anchor: BlockHeader = { ...cursor, parentHash: cursor.hash };
-      tip = await store.getTailTip(network);
+      const anchor: BlockHeader = { number: cursor.number, hash: cursor.hash, timestamp: cursor.timestamp, parentHash: cursor.hash };
+      tip = await store.tailTip(network);
       const ahead = (tip?.number ?? cursor.number) - cursor.number;
 
       if (ahead >= maxAheadBlocks) {
@@ -223,7 +233,7 @@ export function createTail(o: TailOptions): Tail {
       if (!tip) {
         if (head.number > cursor.number) await append(anchor, head, cursor.number);
       } else if (head.number < tip.number) {
-        const stored = (await store.getTailBlocks(network)).find((block) => block.number === head.number);
+        const stored = (await store.tailBlocks(network)).find((block) => block.number === head.number);
 
         if (stored?.hash !== head.hash) await handleReorg(head, anchor);
       } else if (head.number === tip.number) {
@@ -266,7 +276,7 @@ export function createTail(o: TailOptions): Tail {
 
   return {
     async load() {
-      tip = await store.getTailTip(network);
+      tip = await store.tailTip(network);
 
       if (tip) {
         lastAdvanceAt = now();
