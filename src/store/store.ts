@@ -487,9 +487,14 @@ export function createStore(db: StoreDatabase, close: () => Promise<void> = asyn
           blockNumber: sql`excluded.block_number`,
           blockHash: sql`excluded.block_hash`,
         },
-        setWhere: opts?.replaceNewer
-          ? sql`excluded.block_number >= ${schema.balanceSnapshots.blockNumber} OR ${schema.balanceSnapshots.blockNumber} > excluded.block_number`
-          : sql`excluded.block_number >= ${schema.balanceSnapshots.blockNumber}`,
+        // replaceNewer (only the reorg-kicked refresh at the canonical tip) overwrites unconditionally, so snapshots of
+        // orphaned blocks, newer or at the same height, are replaced. Otherwise a snapshot only moves to a later block,
+        // or is re-read at the same block: a same-height read of another (orphaned) hash never replaces it.
+        ...(!opts?.replaceNewer && {
+          setWhere: sql`excluded.block_number > ${schema.balanceSnapshots.blockNumber}
+            OR (excluded.block_number = ${schema.balanceSnapshots.blockNumber}
+              AND excluded.block_hash = ${schema.balanceSnapshots.blockHash})`,
+        }),
       }));
     },
 
