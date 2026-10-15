@@ -22,6 +22,7 @@ Times are local (CEST). "We" is Viktor plus AI agents: a Claude orchestrator han
 | 17:00– | HyperSync `LogSource` for backfill | Codex, started from Viktor's main session. Landed as an opt-in, experimental source with per-chunk RPC fallback (76 tests) |
 | 18:00–21:00 | Realtime tail with reorg handling | Jakub: realtime is part of the brief. Opus design, Codex build, Opus audit (9 bugs fixed). Tail lag 0 blocks live; 93 tests |
 | 23:50–01:15 | `/improve` audit and fixes (branch `feat/improve`) | Three parallel audits (Codex sol, 2× Opus), 5 fix plans run by Sonnet, sol and Opus in isolated worktrees, each reviewed. 115 tests; live run passed every check |
+| 11:00–13:30 | Budget: change-driven balance refresh (plan 006) | Opus built levers 1+3, 1 revision (orphaned snapshots on non-leaders). Balance sweep ~43M → ~1.6–6M credits/month; total ≈53M → ≈12–17M (estimates). 130 tests |
 
 ---
 
@@ -402,8 +403,49 @@ Tests: 115 → **120**, all passing. Lesson: a refold optimisation must replay *
 - **Cross-replica backfills:** a per-account lease, so two processes don't backfill the same account.
 - **Follower catch-up memory:** 500-block unfiltered responses ≈ 225 MB of JSON.
 - **Response size:** pagination for heavy accounts.
-- **Balance sweep cost:** refreshing only touched pairs.
+- ~~**Balance sweep cost:** refreshing only touched pairs.~~ Done in §15.
 - **Real concurrency tests:** a multi-connection Postgres integration suite.
+
+---
+
+## 15. Budget: change-driven balance refresh (2026-10-15)
+
+**Problem.** The steady-state bill for 5k users × 10 tokens was about 53M of the 80M credits/month, and the balance worker was most of it (the 20-credit call rate is the only lever, so the number of calls had to drop):
+
+| Item (before) | Credits/month (estimate) |
+|---|---|
+| Balances: every pair every 60 s (50k pairs / 1000 per Multicall = 50 calls/min) | about 43M |
+| Tail (`latest` header + `getLogs` per block) | about 9–11M |
+| Follower, head polling | under 0.5M |
+| **Total** | **about 53–54M** |
+
+**Levers considered:**
+1. **Change-driven refresh.** Re-read a pair only when something may have changed. Built.
+2. **Bigger or compact batches.** 2000 per batch, or `aggregate3` replaced by a state-override balance-checker contract. Not done: needs a measurement of the Quicknode `eth_call` gas cap first.
+3. **Skip zero balances.** A zero balance only becomes non-zero through a Transfer, which lever 1 already catches. Built with lever 1.
+4. **HyperSync backfills.** Would cut the one-off cold backfill cost, but blocked on the Binance stream hang (§12).
+5. **WebSocket heads.** Would replace header polling, but how Quicknode bills subscriptions is unverified.
+6. **Abuse or admission cap.** A cap on newly tracked accounts and backfills; a product decision, not done.
+7. **Self-hosted node.** Comparison point only: about $200–400/month flat (estimate), against Quicknode Build at $49 for 80M credits.
+
+**What was built (plan 006, levers 1+3; Opus, `873f91e`, merged in `a4e98d6`).** Each 60 s cycle the worker re-reads only pairs with no snapshot, pairs with a Transfer after their snapshot's block (`store.erc20RefreshState`), `BALANCE_ALWAYS_REFRESH_TOKENS` (WETH, stETH), pairs whose last read failed transiently, and pairs whose snapshot block is no longer canonical. Every `BALANCE_FULL_SWEEP_MS` (1 h) it re-reads all non-zero pairs; a reorg kick re-reads everything. Responses gained per-token `balanceCurrent` and a top-level `balancesCurrent`; `/health` reports `candidates`, `read` and `fullSweep`.
+
+**Review revision (1 round).** Processes that never received a reorg kick (non-leader replicas, whose tail does not run) kept snapshots of an orphaned block, because the change test looked only at Transfers. Orphaned snapshots are now detected (block no longer canonical), re-read and saved with `replaceNewer`.
+
+**Soundness assumption.** Balances change only through `Transfer`, except for the always-refresh list. Anything else (unlisted rebasing tokens, admin mints without events) can be stale, bounded by the hourly sweep, and never fixed for an `ok` zero balance. `balanceCurrent` says "no Transfer since the snapshot", not "verified on chain", so it can be true for such a balance.
+
+**Cost, before vs after** (all estimates; 5k users × 10 tokens, about 1% of pairs touched per minute):
+
+| Item | Before | After |
+|---|---|---|
+| Balances | about 43M (50 calls/min) | about 1.6M (about 1.8 calls/min); about 6M if every user holds WETH/stETH |
+| Tail | about 9–11M | about 9–11M |
+| Follower and heads | under 0.5M | under 0.5M |
+| **Total steady state** | **about 53–54M** | **about 12–17M** |
+
+Cold backfill is unchanged: about 172 calls per new account, one-off.
+
+**Tests:** 120 → **130**. The call rate is modelled, not measured live (next items: lever 2 gas cap, live re-measure).
 
 ---
 
@@ -440,7 +482,7 @@ Tests: 115 → **120**, all passing. Lesson: a refold optimisation must replay *
 | Unreliable RPC: slow, errors, rate limits, lagging | ✅ | RpcClient classification, backoff, breaker, failover, validate. Follower lag, `stale` and 503 |
 | README and documented limits | ✅ | README "Limits", REPORT §7 |
 | Not a full indexer | ✅ | Only `Transfer` logs, only for tracked accounts, aggregated per (account, token) |
-| RPC-efficient (paid per request) | ✅ | About 53–54M credits/month steady state for 5k users at 10 tokens each (Build plan has 80M); the balance sweep scales linearly with tokens per account. Cold backfill is 172 calls per account |
+| RPC-efficient (paid per request) | ✅ | About 12–17M credits/month steady state for 5k users at 10 tokens each (estimate; Build plan has 80M, was about 53–54M before the change-driven balance refresh, §15). Balance cost now scales with Transfer activity. Cold backfill is 172 calls per account |
 | BONUS: ERC-721 discovery and endpoint | ✅ | `/erc721`: collections plus token IDs, `?verifyOwnership=true` via `ownerOf` |
 | Own repository, shared | ⚠️ | Pushed (private) to github.com/vikiival/i-see-u, including `feat/improve`; collaborators not added yet |
 | Presentation (30 min + Q&A, Thursday) | ❌ | To do. This log and REPORT are the basis |
@@ -455,3 +497,5 @@ Tests: 115 → **120**, all passing. Lesson: a refold optimisation must replay *
 6. **Known limits to decide on:** multi-replica state (active set, balance-worker leader), untracking idle accounts, holdings from before the start block, spam flags, and native ETH.
 7. **Backfill admission and credit budget** for arbitrary addresses: the largest remaining cost and DoS lever (§14).
 8. **Re-measure tail cost per block** over a longer window (1.5 vs 1.26 header calls).
+9. **Lever 2:** measure the Quicknode `eth_call` gas cap for a state-override balance checker / 2000 per batch.
+10. **Live re-measure of the balance refresh call rate** (the 1.8 calls/min figure is an estimate).
