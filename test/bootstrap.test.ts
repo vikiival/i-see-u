@@ -29,7 +29,7 @@ function populated(finalized = 130n): FakeChain {
     if (block % 5n === 0n) chain.addTransfer({ token: nft, standard: 'erc721', from: block === 100n ? ZERO : alice, to: block % 10n ? alice : bob, value: 7n, blockNumber: block });
   }
 
-  chain.addTransfer({ token, from: carol, to: carol, value: 1n, blockNumber: 118n });
+  if (finalized >= 118n) chain.addTransfer({ token, from: carol, to: carol, value: 1n, blockNumber: 118n });
 
   return chain;
 }
@@ -180,9 +180,10 @@ test('a crash mid-segment leaves no rows; the rerun loads only that segment, a f
     await expect(runBootstrap(options(f, chain, { rpc: first.source }))).rejects.toThrow('1 segments failed on every source');
     expect(await f.bootstrap.status('ethereum', Date.now())).toMatchObject({ status: 'logs', segmentsDone: 4, segmentsTotal: 5, segmentsFailed: 1 });
     expect(await f.store.indexState('ethereum')).toBeUndefined();
-    // Only committed segments have staged rows: the crashed transaction rolled back its first page.
-    const staged = await f.db.execute(sql`SELECT count(*)::int c, count(*) FILTER (WHERE block_number BETWEEN 107 AND 113)::int crashed FROM bootstrap_transfers`);
-    expect(staged.rows).toEqual([{ c: chain.transfers.filter((event) => event.blockNumber < 107n || event.blockNumber > 113n).length, crashed: 0 }]);
+    // The failed segment's raw rows and additive summaries both rolled back.
+    const committed = await f.db.execute(sql`SELECT count(*)::int c, count(*) FILTER (WHERE block_number BETWEEN 107 AND 113)::int crashed FROM transfers`);
+    expect(committed.rows).toEqual([{ c: chain.transfers.filter((event) => event.blockNumber < 107n || event.blockNumber > 113n).length, crashed: 0 }]);
+    expect((await f.db.execute(sql`SELECT count(*)::int c FROM bootstrap_segments WHERE applied`)).rows).toEqual([{ c: 4 }]);
 
     crash = false;
     const second = fakeSource('rpc', chain);
@@ -197,7 +198,7 @@ test('a crash mid-segment leaves no rows; the rerun loads only that segment, a f
   } finally { await f.store.close(); }
 });
 
-test('lost UNLOGGED staging rows (PostgreSQL crash) reset the done markers and reload everything', async () => {
+test('loss of old UNLOGGED staging leaves newly committed segments intact', async () => {
   const chain = populated();
   const f = await fixture();
 
@@ -206,9 +207,94 @@ test('lost UNLOGGED staging rows (PostgreSQL crash) reset the done markers and r
     await f.db.execute(sql`TRUNCATE bootstrap_transfers`);
     const rerun = fakeSource('rpc', chain);
     await runBootstrap(options(f, chain, { rpc: rerun.source }));
-    expect(rerun.calls.transfers).toHaveLength(5);
+    expect(rerun.calls.transfers).toEqual([{ fromBlock: 107n, toBlock: 113n }]);
     expect(await dump(f)).toEqual(await followerDump(populated()));
   } finally { await f.store.close(); }
+});
+
+test('legacy staged segments replay independently; a failed later segment resumes without double counting', async () => {
+  const chain = populated(113n);
+  const f = await fixture();
+  const headers = headersFor(99n, 113n);
+  const first = chain.transfers.filter((event) => event.blockNumber <= 106n);
+  const second = chain.transfers.filter((event) => event.blockNumber >= 107n);
+
+  const stage = async (events: TransferEvent[]) => {
+    for (const event of events) await f.db.execute(sql`INSERT INTO bootstrap_transfers
+      (network, block_number, log_index, block_hash, transaction_hash, token, standard, "from", "to", value)
+      VALUES (1, ${event.blockNumber}, ${event.logIndex}, decode(${event.blockHash.slice(2)}, 'hex'),
+        decode(${event.transactionHash.slice(2)}, 'hex'), decode(${event.token.slice(2)}, 'hex'),
+        ${event.standard === 'erc20' ? 20 : 721}, decode(${event.from.slice(2)}, 'hex'), decode(${event.to.slice(2)}, 'hex'), ${event.value})`);
+  };
+
+  try {
+    await f.bootstrap.createRun('ethereum', { startBlock: 100n, target: headers.at(-1)!, anchor: headers[0], segmentBlocks: 7n }, Date.now());
+    await f.bootstrap.saveHeaders('ethereum', { fromBlock: 100n, toBlock: 113n }, headers.slice(1).map((header) => ({ ...header, transferBloom: true })));
+    await stage(first);
+    await f.db.execute(sql`UPDATE bootstrap_segments SET done = true, logs = CASE from_block WHEN 100 THEN ${first.length}::bigint ELSE ${second.length}::bigint END`);
+    await expect(f.bootstrap.finalize('ethereum', { at: Date.now(), maintenanceWorkMem: 'invalid' })).rejects.toThrow();
+    expect(await f.bootstrap.status('ethereum', Date.now())).toMatchObject({ status: 'indexing', segmentsApplied: 0, indexesDone: 0, indexesTotal: 1 });
+    await expect(f.bootstrap.finalize('ethereum', { at: Date.now() })).rejects.toThrow('staged rows');
+    expect((await f.db.execute(sql`SELECT from_block::text b, applied FROM bootstrap_segments ORDER BY from_block`)).rows)
+      .toEqual([{ b: '100', applied: true }, { b: '107', applied: false }]);
+    expect(await f.bootstrap.status('ethereum', Date.now())).toMatchObject({ status: 'materializing', segmentsApplied: 1 });
+    expect(await f.store.indexState('ethereum')).toBeUndefined();
+    await stage(second);
+    await f.bootstrap.finalize('ethereum', { at: Date.now() });
+    expect(await dump(f)).toEqual(await followerDump(chain));
+    expect((await f.db.execute(sql`SELECT sent_count::text s FROM holdings WHERE holder = decode(${alice.slice(2)}, 'hex') AND token = decode(${token.slice(2)}, 'hex')`)).rows).toHaveLength(1);
+  } finally { await f.store.close(); }
+});
+
+test('publish refuses an incomplete staged header chain after all segments are applied', async () => {
+  const chain = populated(106n);
+  const f = await fixture();
+  const headers = headersFor(99n, 106n);
+
+  try {
+    await f.bootstrap.createRun('ethereum', { startBlock: 100n, target: headers.at(-1)!, anchor: headers[0], segmentBlocks: 7n }, Date.now());
+    await f.bootstrap.commitSegment('ethereum', { fromBlock: 100n, toBlock: 106n }, 'test', async (insert) => {
+      await insert(chain.transfers);
+
+      return { logs: chain.transfers.length, requests: 1 };
+    }, Date.now());
+    await expect(f.bootstrap.finalize('ethereum', { at: Date.now() })).rejects.toThrow('incomplete');
+    expect(await f.store.indexState('ethereum')).toBeUndefined();
+    await f.bootstrap.saveHeaders('ethereum', { fromBlock: 100n, toBlock: 106n }, headers.slice(1).map((header) => ({ ...header, transferBloom: true })));
+    await f.bootstrap.finalize('ethereum', { at: Date.now() });
+    expect((await f.store.indexState('ethereum'))?.cursor.number).toBe(106n);
+  } finally { await f.store.close(); }
+});
+
+test('out-of-order and parallel segment commits converge on follower holdings and NFT winners', async () => {
+  const chain = populated(113n);
+  const ranges = [{ fromBlock: 100n, toBlock: 106n }, { fromBlock: 107n, toBlock: 113n }];
+  const expected = await followerDump(chain);
+
+  for (const parallel of [false, true]) {
+    const f = await fixture();
+    const headers = headersFor(99n, 113n);
+
+    try {
+      await f.bootstrap.createRun('ethereum', { startBlock: 100n, target: headers.at(-1)!, anchor: headers[0], segmentBlocks: 7n }, Date.now());
+      await f.bootstrap.saveHeaders('ethereum', { fromBlock: 100n, toBlock: 113n }, headers.slice(1).map((header) => ({ ...header, transferBloom: true })));
+
+      const commit = (range: BlockRange) => {
+        const events = chain.transfers.filter((event) => event.blockNumber >= range.fromBlock && event.blockNumber <= range.toBlock);
+
+        return f.bootstrap.commitSegment('ethereum', range, 'test', async (insert) => {
+          await insert(events);
+
+          return { logs: events.length, requests: 1 };
+        }, Date.now());
+      };
+
+      if (parallel) await Promise.all(ranges.map(commit));
+      else for (const range of ranges.toReversed()) await commit(range);
+      await f.bootstrap.finalize('ethereum', { at: Date.now() });
+      expect(await dump(f)).toEqual(expected);
+    } finally { await f.store.close(); }
+  }
 });
 
 test('a log hash that does not match the header chain refetches the segment from the other source', async () => {

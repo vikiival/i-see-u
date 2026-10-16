@@ -163,7 +163,8 @@ export const repairQueue = pgTable('repair_queue', {
 ]);
 
 // ---------------------------------------------------------------------------
-// One-time bulk load (src/bootstrap). Staging only; finalize moves everything into the tables above.
+// One-time bulk load (src/bootstrap). New segments write directly to the index;
+// bootstrap_transfers remains for runs created by the earlier staged loader.
 // ---------------------------------------------------------------------------
 
 /** One bootstrap per network: the pinned finalized target B, never moved during the run. */
@@ -172,7 +173,7 @@ export const bootstrapRuns = pgTable('bootstrap_runs', {
   startBlock: block('start_block').notNull(),
   targetBlock: block('target_block').notNull(),
   targetHash: hash('target_hash').notNull(),
-  /** headers | logs | finalizing | done */
+  /** headers | logs | materializing | publishing | done */
   status: text().notNull(),
   startedAt: time('started_at').notNull(),
   /** Last (re)start of a loader process; progress rates are measured from here. */
@@ -190,6 +191,8 @@ export const bootstrapSegments = pgTable('bootstrap_segments', {
   fromBlock: block('from_block').notNull(),
   toBlock: block('to_block').notNull(),
   done: boolean().notNull().default(false),
+  /** True iff this segment's raw and derived rows committed together. Old staged segments default false. */
+  applied: boolean().notNull().default(false),
   source: text(),
   logs: bigint('logs', { mode: 'number' }).notNull().default(0),
   calls: integer().notNull().default(0),

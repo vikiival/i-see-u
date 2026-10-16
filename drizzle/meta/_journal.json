@@ -36,6 +36,13 @@
       "when": 1792099272244,
       "tag": "0004_bootstrap_unlogged",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1792146994494,
+      "tag": "0005_bootstrap_applied",
+      "breakpoints": true
     }
   ]
 }

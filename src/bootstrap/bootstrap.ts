@@ -23,6 +23,7 @@ export interface BootstrapOptions {
   /** Concurrent RPC segment workers (default 4); HyperSync always has exactly one. */
   rpcWorkers?: number;
   maintenanceWorkMem?: string;
+  workMem?: string;
   /** VACUUM (ANALYZE) after finalize (default true). */
   analyze?: boolean;
   progressMs?: number;
@@ -69,15 +70,16 @@ const describe = (status: BootstrapStatus): string => {
   const eta = status.etaS === undefined ? '' : `, ETA ${Math.floor(status.etaS / 60)}m${status.etaS % 60}s`;
   const rate = status.logsPerS === undefined ? '' : `, ${status.logsPerS} logs/s`;
 
-  return `${status.status}: headers ${status.headersLoaded}/${status.headersTotal}, segments ${status.segmentsDone}/${status.segmentsTotal}`
+  return `${status.status}: headers ${status.headersLoaded}/${status.headersTotal}, segments ${status.segmentsDone}/${status.segmentsTotal}, applied ${status.segmentsApplied}/${status.segmentsTotal}`
+    + (status.indexesTotal ? `, index ${status.indexesDone}/${status.indexesTotal}` : '')
     + `${status.segmentsFailed ? ` (${status.segmentsFailed} failed)` : ''}, ${status.logs} logs${rate}${eta}`;
 };
 
 /**
  * One-time global load of [S, B] (B = the finalized block pinned when the run is created), resumable per segment:
  * headers (HyperSync, RPC fallback) -> verified segments from HyperSync (low end) and RPC workers (high end), each
- * refetched from the other source on any failure -> one finalize transaction that publishes transfers, headers,
- * holdings and nft_ownership with ingestion_state at B. The follower then continues at B + 1.
+ * refetched from the other source on any failure -> replay legacy staged segments if any ->
+ * a short transaction publishes headers and ingestion_state at B. The follower continues at B + 1.
  */
 export async function runBootstrap(o: BootstrapOptions): Promise<BootstrapResult> {
   const now = o.now ?? Date.now;
@@ -113,7 +115,7 @@ export async function runBootstrap(o: BootstrapOptions): Promise<BootstrapResult
   if (run.status === 'done') throw new Error('Bootstrap run is done but the index is missing');
   const { reset } = await store.resume(network, now());
 
-  if (reset) log('UNLOGGED staging rows were lost (PostgreSQL crash?); reloading every segment');
+  if (reset) log('UNLOGGED staging rows were lost (PostgreSQL crash?); reloading unapplied legacy segments');
   const target = run.targetBlock;
   const sources = [o.hypersync, o.rpc].filter((source) => source !== undefined);
   const other = (source: BootstrapSource) => sources.find((candidate) => candidate !== source);
@@ -234,10 +236,10 @@ export async function runBootstrap(o: BootstrapOptions): Promise<BootstrapResult
 
     if (failedSegments > 0) throw new Error(`${failedSegments} segments failed on every source; rerun to resume the remaining segments`);
 
-    // 3. Publish in one transaction.
-    await store.setPhase(network, 'finalizing', now());
-    log('all segments loaded and verified; finalizing (insert, derived tables, index builds)');
-    const finalized = await store.finalize(network, { at: now(), maintenanceWorkMem: o.maintenanceWorkMem });
+    // 3. Replay any old staged segments independently, then publish atomically.
+    await store.setPhase(network, 'materializing', now());
+    log('all segments loaded; applying any legacy staged segments, then publishing');
+    const finalized = await store.finalize(network, { at: now(), workMem: o.workMem, maintenanceWorkMem: o.maintenanceWorkMem });
 
     if (o.analyze ?? true) await store.analyze();
     const seconds = Math.round((now() - started) / 1_000);

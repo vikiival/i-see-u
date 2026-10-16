@@ -33,7 +33,7 @@ export function runConfiguredBootstrap(config: AppConfig, network: AppConfig['et
 
   const done = runBootstrap({
     network: network.name, startBlock: network.startBlock, adapter, index: deps.store, store: deps.bootstrap, hypersync, rpc,
-    segmentBlocks: b.segmentBlocks, headerChunkBlocks: b.headerChunkBlocks, rpcWorkers: b.rpcWorkers, maintenanceWorkMem: b.maintenanceWorkMem,
+    segmentBlocks: b.segmentBlocks, headerChunkBlocks: b.headerChunkBlocks, rpcWorkers: b.rpcWorkers, workMem: b.workMem, maintenanceWorkMem: b.maintenanceWorkMem,
     log: deps.log,
   });
 

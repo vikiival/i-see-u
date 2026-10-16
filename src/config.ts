@@ -146,6 +146,8 @@ export const config = {
     hypersyncUrl: process.env.HYPERSYNC_URL || ethereum.hypersyncUrl,
     /** Per-request idle timeout for HyperSync (not a whole-range timeout). */
     hypersyncIdleMs: int('HYPERSYNC_TIMEOUT_MS', '120000'),
+    /** Per legacy segment GROUP BY, not a global server setting. */
+    workMem: env('BOOTSTRAP_WORK_MEM', '64MB'),
     maintenanceWorkMem: env('BOOTSTRAP_MAINTENANCE_WORK_MEM', '1GB'),
   },
   /** Refuse discovery when the follower has not advanced for longer than this. */

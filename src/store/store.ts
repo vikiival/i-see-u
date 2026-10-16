@@ -66,23 +66,103 @@ const summarySelect = (source: SQL) => sql`
     sum(sent)::bigint, sum(received)::bigint
   FROM (${source}) movements GROUP BY network, holder, token`;
 
+const summaryMerge = sql`ON CONFLICT (network, holder, token) DO UPDATE SET
+  standard = greatest(holdings.standard, excluded.standard),
+  first_block = least(holdings.first_block, excluded.first_block),
+  last_block = greatest(holdings.last_block, excluded.last_block),
+  sent_count = holdings.sent_count + excluded.sent_count,
+  received_count = holdings.received_count + excluded.received_count`;
+
+const nftMerge = sql`ON CONFLICT (network, token, token_id) DO UPDATE SET
+  owner = excluded.owner, last_block = excluded.last_block, last_log_index = excluded.last_log_index
+  WHERE (excluded.last_block, excluded.last_log_index) > (nft_ownership.last_block, nft_ownership.last_log_index)`;
+
 export const applySummaries = (tx: Executor, source: SQL) => tx.execute(sql`
   INSERT INTO holdings (network, holder, token, standard, first_block, last_block, sent_count, received_count)
   ${summarySelect(source)}
-  ON CONFLICT (network, holder, token) DO UPDATE SET
-    standard = greatest(holdings.standard, excluded.standard),
-    first_block = least(holdings.first_block, excluded.first_block),
-    last_block = greatest(holdings.last_block, excluded.last_block),
-    sent_count = holdings.sent_count + excluded.sent_count,
-    received_count = holdings.received_count + excluded.received_count`);
+  ${summaryMerge}`);
 
 export const applyNfts = (tx: Executor, source: SQL) => tx.execute(sql`
   INSERT INTO nft_ownership (network, token, token_id, owner, last_block, last_log_index)
   SELECT DISTINCT ON (network, token, value) network, token, value, "to", block_number, log_index
   FROM (${source}) events ORDER BY network, token, value, block_number DESC, log_index DESC
-  ON CONFLICT (network, token, token_id) DO UPDATE SET
-    owner = excluded.owner, last_block = excluded.last_block, last_log_index = excluded.last_log_index
-  WHERE (excluded.last_block, excluded.last_log_index) > (nft_ownership.last_block, nft_ownership.last_log_index)`);
+  ${nftMerge}`);
+
+/** Fold one bootstrap segment before writing. Each key is unique in each batch, so
+ * PostgreSQL can merge concurrently committed segments in any order. */
+export function createSegmentAggregate() {
+  type Summary = { holder: Address; token: Address; standard: number; first: bigint; last: bigint; sent: bigint; received: bigint };
+
+  type Winner = { token: Address; value: bigint; owner: Address; block: bigint; index: number };
+
+  const summaries = new Map<string, Summary>();
+
+  const winners = new Map<string, Winner>();
+
+  const add = (events: TransferEvent[]): void => {
+    for (const event of events) {
+      for (const [holder, sent] of [[event.from, true], [event.to, false]] as const) {
+        const key = `${holder}:${event.token}`;
+        let row = summaries.get(key);
+
+        if (!row) {
+          row = { holder, token: event.token, standard: event.standard === 'erc20' ? 20 : 721,
+            first: event.blockNumber, last: event.blockNumber, sent: 0n, received: 0n };
+          summaries.set(key, row);
+        }
+
+        row.standard = Math.max(row.standard, event.standard === 'erc20' ? 20 : 721);
+
+        if (event.blockNumber < row.first) row.first = event.blockNumber;
+
+        if (event.blockNumber > row.last) row.last = event.blockNumber;
+
+        if (sent) row.sent += 1n;
+        else row.received += 1n;
+      }
+
+      if (event.standard === 'erc721') {
+        const key = `${event.token}:${event.value}`;
+        const old = winners.get(key);
+
+        if (!old || event.blockNumber > old.block || (event.blockNumber === old.block && event.logIndex > old.index)) {
+          winners.set(key, { token: event.token, value: event.value, owner: event.to, block: event.blockNumber, index: event.logIndex });
+        }
+      }
+    }
+  };
+
+  const flush = async (tx: Executor, network: number): Promise<void> => {
+    const column = <T>(rows: T[], pick: (row: T) => string): SQL => sql`${sql.param(rows.map(pick))}::text[]`;
+    const bytes = <T>(rows: T[], pick: (row: T) => Address): SQL => column(rows, (row) => pick(row).slice(2));
+    const ordered = [...summaries.values()].sort((a, b) => a.holder.localeCompare(b.holder) || a.token.localeCompare(b.token));
+
+    for (let i = 0; i < ordered.length; i += 2_000) {
+      const rows = ordered.slice(i, i + 2_000);
+      await tx.execute(sql`INSERT INTO holdings (network, holder, token, standard, first_block, last_block, sent_count, received_count)
+        SELECT ${network}::smallint, decode(h, 'hex'), decode(t, 'hex'), s::smallint, f::bigint, l::bigint, sc::bigint, rc::bigint
+        FROM unnest(${bytes(rows, (r) => r.holder)}, ${bytes(rows, (r) => r.token)}, ${column(rows, (r) => String(r.standard))},
+          ${column(rows, (r) => String(r.first))}, ${column(rows, (r) => String(r.last))},
+          ${column(rows, (r) => String(r.sent))}, ${column(rows, (r) => String(r.received))}) AS u(h, t, s, f, l, sc, rc)
+        ORDER BY h, t
+        ${summaryMerge}`);
+    }
+
+    const nftRows = [...winners.values()].sort((a, b) => a.token.localeCompare(b.token) || (a.value < b.value ? -1 : a.value > b.value ? 1 : 0));
+
+    for (let i = 0; i < nftRows.length; i += 2_000) {
+      const rows = nftRows.slice(i, i + 2_000);
+      await tx.execute(sql`INSERT INTO nft_ownership (network, token, token_id, owner, last_block, last_log_index)
+        SELECT ${network}::smallint, decode(t, 'hex'), v::numeric, decode(o, 'hex'), b::bigint, i::integer
+        FROM unnest(${bytes(rows, (r) => r.token)}, ${column(rows, (r) => String(r.value))}, ${bytes(rows, (r) => r.owner)},
+          ${column(rows, (r) => String(r.block))}, ${column(rows, (r) => String(r.index))}) AS u(t, v, o, b, i)
+        ORDER BY t, v::numeric
+        ${nftMerge}`);
+    }
+  };
+
+  return { add, flush };
+}
 
 /** Registry names are converted once here; every SQL key uses a stable smallint, never the EVM chain ID. */
 export function createStore(

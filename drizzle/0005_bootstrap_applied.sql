@@ -1,0 +1,1 @@
+ALTER TABLE "bootstrap_segments" ADD COLUMN "applied" boolean DEFAULT false NOT NULL;
