@@ -6,8 +6,8 @@ import { createLimiter } from '../core/limiter.ts';
 import { isObject, isString, thrownMessage, toLowerHex } from '../core/parse.ts';
 import type { BlockHeader, BlockRange, Hex, RpcClient, RpcRequestOptions, TransferEvent } from '../core/types.ts';
 import { hypersyncPages, redactSecrets } from '../sources/hypersync-pages.ts';
-import { wireLog } from '../sources/hypersync.ts';
-import type { HypersyncFactoryResult } from '../sources/hypersync.ts';
+import { LOG_FIELDS, wireLog } from '../sources/hypersync-wire.ts';
+import type { HypersyncFactoryResult } from '../sources/hypersync-wire.ts';
 
 /** A header plus whether its logsBloom may contain the Transfer topic (false proves the block has no Transfer). */
 export interface BootstrapHeader extends BlockHeader {
@@ -146,10 +146,6 @@ export interface HypersyncBootstrapOptions {
   sleep?: (ms: number) => Promise<void>;
   onRateLimit?: (waitMs: number) => void;
 }
-
-const LOG_FIELDS: NonNullable<NonNullable<Query['fieldSelection']>['log']> = [
-  'BlockNumber', 'BlockHash', 'LogIndex', 'TransactionHash', 'Address', 'Topic0', 'Topic1', 'Topic2', 'Topic3', 'Data',
-];
 
 /**
  * Envio HyperSync source: paginated `getWithRateLimit` (never `stream()`/`collect()`), headers for ~5,000 blocks per

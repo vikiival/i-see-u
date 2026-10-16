@@ -15,9 +15,10 @@ import type {
   RpcStats,
 } from '../src/core/types.ts';
 import { withFallback } from '../src/sources/fallback.ts';
-import { createHypersyncLogSource, wireLog } from '../src/sources/hypersync.ts';
-import type { HypersyncFactoryResult } from '../src/sources/hypersync.ts';
+import { createHypersyncLogSource } from '../src/sources/hypersync.ts';
 import type { HypersyncPager } from '../src/sources/hypersync-pages.ts';
+import { wireLog } from '../src/sources/hypersync-wire.ts';
+import type { HypersyncFactoryResult } from '../src/sources/hypersync-wire.ts';
 import { createRpcLogSource } from '../src/sources/rpc-logs.ts';
 import { rpcParam, staged } from './helpers.ts';
 import type { Log, Query, QueryResponse } from '@envio-dev/hypersync-client';

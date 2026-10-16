@@ -2,7 +2,7 @@ import { createEvmAdapter } from '../chains/evm/adapter.ts';
 import type { config as appConfig } from '../config.ts';
 import type { Store } from '../core/types.ts';
 import { createRpcClient } from '../rpc/client.ts';
-import { nativeHypersyncClient } from '../sources/hypersync.ts';
+import { nativeHypersyncClient } from '../sources/hypersync-wire.ts';
 import type { BootstrapStore } from './store.ts';
 import { runBootstrap } from './bootstrap.ts';
 import type { BootstrapResult } from './bootstrap.ts';

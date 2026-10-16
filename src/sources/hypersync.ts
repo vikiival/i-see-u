@@ -1,19 +1,14 @@
 import { pad } from 'viem';
-import type { Log, Query } from '@envio-dev/hypersync-client';
+import type { Query } from '@envio-dev/hypersync-client';
 
 import { addTransfer, aggregateLogCount, emptyAggregate } from '../core/aggregate.ts';
 import type { AccountLogSource, AccountLogSourceStats } from '../core/types.ts';
-import { isNumber, isObject, thrownMessage } from '../core/parse.ts';
+import { isObject, thrownMessage } from '../core/parse.ts';
 import { decodeTransferLog } from '../chains/evm/logs.ts';
-import type { WireLog } from '../chains/evm/logs.ts';
 import { TRANSFER_TOPIC } from '../chains/evm/logs.ts';
 import { hypersyncPages, redactSecrets } from './hypersync-pages.ts';
-import type { HypersyncPager } from './hypersync-pages.ts';
-
-export interface HypersyncFactoryResult {
-  client: HypersyncPager;
-  joinNothing: number;
-}
+import { LOG_FIELDS, nativeHypersyncClient, wireLog } from './hypersync-wire.ts';
+import type { HypersyncFactoryResult } from './hypersync-wire.ts';
 
 export interface HypersyncSourceOptions {
   url: string;
@@ -26,35 +21,6 @@ export interface HypersyncSourceOptions {
   clientFactory?: () => Promise<HypersyncFactoryResult>;
   sleep?: (ms: number) => Promise<void>;
 }
-
-const integer = (value: unknown): value is number => isNumber(value) && Number.isSafeInteger(value) && value >= 0;
-const quantity = (value: number): `0x${string}` => `0x${value.toString(16)}`;
-
-/** The native client, configured to report 429s to us instead of sleeping silently inside a request. */
-export async function nativeHypersyncClient(url: string, apiToken: string, timeoutMs: number): Promise<HypersyncFactoryResult> {
-  const { HypersyncClient, JoinMode } = await import('@envio-dev/hypersync-client');
-
-  return {
-    client: new HypersyncClient({ url, apiToken, httpReqTimeoutMillis: timeoutMs, proactiveRateLimitSleep: false, maxNumRetries: 3 }),
-    joinNothing: JoinMode.JoinNothing,
-  };
-}
-
-export const wireLog = (log: Log): WireLog => {
-  const topics = [...log.topics];
-
-  while (topics.length > 0 && topics.at(-1) == null) topics.pop();
-
-  return {
-    address: log.address,
-    topics,
-    data: log.data,
-    blockNumber: integer(log.blockNumber) ? quantity(log.blockNumber) : log.blockNumber,
-    blockHash: log.blockHash,
-    transactionHash: log.transactionHash,
-    logIndex: integer(log.logIndex) ? quantity(log.logIndex) : log.logIndex,
-  };
-};
 
 /** Paginated Envio HyperSync diagnostic source (sequential `getWithRateLimit`, never `stream()` or `collect()`). */
 export function createHypersyncLogSource(options: HypersyncSourceOptions): AccountLogSource {
@@ -92,7 +58,7 @@ export function createHypersyncLogSource(options: HypersyncSourceOptions): Accou
             { include: { topics: [[TRANSFER_TOPIC], [paddedAccount]] } },
             { include: { topics: [[TRANSFER_TOPIC], [], [paddedAccount]] } },
           ],
-          fieldSelection: { log: ['BlockNumber', 'BlockHash', 'LogIndex', 'TransactionHash', 'Address', 'Topic0', 'Topic1', 'Topic2', 'Topic3', 'Data'] },
+          fieldSelection: { log: LOG_FIELDS },
         };
 
         const aggregate = emptyAggregate();
