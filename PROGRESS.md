@@ -23,7 +23,7 @@ Times are local (CEST). "We" is Viktor plus AI agents: a Claude orchestrator han
 | 18:00–21:00 | Realtime tail with reorg handling | Jakub: realtime is part of the brief. Opus design, Codex build, Opus audit (9 bugs fixed). Tail lag 0 blocks live; 93 tests |
 | 23:50–01:15 | `/improve` audit and fixes (branch `feat/improve`) | Three parallel audits (Codex sol, 2× Opus), 5 fix plans run by Sonnet, sol and Opus in isolated worktrees, each reviewed. 115 tests; live run passed every check |
 | 11:00–13:30 | Budget: change-driven balance refresh (plan 006) | Opus built levers 1+3, 1 revision (orphaned snapshots on non-leaders). Balance sweep ~43M → ~1.6–6M credits/month; total ≈53M → ≈12–17M (estimates). 130 tests |
-| evening | SQD squid-sdk RPC source, revisited (`../disquid`) | Sonnet, source-level. Not adopted. Full blocks and unfiltered `getLogs` are hardcoded; a patch to three packages reaches our call count. Patch specified as plan 007 for Codex |
+| evening | SQD squid-sdk RPC source, revisited (`../disquid`) | Sonnet, source-level. Not adopted. Full blocks and unfiltered `getLogs` are hardcoded; a patch to three packages would reach our call count. Kept as a speculative spike in `../disquid` |
 
 ---
 
@@ -471,8 +471,9 @@ Cold backfill is unchanged: about 172 calls per new account, one-off.
 - The `eth_getLogs` range is one stride. `strideSize` is configurable, but an unfiltered 500-block call will hit provider limits, and `addLogs` has no split on too-large.
 - `verifyLogsBloom` needs every log of the block, so it cannot be combined with a filter. It can be turned off with `setRpc({rpc: {verifyLogsBloom: false}})`; the overrides are spread over the preset.
 - `includeAllBlocks` only affects output. Every block number is fetched either way.
+- **Head polling (found while writing the spike spec, Opus).** Once caught up, `evm-rpc/src/data-source/ingest.ts` waits `headPollInterval` (default 100 ms) between `latest` polls, and the squid-sdk builder does not expose it. That is about 864k calls a day, about 17M credits a day, enough to exhaust the 80M plan in under five days. A patch would have to expose it.
 
-**Found while writing the plan (Opus).** `addLogs` groups the returned logs by `blockHash` and silently drops any log whose hash is not one of the batch's headers. Behind a load-balanced provider (§13: varying `x-node-id`), a by-number `getLogs` can return another fork's logs, and with the bloom check off that block would just look empty. Our follower rejects such a response instead. The patch must add the same membership check.
+**Found while writing the spike spec (Opus).** `addLogs` groups the returned logs by `blockHash` and silently drops any log whose hash is not one of the batch's headers. Behind a load-balanced provider (§13: varying `x-node-id`), a by-number `getLogs` can return another fork's logs, and with the bloom check off that block would just look empty. Our follower rejects such a response instead. A patch would have to add the same membership check.
 
 **Call counts for the ~265k-block window** (derived from code, not measured):
 
@@ -482,7 +483,7 @@ Cold backfill is unchanged: about 172 calls per new account, one-off.
 | SQD patched (header-only, topic0, stride 500) | about 265k headers | about 530 plus splits |
 | i-see-u follower | about 265k headers (concurrency 8) | about 530 (`ETH_FOLLOWER_MAX_RANGE=500`) plus splits |
 
-**Decision.** i-see-u keeps its own follower and tail. The patch is specified as [plans/007](plans/007-sqd-rpc-log-filter-pushdown.md) for a Codex worker in `../disquid`, with a counting proxy to measure calls and bytes and a parity check against the unpatched source. If it measures at parity, the patched source (or the Portal, if RPC-only is not a hard rule) is a candidate for the pending bootstrap, appended through `appendRange`. The logs-bloom idea can also be ported into `src/chains/evm/logs.ts` without the framework, but only with unfiltered per-block logs or receipts.
+**Decision.** i-see-u keeps its own follower and tail. The patch is speculation, not project work: its spec lives in `../disquid/SPIKE-rpc-log-pushdown.md` (counting proxy, parity check against the unpatched source), outside this repo. If it were ever built and measured at parity, the patched source (or the Portal, if RPC-only is not a hard rule) is a candidate for the pending bootstrap, appended through `appendRange`. The logs-bloom idea can also be ported into `src/chains/evm/logs.ts` without the framework, but only with unfiltered per-block logs or receipts.
 
 ---
 
@@ -536,4 +537,3 @@ Cold backfill is unchanged: about 172 calls per new account, one-off.
 8. **Re-measure tail cost per block** over a longer window (1.5 vs 1.26 header calls).
 9. **Lever 2:** measure the Quicknode `eth_call` gas cap for a state-override balance checker / 2000 per batch.
 10. **Live re-measure of the balance refresh call rate** (the 1.8 calls/min figure is an estimate).
-11. **Run plan 007 (Codex, `../disquid`)**: header-only blocks plus topic-filtered `eth_getLogs` in the SQD RPC source; measure calls and bytes against the follower over the same range (§16).
