@@ -22,6 +22,20 @@
       "when": 1792095903610,
       "tag": "0002_tail_journal",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1792099271884,
+      "tag": "0003_bootstrap",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1792099272244,
+      "tag": "0004_bootstrap_unlogged",
+      "breakpoints": true
     }
   ]
 }

@@ -9,7 +9,7 @@ import * as schema from './schema.ts';
 
 export type StoreDatabase = PgDatabase<any, typeof schema>;
 
-type Executor = Pick<StoreDatabase, 'select' | 'insert' | 'update' | 'delete' | 'execute'>;
+export type Executor = Pick<StoreDatabase, 'select' | 'insert' | 'update' | 'delete' | 'execute'>;
 
 const {
   ingestionState: state, blockHeaders: headers, transfers: raw, holdings: h, nftOwnership: nft, balanceSnapshots: cache, repairQueue: repairs,
@@ -66,7 +66,7 @@ const summarySelect = (source: SQL) => sql`
     sum(sent)::bigint, sum(received)::bigint
   FROM (${source}) movements GROUP BY network, holder, token`;
 
-const applySummaries = (tx: Executor, source: SQL) => tx.execute(sql`
+export const applySummaries = (tx: Executor, source: SQL) => tx.execute(sql`
   INSERT INTO holdings (network, holder, token, standard, first_block, last_block, sent_count, received_count)
   ${summarySelect(source)}
   ON CONFLICT (network, holder, token) DO UPDATE SET
@@ -76,7 +76,7 @@ const applySummaries = (tx: Executor, source: SQL) => tx.execute(sql`
     sent_count = holdings.sent_count + excluded.sent_count,
     received_count = holdings.received_count + excluded.received_count`);
 
-const applyNfts = (tx: Executor, source: SQL) => tx.execute(sql`
+export const applyNfts = (tx: Executor, source: SQL) => tx.execute(sql`
   INSERT INTO nft_ownership (network, token, token_id, owner, last_block, last_log_index)
   SELECT DISTINCT ON (network, token, value) network, token, value, "to", block_number, log_index
   FROM (${source}) events ORDER BY network, token, value, block_number DESC, log_index DESC

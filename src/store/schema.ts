@@ -1,5 +1,5 @@
 import { sql } from 'drizzle-orm';
-import { bigint, check, index, integer, pgTable, primaryKey, smallint, text } from 'drizzle-orm/pg-core';
+import { bigint, boolean, check, index, integer, pgTable, primaryKey, smallint, text } from 'drizzle-orm/pg-core';
 
 import { binaryHex, standard, uint256 } from './columns.ts';
 
@@ -161,3 +161,66 @@ export const repairQueue = pgTable('repair_queue', {
   primaryKey({ columns: [t.network, t.fromBlock, t.toBlock] }),
   check('repair_range', sql`${t.fromBlock} >= 0 AND ${t.toBlock} >= ${t.fromBlock}`),
 ]);
+
+// ---------------------------------------------------------------------------
+// One-time bulk load (src/bootstrap). Staging only; finalize moves everything into the tables above.
+// ---------------------------------------------------------------------------
+
+/** One bootstrap per network: the pinned finalized target B, never moved during the run. */
+export const bootstrapRuns = pgTable('bootstrap_runs', {
+  network: smallint().primaryKey(),
+  startBlock: block('start_block').notNull(),
+  targetBlock: block('target_block').notNull(),
+  targetHash: hash('target_hash').notNull(),
+  /** headers | logs | finalizing | done */
+  status: text().notNull(),
+  startedAt: time('started_at').notNull(),
+  /** Last (re)start of a loader process; progress rates are measured from here. */
+  resumedAt: time('resumed_at').notNull(),
+  updatedAt: time('updated_at').notNull(),
+  error: text(),
+}, (t) => [
+  check('bootstrap_run_hash_width', sql`octet_length(${t.targetHash}) = 32`),
+  check('bootstrap_run_range', sql`${t.startBlock} >= 1 AND ${t.targetBlock} >= ${t.startBlock}`),
+]);
+
+/** Unit of fetch, verification, commit and resume. Rows of a segment exist in bootstrap_transfers iff it is done. */
+export const bootstrapSegments = pgTable('bootstrap_segments', {
+  network: smallint().notNull(),
+  fromBlock: block('from_block').notNull(),
+  toBlock: block('to_block').notNull(),
+  done: boolean().notNull().default(false),
+  source: text(),
+  logs: bigint('logs', { mode: 'number' }).notNull().default(0),
+  calls: integer().notNull().default(0),
+  attempts: integer().notNull().default(0),
+  error: text(),
+  updatedAt: time('updated_at'),
+}, (t) => [
+  primaryKey({ columns: [t.network, t.fromBlock] }),
+  check('bootstrap_segment_range', sql`${t.toBlock} >= ${t.fromBlock}`),
+]);
+
+/** Complete header chain S-1..B; `transfer_bloom` records whether logsBloom may contain the Transfer topic. */
+export const bootstrapHeaders = pgTable('bootstrap_headers', {
+  network: smallint().notNull(),
+  number: block('number').notNull(),
+  hash: hash('hash').notNull(),
+  parentHash: hash('parent_hash').notNull(),
+  timestamp: block('timestamp').notNull(),
+  transferBloom: boolean('transfer_bloom').notNull(),
+}, (t) => [primaryKey({ columns: [t.network, t.number] })]);
+
+/** Same columns as transfers; no keys, indexes or checks (UNLOGGED, see the custom migration). Finalize enforces them. */
+export const bootstrapTransfers = pgTable('bootstrap_transfers', {
+  network: smallint().notNull(),
+  blockNumber: block('block_number').notNull(),
+  logIndex: integer('log_index').notNull(),
+  blockHash: hash('block_hash').notNull(),
+  transactionHash: hash('transaction_hash').notNull(),
+  token: address('token').notNull(),
+  standard: standard('standard').notNull(),
+  from: address('from').notNull(),
+  to: address('to').notNull(),
+  value: uint256('value').notNull(),
+});
