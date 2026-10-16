@@ -24,6 +24,7 @@ Times are local (CEST). "We" is Viktor plus AI agents: a Claude orchestrator han
 | 23:50–01:15 | `/improve` audit and fixes (branch `feat/improve`) | Three parallel audits (Codex sol, 2× Opus), 5 fix plans run by Sonnet, sol and Opus in isolated worktrees, each reviewed. 115 tests; live run passed every check |
 | 11:00–13:30 | Budget: change-driven balance refresh (plan 006) | Opus built levers 1+3, 1 revision (orphaned snapshots on non-leaders). Balance sweep ~43M → ~1.6–6M credits/month; total ≈53M → ≈12–17M (estimates). 130 tests |
 | evening | SQD squid-sdk RPC source, revisited (`../disquid`) | Sonnet, source-level. Not adopted. Full blocks and unfiltered `getLogs` are hardcoded; a patch to three packages would reach our call count. Kept as a speculative spike in `../disquid` |
+| 2026-10-16 | Cancellation, Codex review and fixes | Effect not adopted; plain `AbortSignal` makes abandoned request-path work stop. Codex gpt-6-sol review: 6 of 8 findings fixed, 2 kept by design. 164 tests |
 
 ---
 
@@ -485,6 +486,35 @@ Cold backfill is unchanged: about 172 calls per new account, one-off.
 
 **Decision.** i-see-u keeps its own follower and tail. The patch is speculation, not project work: its spec lives in `../disquid/SPIKE-rpc-log-pushdown.md` (counting proxy, parity check against the unpatched source), outside this repo. If it were ever built and measured at parity, the patched source (or the Portal, if RPC-only is not a hard rule) is a candidate for the pending bootstrap, appended through `appendRange`. The logs-bloom idea can also be ported into `src/chains/evm/logs.ts` without the framework, but only with unfiltered per-block logs or receipts.
 
+## 17. Cancellation, Codex review and fixes (2026-10-16)
+
+**Trigger.** Would Effect help this codebase? Viktor's main session concluded: no migration. The one concrete gain Effect would bring is interruption, meaning abandoned work actually stops, and plain `AbortSignal` plumbing gets most of that without a new runtime. Before this change nothing passed a signal:
+- `withDeadline` only stopped *waiting*. A request past its deadline kept its RPC work running, retries and backoff sleeps included, still billed.
+- The limiter dropped an expired job only once it was dequeued, so a queued waiter sat in the queue until a slot freed.
+- `scanAccountChunk` stopped the second direction only between ranges, after its in-flight `eth_getLogs` finished.
+
+**What was built (Opus, `a17f93f`).**
+- **RpcClient:** an optional `signal` per request. viem 2.57's http transport accepts `{ signal }` per call and merges it with its own timeout signal, so the in-flight fetch really aborts. The client checks the signal before every attempt, and the token-bucket wait and backoff sleep are abortable. An abort rejects with the signal's reason and does not count against endpoint health.
+- **Limiter and `withDeadline`:** `Limiter.run` hands the job one signal (the caller's signal plus `deadlineAt`); a queued waiter whose signal aborts leaves the queue at once. `withDeadline` answers with its timeout error, then aborts the work. A deadline is still `unavailable(...)` and a 503.
+- **Log scans:** the `failed`/`shouldStop` flags became one shared `AbortController`; the first failing direction aborts the other in flight.
+- **Balance batches:** these are shared across requests, so a batch's RPC is aborted only when the *last* waiting request gives up (deadline, or client disconnect via the request's own signal). Later requests for those pairs then start a fresh read instead of joining the abandoned one.
+- **Ownership sweep:** shared through the per-block cache, so it runs under its own deadline rather than any one request's signal.
+
+**Review (Codex gpt-6-sol, read-only, high effort).** It found no listener leak, unhandled rejection or wrong deadline→503 mapping in the commit. All 8 findings were re-checked against the code:
+
+| Finding | Verdict | Fix |
+|---|---|---|
+| `wireLog` looped forever on an empty or all-null topic list | Confirmed (malformed HyperSync data only) | Loop guard (`a62c9fb`) |
+| Ownership RPC failures of kind `fatal` (e.g. 401) became a 500; balances already gave 503 | Confirmed | Wrapped as `unavailable(...)` like balances (`a62c9fb`) |
+| Owner cache kept results with transient per-item errors until the block changed | Confirmed | Single flight kept; such results are evicted (`a62c9fb`) |
+| `Limiter.run` read the clock twice; a negative `AbortSignal.timeout` throws `RangeError` → 500 | Confirmed (rare) | One clock read (`a62c9fb`) |
+| `withDeadline` leaked its timer if the work threw synchronously | Confirmed (no current caller does) | Work runs inside a promise executor (`a62c9fb`) |
+| Bootstrap imported HyperSync plumbing from the diagnostic source; log field list duplicated | Confirmed | New `src/sources/hypersync-wire.ts` with one `LOG_FIELDS` (Sonnet subagent, `6137103`) |
+| Partial multicall success hides a 401/429 in one chunk | Not changed | Plan 004's intended partial-result semantics |
+| Ownership sweep ignores client disconnects | Not changed | Deliberate: shared sweep, bounded by its deadline |
+
+**Tests:** 147 → **164**. New coverage shows aborted work makes no further RPC attempts (limiter, RpcClient, log scans), that a shared balance batch is aborted only by its last waiter, and each review fix. Under file parallelism, `npm test` sometimes hits Vitest's 5 s timeout on PGlite-heavy files; HEAD before these changes did the same (plan 007). Serial runs pass.
+
 ---
 
 ## Mistakes and reversals (the interesting part)
@@ -503,6 +533,8 @@ Cold backfill is unchanged: about 172 calls per new account, one-off.
 | Benchmarks under a changing provider | Re-measured, and every table states the provider conditions |
 | `pkill -f src/server.ts` in benchmarks | Killed Viktor's server once. Narrow patterns only since |
 | A 46 s cold request in Viktor's own test | Contention with a parallel benchmark on the same endpoint, plus a wrong test address. Re-measured at 3.3 s |
+| Plan 005 dropped expired *queued* jobs, but work already running past its deadline kept going | Running attempts, retries and backoff kept spending credits. `AbortSignal` cancellation now stops them (§17) |
+| Parallel test timeouts after the cancellation change looked like a regression | The unchanged baseline failed the same way on one run in two; it is PGlite load (plan 007), not the change |
 
 ---
 
@@ -517,7 +549,7 @@ Cold backfill is unchanged: about 172 calls per new account, one-off.
 | Block height the data is valid for | ✅ | `blockHeight` + `blockHash` (the tail tip with `finality=latest`, the follower cursor with `finalized`), `finalizedBlockHeight`, `balancesAtBlockHeight` |
 | Modular (adapter-style) | ✅ / ⚠️ | `ChainAdapter`, `Store` and `RpcClient` are interfaces, and a new EVM chain is a config entry. A per-account `AccountLogSource` (RPC, HyperSync, with fallback) is in progress (§12) |
 | Scales to 5k users polling every minute | ✅ / ⚠️ | 0 RPC calls per warm request. A fake-RPC acceptance test covers 5k accounts. No live HTTP load test. Multi-replica hardened in §14 (race-safe tracking, truthful leadership, shared tail freshness, fenced tail writes); still no cross-replica backfill dedupe |
-| Unreliable RPC: slow, errors, rate limits, lagging | ✅ | RpcClient classification, backoff, breaker, failover, validate. Follower lag, `stale` and 503 |
+| Unreliable RPC: slow, errors, rate limits, lagging | ✅ | RpcClient classification, backoff, breaker, failover, validate. Follower lag, `stale` and 503. Work a request abandons (deadline, disconnect) is cancelled, so slow RPC does not keep billing (§17) |
 | README and documented limits | ✅ | README "Limits", REPORT §7 |
 | Not a full indexer | ✅ | Only `Transfer` logs, only for tracked accounts, aggregated per (account, token) |
 | RPC-efficient (paid per request) | ✅ | About 12–17M credits/month steady state for 5k users at 10 tokens each (estimate; Build plan has 80M, was about 53–54M before the change-driven balance refresh, §15). Balance cost now scales with Transfer activity. Cold backfill is 172 calls per account |
@@ -537,3 +569,5 @@ Cold backfill is unchanged: about 172 calls per new account, one-off.
 8. **Re-measure tail cost per block** over a longer window (1.5 vs 1.26 header calls).
 9. **Lever 2:** measure the Quicknode `eth_call` gas cap for a state-override balance checker / 2000 per batch.
 10. **Live re-measure of the balance refresh call rate** (the 1.8 calls/min figure is an estimate).
+11. **Reliable default test run** (plan 007): one worker or no file parallelism for the PGlite-heavy files.
+12. **Non-EVM readiness:** a `kind` on registry entries with an adapter factory switch, and the EVM-only bulk sources moved under `src/chains/evm/`.
