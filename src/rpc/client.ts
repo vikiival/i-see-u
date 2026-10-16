@@ -32,7 +32,26 @@ const RETRY_AFTER_CAP_MS = 10_000;
 // Hands each attempt the raw Response (status, Retry-After) that viem's errors do not always carry.
 const attemptResponse = new AsyncLocalStorage<(response: Response) => void>();
 
-const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
+/** Rejects with signal.reason as soon as the signal aborts. */
+const sleep = (ms: number, signal?: AbortSignal): Promise<void> => new Promise((resolve, reject) => {
+  if (signal?.aborted) {
+    reject(signal.reason);
+
+    return;
+  }
+
+  const abort = (): void => {
+    clearTimeout(timer);
+    reject(signal?.reason);
+  };
+
+  const timer = setTimeout(() => {
+    signal?.removeEventListener('abort', abort);
+    resolve();
+  }, ms);
+
+  signal?.addEventListener('abort', abort, { once: true });
+});
 
 const redactedUrl = (url: URL): string => `${url.origin}/***`;
 
@@ -69,7 +88,8 @@ const networkMessage = (error: unknown): string => {
  * - HttpRequestError with .status: non-2xx without a JSON-RPC error body; .headers, .details (body or statusText).
  * - HttpRequestError without .status: fetch/body-read failure (.cause chain carries e.g. ECONNRESET) or, on a 2xx,
  *   an unparsable body (SyntaxError cause).
- * - TimeoutError: per-transport timeout; AbortError never occurs since we pass no signal.
+ * - TimeoutError: per-transport timeout. The caller's signal is passed per request (viem merges it with its timeout
+ *   signal); request() checks signal.aborted before classifying, so an AbortError never reaches failureOf.
  * viem's messages embed the full endpoint URL (key in path), so only .details/.code/.status are ever surfaced.
  */
 const timeoutMessage = /timed? ?out|timeout/i;
@@ -147,7 +167,7 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
   let tokens = bucketCapacity;
   let refilledAt = performance.now();
 
-  const takeToken = async (): Promise<void> => {
+  const takeToken = async (signal?: AbortSignal): Promise<void> => {
     while (true) {
       const now = performance.now();
       tokens = Math.min(bucketCapacity, tokens + (now - refilledAt) * options.maxRps / 1_000);
@@ -159,7 +179,7 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
         return;
       }
 
-      await sleep(Math.max(1, Math.ceil((1 - tokens) * 1_000 / options.maxRps)));
+      await sleep(Math.max(1, Math.ceil((1 - tokens) * 1_000 / options.maxRps)), signal);
     }
   };
 
@@ -216,11 +236,13 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
   const request = async <T>(method: string, params: unknown[], requestOptions: RpcRequestOptions = {}): Promise<T> => {
     counters.requests += 1;
     const { maxAttempts } = options;
+    const { signal } = requestOptions;
 
     let lastError: RpcError | undefined;
     let endpointOffset = 0;
 
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      signal?.throwIfAborted();
       const endpoint = chooseEndpoint(method, endpointOffset);
 
       if (!endpoint) {
@@ -228,12 +250,8 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
       }
 
       endpointOffset = (endpoints.indexOf(endpoint) + 1) % endpoints.length;
-      await takeToken();
-      counters.attempts += 1;
-      counters.byMethod[method] = (counters.byMethod[method] ?? 0) + 1;
-
       let response: Response | undefined;
-      const startedAt = performance.now();
+      let startedAt = 0;
 
       const report = (ok: boolean): void => {
         if (!requestOptions.onAttempt) return;
@@ -242,9 +260,14 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
       };
 
       try {
+        await takeToken(signal);
+        counters.attempts += 1;
+        counters.byMethod[method] = (counters.byMethod[method] ?? 0) + 1;
+        startedAt = performance.now();
+
         const result = await attemptResponse.run(
           value => { response = value; },
-          () => endpoint.send({ method, params }),
+          () => endpoint.send({ method, params }, { signal }),
         );
 
         if (result === undefined) throw new RpcError('fatal', 'Malformed JSON-RPC response');
@@ -260,6 +283,12 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
         // parsed from the response body, checked by the caller's `validate` above where the shape is not guaranteed.
         return result as T;
       } catch (cause) {
+        if (signal?.aborted) {
+          // The caller gave up: not an endpoint failure, and not worth another attempt.
+          endpoint.probeInFlight = false;
+          throw signal.reason;
+        }
+
         const error = failureOf(cause, response);
         lastError = error;
         report(false);
@@ -284,7 +313,7 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
           const cap = Math.min(BACKOFF_CAP_MS, BACKOFF_BASE_MS * 2 ** attempt);
           const headers = response?.headers ?? (cause instanceof HttpRequestError ? cause.headers : undefined);
           // Honour Retry-After, but never hold an API request longer than RETRY_AFTER_CAP_MS per attempt.
-          await sleep(Math.max(Math.min(retryAfterMs(headers?.get('retry-after')), RETRY_AFTER_CAP_MS), Math.random() * cap));
+          await sleep(Math.max(Math.min(retryAfterMs(headers?.get('retry-after')), RETRY_AFTER_CAP_MS), Math.random() * cap), signal);
         }
       }
     }

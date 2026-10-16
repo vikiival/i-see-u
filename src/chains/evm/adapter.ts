@@ -38,7 +38,7 @@ export function createEvmAdapter(rpc: RpcClient, o: EvmAdapterOptions): ChainAda
     headerByNumber: head.blockByNumber,
     transfersInBlock: (blockHash) => transfersInBlock(rpc, blockHash),
     transfersInRange: (range, headers) => transfersInRange(rpc, range, headers),
-    erc20BalancePairs: (pairs, blockHash) => readErc20BalancePairs(rpc, pairs, blockHash, o.multicallBatch, o.multicall3),
-    erc721Owners: (items, blockHash) => readErc721Owners(rpc, items, blockHash, o.multicallBatch, o.multicall3),
+    erc20BalancePairs: (pairs, blockHash, signal) => readErc20BalancePairs(rpc, pairs, blockHash, o.multicallBatch, o.multicall3, signal),
+    erc721Owners: (items, blockHash, signal) => readErc721Owners(rpc, items, blockHash, o.multicallBatch, o.multicall3, signal),
   };
 }

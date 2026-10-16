@@ -156,8 +156,9 @@ export function createApp(deps: RouteDeps, opts: { requestLog?: boolean } = {}):
 
     if (hit) return hit;
 
+    // Shared by every request polling this block, so it stops at its own deadline rather than any one request's.
     const promise = deps.requestRpc.limiter.run(
-      () => adapter.erc721Owners(items, blockHash),
+      (signal) => adapter.erc721Owners(items, blockHash, signal),
       { deadlineAt: Date.now() + deps.requestRpc.deadlineMs },
     );
 
@@ -213,7 +214,9 @@ export function createApp(deps: RouteDeps, opts: { requestLog?: boolean } = {}):
     const at = { number: result.blockHeight, hash: result.blockHash, timestamp: result.blockTimestamp };
 
     // Pinned to the served block hash: the tail tip for latest, the finalized cursor otherwise.
-    const balances = includeBalances ? await deps.balances[result.network].forAccount(result.account, holdings, at, result.revision, result.balances) : undefined;
+    const balances = includeBalances
+      ? await deps.balances[result.network].forAccount(result.account, holdings, at, result.revision, result.balances, c.req.raw.signal)
+      : undefined;
 
     const tokens = holdings.map((holding, i) => {
       const token = {
@@ -262,7 +265,7 @@ export function createApp(deps: RouteDeps, opts: { requestLog?: boolean } = {}):
 
     const owners = verifyOwnership && !skipped && heldItems.length > 0
       ? await withDeadline(
-        ownersFor(`${result.network}:${result.account}:${result.blockHash}:${result.revision}`, adapter, heldItems, result.blockHash),
+        () => ownersFor(`${result.network}:${result.account}:${result.blockHash}:${result.revision}`, adapter, heldItems, result.blockHash),
         deps.requestRpc.deadlineMs,
         () => { throw unavailable('Ownership verification did not finish within the request deadline', 2); },
       )

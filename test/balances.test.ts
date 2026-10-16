@@ -1,5 +1,7 @@
-import { expect, test } from 'vitest';
+import { expect, test, vi } from 'vitest';
 
+import { createBalanceReader } from '../src/balances/reader.ts';
+import { createLimiter } from '../src/core/limiter.ts';
 import { RpcError } from '../src/rpc/errors.ts';
 import { address, blockHash, FakeChain, gate } from './fake-chain.ts';
 import { blockRange, stack } from './stack.ts';
@@ -200,5 +202,51 @@ test('without balances=true no balance RPC or cache write happens', async () => 
     expect((await s.app.request(`/v1/ethereum/accounts/${account}/erc20`)).status).toBe(200);
     expect(ethCalls(s)).toBe(0);
     expect(await s.store.balances('ethereum', account)).toEqual([]);
+  } finally { await s.close(); }
+});
+
+test('a shared balance batch stops its RPC only once every waiting request gave up', async () => {
+  const s = await fixture();
+  const signals: AbortSignal[] = [];
+
+  const reader = createBalanceReader({
+    adapter: {
+      ...s.adapter,
+      erc20BalancePairs: (_pairs, _hash, signal) => {
+        if (signal) signals.push(signal);
+
+        return new Promise((_resolve, reject) => signal?.addEventListener('abort', () => reject(signal.reason)));
+      },
+    },
+    store: s.store,
+    requestRpc: { limiter: createLimiter(2, 8), deadlineMs: 60_000 },
+    batchSize: 1_000,
+    windowMs: 0,
+    alwaysRefresh: [],
+  });
+
+  const at = { number: 102n, hash: blockHash(102n), timestamp: 0n };
+  const holdings = [{ token: tokenA, lastBlock: 100n }];
+  const [a, b, c] = [new AbortController(), new AbortController(), new AbortController()];
+
+  try {
+    const first = reader.forAccount(account, holdings, at, 0n, [], a.signal);
+    const second = reader.forAccount(other, holdings, at, 0n, [], b.signal);
+    await vi.waitFor(() => expect(signals).toHaveLength(1));
+
+    a.abort();
+    await expect(first).rejects.toMatchObject({ statusCode: 503, message: 'Request cancelled' });
+    expect(signals[0].aborted).toBe(false);
+
+    b.abort();
+    await expect(second).rejects.toMatchObject({ statusCode: 503, message: 'Request cancelled' });
+    expect(signals[0].aborted).toBe(true);
+
+    // A later request for the same pair starts a fresh read instead of joining the abandoned one.
+    const third = reader.forAccount(account, holdings, at, 0n, [], c.signal);
+    await vi.waitFor(() => expect(signals).toHaveLength(2));
+    expect(signals[1].aborted).toBe(false);
+    c.abort();
+    await expect(third).rejects.toMatchObject({ statusCode: 503 });
   } finally { await s.close(); }
 });

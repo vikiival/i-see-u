@@ -124,8 +124,8 @@ export interface ChainAdapter {
   transfersInBlock(blockHash: Hex): Promise<TransferEvent[]>;
   /** All Transfer logs, verified against the supplied contiguous header chain. */
   transfersInRange(range: BlockRange, headers: BlockHeader[]): Promise<TransferEvent[]>;
-  erc20BalancePairs(pairs: BalancePair[], blockHash: Hex): Promise<BalanceResult[]>;
-  erc721Owners(items: { token: Address; tokenId: bigint }[], blockHash: Hex): Promise<OwnerResult[]>;
+  erc20BalancePairs(pairs: BalancePair[], blockHash: Hex, signal?: AbortSignal): Promise<BalanceResult[]>;
+  erc721Owners(items: { token: Address; tokenId: bigint }[], blockHash: Hex, signal?: AbortSignal): Promise<OwnerResult[]>;
 }
 
 export interface BalancePair {
@@ -155,6 +155,8 @@ export interface RpcRequestOptions {
   failFastOnTimeout?: boolean;
   /** Called after every HTTP attempt; bytes is the uncompressed Content-Length when the provider sends one. */
   onAttempt?: (attempt: RpcAttemptInfo) => void;
+  /** Stops the request: no further attempt or backoff, and the in-flight fetch is aborted. Rejects with signal.reason. */
+  signal?: AbortSignal;
 }
 
 export interface RpcAttemptInfo {

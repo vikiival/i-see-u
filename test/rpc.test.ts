@@ -389,3 +389,62 @@ test('onAttempt reports duration and the uncompressed Content-Length', async () 
   await client.request('eth_getLogs', [], { onAttempt: attempt => attempts.push(attempt) });
   expect(attempts).toEqual([{ ok: true, durationMs: expect.any(Number), bytes: body.length }]);
 });
+
+/** fetch that never answers until its (viem-merged) signal aborts, like a slow provider. */
+const hangingFetch = () => {
+  const calls: (AbortSignal | undefined)[] = [];
+  vi.stubGlobal('fetch', vi.fn((_input: string, init?: RequestInit) => {
+    calls.push(init?.signal ?? undefined);
+
+    return new Promise((_resolve, reject) => init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError'))));
+  }));
+
+  return calls;
+};
+
+test('aborting the signal cancels the in-flight fetch and makes no further attempt', async () => {
+  const calls = hangingFetch();
+  const client = createRpcClient({ urls: ['https://a.example/key', 'https://b.example/key'], timeoutMs: 60_000, maxAttempts: 4, maxRps: 1_000 });
+  const controller = new AbortController();
+  const pending = client.request('eth_getLogs', [], { signal: controller.signal });
+  await vi.waitFor(() => expect(calls.length).toBe(1));
+
+  const reason = new Error('caller gave up');
+  controller.abort(reason);
+  await expect(pending).rejects.toBe(reason);
+  expect(calls[0]?.aborted).toBe(true);
+  expect(calls.length).toBe(1);
+  // A cancellation is not an endpoint failure.
+  expect(client.stats()).toMatchObject({ attempts: 1, errors: {} });
+  expect(client.stats().endpoints.map(endpoint => endpoint.failures)).toEqual([0, 0]);
+});
+
+test('aborting during the retry backoff stops at once without another attempt', async () => {
+  const urls = stubFetch(() => new Response('Too Many Requests', { status: 429, headers: { 'retry-after': '5' } }));
+  const client = createRpcClient({ urls: ['https://only.example/key'], timeoutMs: 1_000, maxAttempts: 3, maxRps: 1_000 });
+  const controller = new AbortController();
+  const pending = client.request('eth_blockNumber', [], { signal: controller.signal });
+  await vi.waitFor(() => expect(client.stats().errors).toEqual({ rate_limited: 1 }));
+
+  const startedAt = Date.now();
+  controller.abort();
+  await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+  expect(Date.now() - startedAt).toBeLessThan(1_000);
+  expect(urls.length).toBe(1);
+});
+
+test('an already aborted signal makes no attempt, and the token-bucket wait is abortable', async () => {
+  const urls = stubFetch(() => json({ jsonrpc: '2.0', id: 1, result: '0x1' }));
+  const client = createRpcClient({ urls: ['https://only.example/key'], timeoutMs: 1_000, maxAttempts: 1, maxRps: 1 });
+  await expect(client.request('eth_blockNumber', [], { signal: AbortSignal.abort() })).rejects.toMatchObject({ name: 'AbortError' });
+  expect(urls.length).toBe(0);
+
+  // maxRps 1: the first request takes the only token, the second waits ~1 s for the next one.
+  expect(await client.request('eth_blockNumber', [])).toBe('0x1');
+  const controller = new AbortController();
+  const waiting = client.request('eth_blockNumber', [], { signal: controller.signal });
+  controller.abort();
+  await expect(waiting).rejects.toMatchObject({ name: 'AbortError' });
+  expect(urls.length).toBe(1);
+  expect(client.stats().attempts).toBe(1);
+});

@@ -22,7 +22,7 @@ const splittable = (error: RpcError | undefined): error is RpcError =>
   error?.kind === 'too_large'
   || (error?.kind === 'fatal' && /revert|out of gas|gas required|exceeds|too large|entity too large/i.test(error.message));
 
-async function aggregateChunk(rpc: RpcClient, calls: EncodedCall[], blockHash: Hex, multicall3: Address): Promise<CallOutcome[]> {
+async function aggregateChunk(rpc: RpcClient, calls: EncodedCall[], blockHash: Hex, multicall3: Address, signal?: AbortSignal): Promise<CallOutcome[]> {
   try {
     const data = encodeFunctionData({
       abi: multicall3Abi,
@@ -43,6 +43,7 @@ async function aggregateChunk(rpc: RpcClient, calls: EncodedCall[], blockHash: H
           return false;
         }
       },
+      signal,
     });
 
     const decoded = decodeFunctionResult({ abi: multicall3Abi, functionName: 'aggregate3', data: response });
@@ -56,8 +57,8 @@ async function aggregateChunk(rpc: RpcClient, calls: EncodedCall[], blockHash: H
 
     if (calls.length === 1) return [{ ok: false, error: shortReason(rpcError.message) }];
     const middle = Math.floor(calls.length / 2);
-    const left = await aggregateChunk(rpc, calls.slice(0, middle), blockHash, multicall3);
-    const right = await aggregateChunk(rpc, calls.slice(middle), blockHash, multicall3);
+    const left = await aggregateChunk(rpc, calls.slice(0, middle), blockHash, multicall3, signal);
+    const right = await aggregateChunk(rpc, calls.slice(middle), blockHash, multicall3, signal);
 
     return [...left, ...right];
   }
@@ -72,6 +73,7 @@ async function readCalls<T>(
   label: string,
   decode: (data: Hex) => T,
   multicall3: Address,
+  signal?: AbortSignal,
 ): Promise<({ status: 'ok'; value: T } | { status: 'error'; error: string; transient?: true })[]> {
   const chunks: EncodedCall[][] = [];
 
@@ -80,11 +82,11 @@ async function readCalls<T>(
   let next = 0;
 
   const worker = async (): Promise<void> => {
-    while (next < chunks.length) {
+    while (next < chunks.length && !signal?.aborted) {
       const index = next++;
 
       try {
-        chunksResults[index] = { outcomes: await aggregateChunk(rpc, chunks[index], blockHash, multicall3) };
+        chunksResults[index] = { outcomes: await aggregateChunk(rpc, chunks[index], blockHash, multicall3, signal) };
       } catch (error) {
         chunksResults[index] = { error };
       }
@@ -92,6 +94,8 @@ async function readCalls<T>(
   };
 
   await Promise.all(Array.from({ length: Math.min(2, chunks.length) }, worker));
+  // Aborted chunks were caught as failures above; never pass them off as per-call transient errors.
+  signal?.throwIfAborted();
   const failures = chunksResults.filter((result): result is { error: unknown } => 'error' in result);
 
   if (failures.length > 0 && failures.length === chunks.length) throw failures[0].error;
@@ -122,6 +126,7 @@ export async function readErc20BalancePairs(
   blockHash: Hex,
   batchSize: number,
   multicall3: Address = MULTICALL3,
+  signal?: AbortSignal,
 ): Promise<BalanceResult[]> {
   const callData = new Map<Address, Hex>();
 
@@ -134,7 +139,7 @@ export async function readErc20BalancePairs(
   });
 
   const results = await readCalls(rpc, calls, blockHash, batchSize, 'balanceOf',
-    (data) => decodeFunctionResult({ abi: erc20Abi, functionName: 'balanceOf', data }), multicall3);
+    (data) => decodeFunctionResult({ abi: erc20Abi, functionName: 'balanceOf', data }), multicall3, signal);
 
   return results.map((r) => r.status === 'ok' ? { status: 'ok', balance: r.value } : r);
 }
@@ -153,6 +158,7 @@ export async function readErc721Owners(
   blockHash: Hex,
   batchSize: number,
   multicall3: Address = MULTICALL3,
+  signal?: AbortSignal,
 ): Promise<OwnerResult[]> {
   const calls = items.map((item) => ({
     target: item.token,
@@ -160,7 +166,7 @@ export async function readErc721Owners(
   }));
 
   const results = await readCalls(rpc, calls, blockHash, batchSize, 'ownerOf',
-    (data) => toLowerHex(decodeFunctionResult({ abi: erc721Abi, functionName: 'ownerOf', data })), multicall3);
+    (data) => toLowerHex(decodeFunctionResult({ abi: erc721Abi, functionName: 'ownerOf', data })), multicall3, signal);
 
   return results.map((r) => r.status === 'ok' ? { status: 'ok', owner: r.value } : r);
 }

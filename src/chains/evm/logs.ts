@@ -192,18 +192,19 @@ interface LogsScanStats {
 /**
  * Fetch one topic filter over `range` and hand every raw log to `onLog`, without collecting arrays.
  * A too_large error, or a timeout on a multi-block range, splits the range in half (or at the provider's suggestion).
+ * An aborted signal stops the in-flight request and every remaining range; the scan rejects with signal.reason.
  */
 async function scanLogs(
   rpc: RpcClient,
   topics: (Hex | null)[],
   range: BlockRange,
   onLog: (log: WireLog) => void,
-  shouldStop: () => boolean = () => false,
+  signal?: AbortSignal,
 ): Promise<LogsScanStats> {
   const stats: LogsScanStats = { calls: 0, maxBytes: 0, maxMs: 0, split: false };
 
   const fetchRange = async (part: BlockRange): Promise<void> => {
-    if (shouldStop()) throw new Error('Chunk scan aborted');
+    signal?.throwIfAborted();
     stats.calls += 1;
     let bytes: number | undefined;
     let ms = 0;
@@ -222,6 +223,7 @@ async function scanLogs(
           bytes = attempt.bytes;
           ms = attempt.durationMs;
         },
+        signal,
       });
     } catch (error) {
       const rpcError = rpcErrorOf(error);
@@ -277,7 +279,7 @@ export async function scanTransfers(
   direction: TransferDirection,
   range: BlockRange,
   onTransfer: (event: TransferEvent) => void,
-  shouldStop: () => boolean = () => false,
+  signal?: AbortSignal,
 ): Promise<LogsScanStats> {
   const accountTopic = pad(account, { size: 32 });
 
@@ -289,7 +291,7 @@ export async function scanTransfers(
     const event = decodeTransferLog(log);
 
     if (event) onTransfer(event);
-  }, shouldStop);
+  }, signal);
 }
 
 /** All decoded Transfer logs, unfiltered by account (the bootstrap's RPC source; it verifies them against its headers). */
@@ -310,20 +312,19 @@ export async function scanAllTransfers(
 /** Both directions of one chunk in parallel, folded into one aggregate while decoding. */
 export async function scanAccountChunk(rpc: RpcClient, account: Address, range: BlockRange): Promise<ChunkScan> {
   const aggregate = emptyAggregate();
-  let failed = false;
-  let firstError: unknown;
+  // The first failing direction aborts the other (in flight too): don't spend more calls on a chunk that already failed.
+  const failed = new AbortController();
   const onTransfer = (event: TransferEvent): void => addTransfer(aggregate, account, event);
 
-  const run = (direction: TransferDirection) => scanTransfers(rpc, account, direction, range, onTransfer, () => failed)
+  const run = (direction: TransferDirection) => scanTransfers(rpc, account, direction, range, onTransfer, failed.signal)
     .catch((error) => {
-      if (!failed) firstError = error;
-      failed = true; // don't spend more calls on a chunk that already failed
+      failed.abort(error); // no-op after the first
       throw error;
     });
 
   const [sent, received] = await Promise.allSettled([run('from'), run('to')]);
 
-  if (sent.status === 'rejected' || received.status === 'rejected') throw firstError;
+  if (sent.status === 'rejected' || received.status === 'rejected') throw failed.signal.reason;
   const a = sent.value;
   const b = received.value;
   // Slowness only counts for a non-trivial response: provider latency is mostly per-request overhead,

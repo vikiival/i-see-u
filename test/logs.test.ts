@@ -1,6 +1,6 @@
 import { afterEach, expect, test, vi } from 'vitest';
 import { pad } from 'viem';
-import type { Address, Hex, RpcClient, RpcRequestOptions, RpcStats, TransferEvent } from '../src/core/types.ts';
+import type { Address, Hex, RpcClient, RpcRequestOptions, RpcStats, TransferDirection, TransferEvent } from '../src/core/types.ts';
 import { decodeTransferLog, scanAccountChunk, scanTransfers, TRANSFER_TOPIC } from '../src/chains/evm/logs.ts';
 import { RpcError } from '../src/rpc/errors.ts';
 import { createRpcClient } from '../src/rpc/client.ts';
@@ -228,4 +228,48 @@ test('an out-of-range eth_getLogs response is rejected before any log is folded'
   await expect(scanTransfers(rpc, ACCOUNT, 'to', { fromBlock: 7n, toBlock: 7n }, event => events.push(event)))
     .rejects.toMatchObject({ kind: 'transient', message: 'Log block 8 outside requested range 7-7' });
   expect(events).toEqual([]);
+});
+
+test('scanAccountChunk aborts the other direction in flight when one fails, and calls nothing more', async () => {
+  const requests: { direction: TransferDirection; signal?: AbortSignal }[] = [];
+
+  const rpc: RpcClient = {
+    async request<T>(_method: string, params: unknown[], opts?: RpcRequestOptions): Promise<T> {
+      const filter = rpcParam<{ topics: unknown[] }>(params, 0);
+      const direction = filter.topics[1] === null ? 'to' : 'from';
+      requests.push({ direction, signal: opts?.signal });
+
+      // The received side fails once the sent side is in flight; a too_large answer would split it into more requests.
+      if (direction === 'to') throw new RpcError('fatal', 'received side failed');
+
+      return new Promise<never>((_resolve, reject) => opts?.signal?.addEventListener('abort', () => reject(new RpcError('too_large', 'split me'))));
+    },
+    stats,
+  };
+
+  await expect(scanAccountChunk(rpc, ACCOUNT, { fromBlock: 1n, toBlock: 100n })).rejects.toThrow('received side failed');
+  expect(requests.map((request) => request.direction)).toEqual(['from', 'to']);
+  expect(requests[0].signal?.aborted).toBe(true);
+});
+
+test('scanTransfers stops before the next range once its signal aborts', async () => {
+  const controller = new AbortController();
+  const requested: string[] = [];
+
+  const rpc: RpcClient = {
+    async request<T>(_method: string, params: unknown[]): Promise<T> {
+      const filter = rpcParam<{ fromBlock: string; toBlock: string }>(params, 0);
+      requested.push(`${filter.fromBlock}-${filter.toBlock}`);
+
+      // The whole range splits in two; the caller gives up while the first half is in flight.
+      if (requested.length === 1) throw new RpcError('too_large', 'too many results');
+      controller.abort(new Error('caller gave up'));
+
+      return staged<T>([]);
+    },
+    stats,
+  };
+
+  await expect(scanTransfers(rpc, ACCOUNT, 'to', { fromBlock: 1n, toBlock: 100n }, () => {}, controller.signal)).rejects.toThrow('caller gave up');
+  expect(requested).toEqual(['0x1-0x64', '0x1-0x32']);
 });

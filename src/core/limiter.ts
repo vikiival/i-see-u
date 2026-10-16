@@ -2,9 +2,19 @@
 export const unavailable = (message: string, retryAfterS: number): Error =>
   Object.assign(new Error(message), { statusCode: 503, retryAfterS });
 
+export interface RunOptions {
+  /** Cancels the job: a queued job leaves the queue at once, a running one is aborted through the signal fn gets. */
+  signal?: AbortSignal;
+  /** Epoch ms; past it the job is cancelled the same way. */
+  deadlineAt?: number;
+}
+
 export interface Limiter {
-  /** Run fn when a slot is free; rejects with 503 at once when maxActive run and maxQueued already wait. */
-  run<T>(fn: () => Promise<T>, opts?: { deadlineAt?: number }): Promise<T>;
+  /**
+   * Run fn when a slot is free; rejects with 503 at once when maxActive run and maxQueued already wait, and with 503
+   * when cancelled. fn gets a signal that aborts on cancellation so it stops spending RPC credits.
+   */
+  run<T>(fn: (signal: AbortSignal) => Promise<T>, opts?: RunOptions): Promise<T>;
   readonly active: number;
   readonly queued: number;
 }
@@ -24,22 +34,47 @@ export function createLimiter(maxActive: number, maxQueued: number, retryAfterS 
   };
 
   return {
-    async run<T>(fn: () => Promise<T>, opts: { deadlineAt?: number } = {}): Promise<T> {
+    async run<T>(fn: (signal: AbortSignal) => Promise<T>, opts: RunOptions = {}): Promise<T> {
+      const { deadlineAt } = opts;
+      const expired = (): boolean => deadlineAt !== undefined && Date.now() >= deadlineAt;
+
+      const cancelled = (when: string, cause?: unknown): Error => Object.assign(
+        unavailable(`Request ${expired() ? 'deadline passed' : 'cancelled'} ${when}`, retryAfterS),
+        { cause: cause ?? opts.signal?.reason },
+      );
+
+      if (opts.signal?.aborted || expired()) throw cancelled('before it ran');
+      const signals = opts.signal ? [opts.signal] : [];
+
+      if (deadlineAt !== undefined) signals.push(AbortSignal.timeout(deadlineAt - Date.now()));
+      const signal = AbortSignal.any(signals);
+
       if (active >= maxActive) {
         if (queue.length >= maxQueued) throw unavailable('Server busy: too many RPC-bound requests in flight', retryAfterS);
-        await new Promise<void>((resolve) => queue.push(resolve));
 
-        // Opt-in: the caller already gave up, so do not spend RPC credits on it.
-        if (opts.deadlineAt !== undefined && Date.now() > opts.deadlineAt) {
-          release();
-          throw unavailable('Request deadline passed while queued', retryAfterS);
-        }
+        await new Promise<void>((resolve, reject) => {
+          const leave = (): void => {
+            queue.splice(queue.indexOf(take), 1);
+            reject(cancelled('while queued'));
+          };
+
+          const take = (): void => {
+            signal.removeEventListener('abort', leave);
+            resolve();
+          };
+
+          queue.push(take);
+          signal.addEventListener('abort', leave, { once: true });
+        });
       } else {
         active += 1;
       }
 
       try {
-        return await fn();
+        return await fn(signal);
+      } catch (error) {
+        // Whatever fn threw after the abort is a consequence of it.
+        throw signal.aborted ? cancelled('while running', error) : error;
       } finally {
         release();
       }
@@ -49,19 +84,38 @@ export function createLimiter(maxActive: number, maxQueued: number, retryAfterS 
   };
 }
 
-/** Settle with the promise's outcome, or with `onTimeout()` (which may throw) after ms; the promise keeps running. */
-export function withDeadline<T, U>(promise: Promise<T>, ms: number, onTimeout: () => U): Promise<T | U> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
+/**
+ * Run work with a signal that aborts after ms or when `parent` aborts. On the deadline it settles with `onTimeout()`
+ * (which may throw), on a parent abort with a 503 "Request cancelled"; either way at once, without waiting for the
+ * aborted work to stop.
+ */
+export function withDeadline<T, U>(
+  work: (signal: AbortSignal) => Promise<T>,
+  ms: number,
+  onTimeout: () => U,
+  parent?: AbortSignal,
+): Promise<T | U> {
+  const controller = new AbortController();
+  const signal = parent ? AbortSignal.any([parent, controller.signal]) : controller.signal;
+  const cut = Promise.withResolvers<U>();
+  const cancel = (): void => cut.reject(Object.assign(unavailable('Request cancelled', 1), { cause: parent?.reason }));
 
-  const timeout = new Promise<U>((resolve, reject) => {
-    timer = setTimeout(() => {
-      try {
-        resolve(onTimeout());
-      } catch (error) {
-        reject(error);
-      }
-    }, ms);
+  const timer = setTimeout(() => {
+    // Settle first so the race reports the deadline, not the abort error the work rejects with.
+    try {
+      cut.resolve(onTimeout());
+    } catch (error) {
+      cut.reject(error);
+    }
+
+    controller.abort(new DOMException('Request deadline passed', 'TimeoutError'));
+  }, ms);
+
+  if (parent?.aborted) cancel();
+  else parent?.addEventListener('abort', cancel, { once: true });
+
+  return Promise.race([work(signal), cut.promise]).finally(() => {
+    clearTimeout(timer);
+    parent?.removeEventListener('abort', cancel);
   });
-
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
