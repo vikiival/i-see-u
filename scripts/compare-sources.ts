@@ -47,7 +47,6 @@ const rpc = createRpcClient({
 
 const rpcSource = createRpcLogSource(rpc, {
   preferredMaxRange: BigInt(integer('ETH_LOGS_MAX_RANGE', 3_000)),
-  minRange: BigInt(integer('ETH_LOGS_MIN_RANGE', 500)),
 });
 
 const hypersyncSource = createHypersyncLogSource({
@@ -60,9 +59,7 @@ const hypersyncSource = createHypersyncLogSource({
 const adapter = createEvmAdapter(rpc, {
   ...network,
   network: network.name,
-  accountLogs: rpcSource,
   finalizedMaxNoProgressMs: 1_200_000,
-  scanConcurrency: 1,
   followerMaxRange: 500n,
   multicallBatch: 1_000,
 });

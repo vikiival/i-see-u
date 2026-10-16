@@ -23,6 +23,7 @@ Times are local (CEST). "We" is Viktor plus AI agents: a Claude orchestrator han
 | 18:00–21:00 | Realtime tail with reorg handling | Jakub: realtime is part of the brief. Opus design, Codex build, Opus audit (9 bugs fixed). Tail lag 0 blocks live; 93 tests |
 | 23:50–01:15 | `/improve` audit and fixes (branch `feat/improve`) | Three parallel audits (Codex sol, 2× Opus), 5 fix plans run by Sonnet, sol and Opus in isolated worktrees, each reviewed. 115 tests; live run passed every check |
 | 11:00–13:30 | Budget: change-driven balance refresh (plan 006) | Opus built levers 1+3, 1 revision (orphaned snapshots on non-leaders). Balance sweep ~43M → ~1.6–6M credits/month; total ≈53M → ≈12–17M (estimates). 130 tests |
+| evening | SQD squid-sdk RPC source, revisited (`../disquid`) | Sonnet, source-level. Not adopted. Full blocks and unfiltered `getLogs` are hardcoded; a patch to three packages would reach our call count. Kept as a speculative spike in `../disquid` |
 
 ---
 
@@ -446,6 +447,43 @@ Tests: 115 → **120**, all passing. Lesson: a refold optimisation must replay *
 Cold backfill is unchanged: about 172 calls per new account, one-off.
 
 **Tests:** 120 → **130**. The call rate is modelled, not measured live (next items: lever 2 gas cap, live re-measure).
+
+---
+
+## 16. SQD squid-sdk RPC source, revisited (2026-10-15)
+
+**Trigger.** Viktor found a way to run the new Squid SDK on plain RPC, with no Portal (`../disquid`, uncommitted working tree on top of `207fd0b`): `EvmRpcDataSourceBuilder` from `@subsquid/squid-sdk/evm/rpc` 0.6.2, `.setRpc({url, network: 'ethereum-mainnet'})`, `addLog({address: [USDC], topic0: [Transfer]})`, `run()` from `@subsquid/batch-processor` into `TypeormDatabase({supportHotBlocks: true})`. The handler only logs. §11 had rejected the older `@subsquid/evm-processor` 1.30.1 RPC mode; this is a rewritten stack (`evm-rpc` 0.2.0, `evm-normalization` 0.1.0), so Sonnet re-checked it against the installed source. Nothing was run.
+
+**Round 1: fit (Sonnet).** Not adopted, not even partially:
+
+| Point | Finding |
+|---|---|
+| Data coverage | Transfer logs: yes (wildcard address plus topic0, split ERC-20/721 by topic count, as we do). Balances: no block-pinned state reads, so `src/balances/reader.ts` stays. Native transfers need traces, which are out of scope |
+| Discovery | We have no address set (global index), so SQD's static `where` filters do not matter |
+| RPC cost | `eth_getBlockByNumber(n, true)` for every block, plus `eth_getLogs({fromBlock, toBlock})` with no topics per stride of 5 blocks |
+| Reorgs | `hot_change_log` rollback is roughly our tail journal. It does not give the fenced leader, prune-on-finalize, repair revision or 503 readiness |
+| Storage | TypeORM plus its own status tables beside drizzle. Using SQD only as a `DataSource` gives up the hot-block store, its main addition |
+| Validation | Stronger than ours on Ethereum: block hash, tx root, tx sender, receipts root and **logs bloom**. The bloom check is what would catch silently omitted logs (REPORT "Repair runner") |
+
+**Round 2: can a topic filter stop the full-block fetch?** Viktor: the stub does not matter, we can iterate on it. Not by configuration:
+- `squid-sdk/src/evm/rpc/source/data-source.ts` hardcodes `transactions: true`, because `evm-normalization` `mapRpcBlock` asserts every transaction is a full object. `evm-rpc`'s `Rpc.getBlockBatch` already honours `transactions: false` (header-only `eth_getBlockByNumber(n, false)`).
+- `evm-rpc/src/rpc.ts` `addLogs` sends only `fromBlock`/`toBlock`. `DataRequest` carries booleans only, and filtering is client-side (`squid-sdk/src/evm/rpc/filter/filter.ts`).
+- The `eth_getLogs` range is one stride. `strideSize` is configurable, but an unfiltered 500-block call will hit provider limits, and `addLogs` has no split on too-large.
+- `verifyLogsBloom` needs every log of the block, so it cannot be combined with a filter. It can be turned off with `setRpc({rpc: {verifyLogsBloom: false}})`; the overrides are spread over the preset.
+- `includeAllBlocks` only affects output. Every block number is fetched either way.
+- **Head polling (found while writing the spike spec, Opus).** Once caught up, `evm-rpc/src/data-source/ingest.ts` waits `headPollInterval` (default 100 ms) between `latest` polls, and the squid-sdk builder does not expose it. That is about 864k calls a day, about 17M credits a day, enough to exhaust the 80M plan in under five days. A patch would have to expose it.
+
+**Found while writing the spike spec (Opus).** `addLogs` groups the returned logs by `blockHash` and silently drops any log whose hash is not one of the batch's headers. Behind a load-balanced provider (§13: varying `x-node-id`), a by-number `getLogs` can return another fork's logs, and with the bloom check off that block would just look empty. Our follower rejects such a response instead. A patch would have to add the same membership check.
+
+**Call counts for the ~265k-block window** (derived from code, not measured):
+
+| Configuration | Block calls | `eth_getLogs` |
+|---|---|---|
+| SQD unpatched (stride 5–20) | about 265k, full transactions | about 13–53k, no topic filter |
+| SQD patched (header-only, topic0, stride 500) | about 265k headers | about 530 plus splits |
+| i-see-u follower | about 265k headers (concurrency 8) | about 530 (`ETH_FOLLOWER_MAX_RANGE=500`) plus splits |
+
+**Decision.** i-see-u keeps its own follower and tail. The patch is speculation, not project work: its spec lives in `../disquid/SPIKE-rpc-log-pushdown.md` (counting proxy, parity check against the unpatched source), outside this repo. If it were ever built and measured at parity, the patched source (or the Portal, if RPC-only is not a hard rule) is a candidate for the pending bootstrap, appended through `appendRange`. The logs-bloom idea can also be ported into `src/chains/evm/logs.ts` without the framework, but only with unfiltered per-block logs or receipts.
 
 ---
 

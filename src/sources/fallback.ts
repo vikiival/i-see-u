@@ -29,9 +29,6 @@ export function withFallback(
   return {
     name: `${primary.name}+${fallback.name}`,
     preferredMaxRange: primary.preferredMaxRange,
-    // Fixed large primary chunks stay independent of RPC's persisted adaptive range. If fallback is needed,
-    // RpcLogSource still splits provider-limited ranges internally and the whole composite chunk commits atomically.
-    adaptiveRange: primary.adaptiveRange,
     async scanAccount(account, range) {
       if (now() < cooldownUntil) return useFallback(account, range);
 

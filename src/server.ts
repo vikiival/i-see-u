@@ -1,117 +1,89 @@
 import { serve } from '@hono/node-server';
 
 import { createApp } from './api/routes.ts';
-import { createBalanceWorker } from './balances/worker.ts';
+import { createBalanceReader } from './balances/reader.ts';
+import { assertStartBlock } from './bootstrap/bootstrap.ts';
+import { runConfiguredBootstrap } from './bootstrap/wire.ts';
 import { createEvmAdapter } from './chains/evm/adapter.ts';
 import { config } from './config.ts';
 import { createLimiter } from './core/limiter.ts';
 import { createDiscoveryService } from './discovery/service.ts';
 import { createFollower } from './follower/follower.ts';
 import { createRpcClient } from './rpc/client.ts';
-import { withFallback } from './sources/fallback.ts';
-import { createHypersyncLogSource } from './sources/hypersync.ts';
-import { createRpcLogSource } from './sources/rpc-logs.ts';
 import { openPostgresStore } from './store/postgres.ts';
 import { createTail } from './tail/tail.ts';
 
 const rpc = createRpcClient(config.rpc);
 
-const adapters = Object.fromEntries(Object.values(config.networks).map((network) => {
-  const rpcLogs = createRpcLogSource(rpc, {
-    preferredMaxRange: network.logsMaxRange,
-    minRange: network.logsMinRange,
-  });
+const adapters = Object.fromEntries(Object.values(config.networks).map((network) =>
+  [network.name, createEvmAdapter(rpc, { ...network, network: network.name })]));
 
-  const useHypersync = config.logSource === 'hypersync'
-    || (config.logSource === 'auto' && config.hypersync.apiToken !== undefined);
+const { store, bootstrap, followerLock, bootstrapLock } = await openPostgresStore(config.databaseUrl, { max: config.db.poolMax, connectionTimeoutMillis: config.db.connectTimeoutMs });
 
-  const accountLogs = useHypersync
-    ? withFallback(createHypersyncLogSource({
-        url: config.hypersync.url ?? network.hypersyncUrl,
-        apiToken: config.hypersync.apiToken!,
-        preferredMaxRange: config.hypersync.maxRange,
-        timeoutMs: config.hypersync.timeoutMs,
-      }), rpcLogs)
-    : rpcLogs;
+// A database initialized (or being bootstrapped) from another START_BLOCK cannot serve this configuration.
+try {
+  for (const network of Object.values(config.networks)) await assertStartBlock(store, bootstrap, network.name, network.startBlock);
+} catch (error) {
+  await store.close();
+  throw error;
+}
 
-  return [network.name, createEvmAdapter(rpc, { ...network, network: network.name, accountLogs })];
-}));
+const requestRpc = { limiter: createLimiter(config.request.rpcConcurrency, config.request.rpcQueue), deadlineMs: config.request.deadlineMs };
 
-const { store, followerLock } = await openPostgresStore(config.databaseUrl, { max: config.db.poolMax, connectionTimeoutMillis: config.db.connectTimeoutMs });
-
-const logError = (what: string) => (message: string) => console.warn(`${what} failed:`, message);
-
-const requestRpc = {
-  limiter: createLimiter(config.request.rpcConcurrency, config.request.rpcQueue),
-  deadlineMs: config.request.deadlineMs,
-};
-
-const balances = Object.fromEntries(Object.values(adapters).map((adapter) => [adapter.network, createBalanceWorker({
-  adapter,
-  store,
-  activeTtlMs: config.balances.activeAccountTtlMs,
-  refreshMs: config.balances.refreshMs,
-  fullSweepMs: config.balances.fullSweepMs,
-  alwaysRefreshTokens: config.balances.alwaysRefreshTokens,
-  requestRpc,
-  tailTip: config.tail.enabled ? () => store.getTailTip(adapter.network) : undefined,
-  onError: logError('balance refresh'),
+const balances = Object.fromEntries(Object.values(config.networks).map((network) => [network.name, createBalanceReader({
+  adapter: adapters[network.name], store, requestRpc,
+  batchSize: network.multicallBatch, windowMs: config.balances.batchWindowMs, alwaysRefresh: network.alwaysRefreshTokens,
 })]));
 
 const followers = Object.fromEntries(Object.values(adapters).map((adapter) => [adapter.network, createFollower({
-  adapter,
-  store,
-  lock: followerLock(adapter.network),
-  pollMs: config.follower.pollMs,
-  maxLagBlocks: config.follower.maxLagBlocks,
-  staleAfterMs: config.networks[adapter.network].finalizedMaxNoProgressMs,
+  adapter, store, lock: followerLock(adapter.network), ...config.follower,
   maxNoAdvanceMs: config.maxHeadProgressAgeMs,
-  // With the tail, balances are read at the tail tip, which a finalized advance does not move.
-  onAdvance: config.tail.enabled ? undefined : () => balances[adapter.network].kick(),
-  onError: logError('follower tick'),
+  onError: (message) => console.warn('Follower failed:', message),
 })]));
 
+// Leader-only (the follower's lock); every replica loads the shared tip and serves latest from the database.
 const tails = config.tail.enabled ? Object.fromEntries(Object.values(adapters).map((adapter) => [adapter.network, createTail({
-  adapter,
-  store,
-  follower: followers[adapter.network],
-  maxDepth: config.tail.maxDepth,
-  maxAheadBlocks: config.tail.maxAheadBlocks,
-  pollOffsetsMs: config.tail.pollOffsetsMs,
-  // The 60 s sweep follows the tip; a reorg may have orphaned the block balances were read at, so refresh now.
-  onAdvance: (_tip, reorg) => { if (reorg) balances[adapter.network].kick({ reorg: true }); },
+  adapter, store, follower: followers[adapter.network],
+  maxDepth: config.tail.maxDepth, maxAheadBlocks: config.tail.maxAheadBlocks, pollOffsetsMs: config.tail.pollOffsetsMs,
   onEpoch: () => followers[adapter.network].kick(),
-  onError: logError('tail tick'),
-})])) : {};
+  onError: (message) => console.warn('Tail failed:', message),
+})])) : undefined;
 
 const discovery = createDiscoveryService({
-  adapters,
-  store,
-  followers,
-  tails,
-  maxTailTipAgeMs: config.tail.maxTipAgeMs,
-  requestDeadlineMs: config.request.deadlineMs,
-  backfillLimiter: createLimiter(config.request.backfillConcurrency, config.request.backfillQueue),
+  adapters, store, tails, maxTailTipAgeMs: config.tail.maxTipAgeMs, maxHeadAgeMs: config.maxHeadAgeMs, maxNoAdvanceMs: config.maxHeadProgressAgeMs,
 });
 
-await Promise.all(Object.values(followers).map((follower) => follower.load()));
+await Promise.all([...Object.values(followers), ...Object.values(tails ?? {})].map((part) => part.load()));
 
-await Promise.all(Object.values(tails).map((tail) => tail.load()));
+for (const part of [...Object.values(followers), ...Object.values(tails ?? {})]) part.start();
 
-for (const follower of Object.values(followers)) follower.start();
+// Optional in-process bootstrap: the service stays not_ready (follower and tail wait) until it publishes the index.
+if (config.bootstrap.onStart) {
+  for (const network of Object.values(config.networks)) {
+    if (await store.indexState(network.name)) continue;
+    const lock = bootstrapLock(network.name);
 
-for (const tail of Object.values(tails)) tail.start();
+    if (!await lock.tryAcquire()) {
+      console.warn(`Bootstrap of ${network.name} is running elsewhere`);
+      continue;
+    }
 
-for (const worker of Object.values(balances)) worker.start();
+    const log = (message: string) => console.log(`[bootstrap ${network.name}] ${message}`);
+    runConfiguredBootstrap(config, network, { store, bootstrap, log }).done
+      .then(() => followers[network.name].kick(), (error) => console.error(`[bootstrap ${network.name}] failed: ${error instanceof Error ? error.message : String(error)}`))
+      .finally(() => lock.release());
+  }
+}
 
-const app = createApp(
-  { discovery, adapters, balances, followers, tails, requestRpc, maxVerifyOwnershipItems: config.request.maxVerifyOwnershipItems, alwaysRefreshTokens: config.balances.alwaysRefreshTokens, rpcStats: () => rpc.stats(), startedAt: Date.now() },
-  { requestLog: process.env.LOG_LEVEL !== 'warn' && process.env.LOG_LEVEL !== 'error' },
-);
+const app = createApp({
+  discovery, adapters, balances, followers, tails, requestRpc,
+  maxVerifyOwnershipItems: config.request.maxVerifyOwnershipItems,
+  rpcStats: () => rpc.stats(), startedAt: Date.now(),
+  bootstrap: (network) => bootstrap.status(network, Date.now()),
+}, { requestLog: process.env.LOG_LEVEL !== 'warn' && process.env.LOG_LEVEL !== 'error' });
 
 const server = serve({ fetch: app.fetch, port: config.port, hostname: '0.0.0.0' }, (info) => {
-  const configured = Object.values(config.networks).map((network) => `${network.name} from block ${network.startBlock}`).join(', ');
-  console.log(`i-see-u listening on http://localhost:${info.port} (${configured})`);
+  console.log(`i-see-u listening on http://localhost:${info.port}; not ready until the bootstrap (npm run bootstrap) has published the index`);
 });
 
 let shuttingDown = false;
@@ -120,8 +92,8 @@ const shutdown = () => {
   if (shuttingDown) return;
   shuttingDown = true;
   server.close(async (error) => {
-    await Promise.all([...Object.values(tails), ...Object.values(followers), ...Object.values(balances)].map((part) => part.stop()));
-    await Promise.all(Object.values(adapters).map((adapter) => adapter.accountLogs.close?.()));
+    await Promise.all(Object.values(tails ?? {}).map((tail) => tail.stop()));
+    await Promise.all(Object.values(followers).map((follower) => follower.stop()));
     await store.close();
 
     if (error) {

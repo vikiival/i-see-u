@@ -1,0 +1,1 @@
+ALTER TABLE "balance_snapshots" ADD COLUMN "revision" bigint DEFAULT 0 NOT NULL;

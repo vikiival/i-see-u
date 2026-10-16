@@ -24,15 +24,6 @@ const int = (k: string, d: string): number => {
   return v;
 };
 
-const choice = <T extends string>(k: string, values: readonly T[], d: T): T => {
-  const value = env(k, d);
-  const match = values.find((candidate) => candidate === value);
-
-  if (match === undefined) throw new Error(`${k} must be one of ${values.join(', ')}`);
-
-  return match;
-};
-
 const bool = (k: string, d: boolean): boolean => {
   const value = env(k, d ? 'true' : 'false');
 
@@ -52,25 +43,40 @@ const intList = (k: string, d: string): number[] => env(k, d).split(',').map((pa
 
 const isLowercaseAddress = (value: string): value is Address => /^0x[0-9a-f]{40}$/.test(value);
 
-const tailEnabled = bool('TAIL_ENABLED', true);
-
 const evmTuning = {
   /** Mark the finalized head stale after this long without a higher block number. */
   finalizedMaxNoProgressMs: int('FINALIZED_MAX_NO_PROGRESS_MS', '1200000'),
-  /** Max block span per address-filtered eth_getLogs call (Quicknode paid: 10k). */
-  logsMaxRange: BigInt(int('ETH_LOGS_MAX_RANGE', '3000')),
-  /** Floor of the adaptive per-account RPC range; heavy accounts shrink towards it. */
-  logsMinRange: BigInt(int('ETH_LOGS_MIN_RANGE', '500')),
-  /** Backfill chunks in flight per account; completed + in flight <= 2x this. */
-  scanConcurrency: int('ETH_SCAN_CONCURRENCY', '8'),
   /** balanceOf calls per Multicall3 aggregate3 request (measured safe up to ~2000). */
   multicallBatch: int('ETH_MULTICALL_BATCH', '1000'),
   /** Max blocks per unfiltered follower getLogs (~450 KB of JSON per block; must stay <= 1000). */
   followerMaxRange: BigInt(int('ETH_FOLLOWER_MAX_RANGE', '500')),
 };
 
-const networks = Object.fromEntries(Object.values(networkRegistry)
-  .map((network) => [network.name, { ...network, ...evmTuning }]));
+const addresses = (k: string, value: string): Address[] => value.split(',').map((token) => token.trim().toLowerCase()).filter(Boolean).map((token) => {
+  if (!isLowercaseAddress(token)) throw new Error(`${k} must contain addresses`);
+
+  return token;
+});
+
+/** When set, replaces (not extends) each network's default list from src/networks.ts. */
+const refreshOverride = process.env.BALANCE_ALWAYS_REFRESH_TOKENS;
+
+/** START_BLOCK replaces the registry start block (a plain block number). A stored index or bootstrap must match it. */
+const startBlockOverride = (() => {
+  const value = process.env.START_BLOCK;
+
+  if (value === undefined || value === '') return undefined;
+
+  if (!/^\d+$/.test(value) || BigInt(value) < 1n) throw new Error('START_BLOCK must be a positive block number');
+
+  return BigInt(value);
+})();
+
+const networks = Object.fromEntries(Object.values(networkRegistry).map((network) => [network.name, {
+  ...network, ...evmTuning,
+  startBlock: startBlockOverride ?? network.startBlock,
+  alwaysRefreshTokens: refreshOverride === undefined ? network.alwaysRefreshTokens : addresses('BALANCE_ALWAYS_REFRESH_TOKENS', refreshOverride),
+}]));
 
 const ethereum = networks.ethereum;
 
@@ -88,25 +94,18 @@ export const config = {
   networks,
   /** Kept as a compact single-network convenience for the PoC. */
   ethereum,
-  logSource: choice('LOG_SOURCE', ['auto', 'hypersync', 'rpc'] as const, 'rpc'),
-  hypersync: {
-    apiToken: process.env.HYPERSYNC_API_KEY || undefined,
-    url: process.env.HYPERSYNC_URL || undefined,
-    maxRange: BigInt(int('HYPERSYNC_MAX_RANGE', '100000')),
-    timeoutMs: int('HYPERSYNC_TIMEOUT_MS', '30000'),
-  },
   follower: {
-    /**
-     * How often the follower polls the finalized head (finalized advances ~every 6.4 min). With the tail enabled the
-     * tail wakes it at each epoch boundary, so this is only a fallback (just over one epoch).
-     */
-    pollMs: int('FOLLOWER_POLL_MS', tailEnabled ? '390000' : '30000'),
-    /** Discovery returns 503 when the follower is more than this many blocks behind finalized (~3 epochs). */
-    maxLagBlocks: BigInt(int('FOLLOWER_MAX_LAG_BLOCKS', '96')),
+    pollMs: int('FOLLOWER_POLL_MS', '30000'),
+    maxRangesPerTick: int('FOLLOWER_MAX_RANGES_PER_TICK', '8'),
+    headerConcurrency: int('FOLLOWER_HEADER_CONCURRENCY', '8'),
   },
+  maxHeadAgeMs: int('MAX_HEAD_OBSERVATION_AGE_MS', '120000'),
+  /** Unfinalized journal above the finalized cursor: `finality=latest` (the default) serves the tip. */
   tail: {
-    enabled: tailEnabled,
+    enabled: bool('TAIL_ENABLED', true),
+    /** Deeper reorgs (or one reaching the finalized cursor) wipe the tail and serve finalized until it rebuilds. */
     maxDepth: BigInt(int('TAIL_MAX_DEPTH', '64')),
+    /** Poll `latest` at these offsets into each 12 s slot; the rest of a slot is skipped once its block is in. */
     pollOffsetsMs: intList('TAIL_POLL_OFFSETS_MS', '2500,5000,9000'),
     /** Serve `latest` only while the tail tip block is at most this old (5 slots: up to 4 missed slots). */
     maxTipAgeMs: int('TAIL_MAX_TIP_AGE_MS', '60000'),
@@ -114,19 +113,8 @@ export const config = {
     maxAheadBlocks: BigInt(int('TAIL_MAX_AHEAD_BLOCKS', '1024')),
   },
   balances: {
-    /** Accounts whose balances were requested within this window are refreshed by the shared worker. */
-    activeAccountTtlMs: int('ACTIVE_ACCOUNT_TTL_MS', '300000'),
-    refreshMs: int('BALANCE_REFRESH_MS', '60000'),
-    /** Between refreshes only Transfer-touched pairs are re-read; this often every non-zero pair is (catches non-Transfer changes). */
-    fullSweepMs: int('BALANCE_FULL_SWEEP_MS', '3600000'),
-    /** Tokens whose balance changes without a Transfer (WETH Deposit, stETH rebase): re-read every refresh. */
-    alwaysRefreshTokens: env('BALANCE_ALWAYS_REFRESH_TOKENS',
-      '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2,0xae7ab96520de3a18e5e111b5eaab095312d7fe84')
-      .split(',').map((token) => token.trim().toLowerCase()).filter(Boolean).map((token) => {
-        if (!isLowercaseAddress(token)) throw new Error('BALANCE_ALWAYS_REFRESH_TOKENS must contain addresses');
-
-        return token;
-      }),
+    /** How long the first uncached (account, token) pair waits for others to share its Multicall. */
+    batchWindowMs: int('BALANCE_BATCH_WINDOW_MS', '25'),
   },
   db: {
     /** Postgres pool size (one connection is held permanently by the follower leader lock). */
@@ -135,35 +123,43 @@ export const config = {
     connectTimeoutMs: int('DB_CONNECT_TIMEOUT_MS', '5000'),
   },
   request: {
-    /** Per-request deadline for RPC work left on the request path (cold backfill wait, first balance read). */
+    /** Per-request deadline for RPC work left on the request path (balances and ownership). */
     deadlineMs: int('REQUEST_DEADLINE_MS', '10000'),
-    /** Concurrent account backfills, and how many more may wait before requests get 503. */
-    backfillConcurrency: int('BACKFILL_CONCURRENCY', '4'),
-    backfillQueue: int('BACKFILL_QUEUE', '64'),
-    /** Concurrent request-path RPC reads (first balance read, ownership), and how many more may wait. */
+    /** Concurrent request-path RPC reads (shared balance Multicalls, ownership), and how many more may wait. */
     rpcConcurrency: int('REQUEST_RPC_CONCURRENCY', '16'),
     rpcQueue: int('REQUEST_RPC_QUEUE', '256'),
     /** verifyOwnership is skipped (not an error) when an account holds more NFT items than this. */
     maxVerifyOwnershipItems: int('MAX_VERIFY_OWNERSHIP_ITEMS', '2000'),
   },
+  /** One-time global load (`npm run bootstrap`, or BOOTSTRAP_ON_START in the server). */
+  bootstrap: {
+    onStart: bool('BOOTSTRAP_ON_START', false),
+    segmentBlocks: BigInt(int('BOOTSTRAP_SEGMENT_BLOCKS', '1000')),
+    headerChunkBlocks: BigInt(int('BOOTSTRAP_HEADER_CHUNK_BLOCKS', '5000')),
+    /** Concurrent Quicknode segment workers (unfiltered 100-block getLogs). */
+    rpcWorkers: int('BOOTSTRAP_RPC_WORKERS', '4'),
+    rpcLogRange: BigInt(int('BOOTSTRAP_RPC_LOG_RANGE', '100')),
+    /** Bulk getLogs answers take 4-35 s under concurrency; the request-path timeout is too short for them. */
+    rpcTimeoutMs: int('BOOTSTRAP_RPC_TIMEOUT_MS', '60000'),
+    /** Optional: without it the bootstrap is RPC-only (and pays one call per header). Never logged. */
+    hypersyncApiKey: process.env.HYPERSYNC_API_KEY || undefined,
+    hypersyncUrl: process.env.HYPERSYNC_URL || ethereum.hypersyncUrl,
+    /** Per-request idle timeout for HyperSync (not a whole-range timeout). */
+    hypersyncIdleMs: int('HYPERSYNC_TIMEOUT_MS', '120000'),
+    /** Per legacy segment GROUP BY, not a global server setting. */
+    workMem: env('BOOTSTRAP_WORK_MEM', '64MB'),
+    maintenanceWorkMem: env('BOOTSTRAP_MAINTENANCE_WORK_MEM', '1GB'),
+  },
   /** Refuse discovery when the follower has not advanced for longer than this. */
   maxHeadProgressAgeMs: int('MAX_HEAD_AGE_MS', '1800000'),
 };
 
-for (const network of Object.values(config.networks)) {
-  if (network.logsMinRange > network.logsMaxRange) {
-    throw new Error('ETH_LOGS_MIN_RANGE must not exceed ETH_LOGS_MAX_RANGE');
-  }
+if (config.tail.pollOffsetsMs.length === 0 || config.tail.pollOffsetsMs.some((offset) => offset >= 12_000)) {
+  throw new Error('TAIL_POLL_OFFSETS_MS must contain offsets within a 12-second slot');
+}
 
+for (const network of Object.values(config.networks)) {
   if (network.followerMaxRange > 1_000n) {
     throw new Error('ETH_FOLLOWER_MAX_RANGE must not exceed 1000 (unfiltered responses are ~450 KB per block)');
   }
-}
-
-if (config.logSource === 'hypersync' && !config.hypersync.apiToken) {
-  throw new Error('LOG_SOURCE=hypersync requires HYPERSYNC_API_KEY');
-}
-
-if (config.tail.pollOffsetsMs.length === 0 || config.tail.pollOffsetsMs.some((offset) => offset >= 12_000)) {
-  throw new Error('TAIL_POLL_OFFSETS_MS must contain offsets within a 12-second slot');
 }

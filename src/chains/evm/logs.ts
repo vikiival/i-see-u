@@ -1,5 +1,6 @@
 import { decodeEventLog, encodeEventTopics, isAddress, isHex, pad, parseAbiItem } from 'viem';
 
+import { ChainGapError } from '../../core/errors.ts';
 import { addTransfer, aggregateLogCount, emptyAggregate } from '../../core/aggregate.ts';
 import type { Address, BlockRange, ChunkScan, Hex, RpcClient, TransferDirection, TransferEvent } from '../../core/types.ts';
 import { RpcError, rpcErrorOf } from '../../rpc/errors.ts';
@@ -84,6 +85,43 @@ export function decodeTransferLog(log: WireLog): TransferEvent | undefined {
   }
 }
 
+const HEX = /^0x[0-9a-fA-F]*$/;
+const WORD = /^0x[0-9a-fA-F]{64}$/;
+const ADDRESS = /^0x[0-9a-fA-F]{40}$/;
+const QUANTITY = /^0x[0-9a-fA-F]{1,13}$/;
+
+/**
+ * Bulk decoder (~15x faster than viem): the canonical wire shape (exact Transfer topic0, 32-byte topics, 32-byte
+ * ERC-20 data or empty ERC-721 data) is decoded by hand; every other shape goes through decodeTransferLog, so both
+ * always agree (a golden test fuzzes them against each other).
+ */
+export function decodeTransferLogFast(log: WireLog): TransferEvent | undefined {
+  const { topics, data } = log;
+
+  if (log.removed === true || !Array.isArray(topics) || (topics.length !== 3 && topics.length !== 4) || topics[0] !== TRANSFER_TOPIC) return decodeTransferLog(log);
+  const erc20 = topics.length === 3;
+  const [, from, to, id] = topics;
+
+  const { address, transactionHash, blockHash, blockNumber, logIndex } = log;
+
+  if (!isString(address) || !ADDRESS.test(address) || !isString(transactionHash) || !HEX.test(transactionHash)
+    || !isString(blockHash) || !HEX.test(blockHash) || !isString(blockNumber) || !QUANTITY.test(blockNumber)
+    || !isString(logIndex) || !QUANTITY.test(logIndex) || !isString(from) || !WORD.test(from) || !isString(to) || !WORD.test(to)
+    || (erc20 ? !isString(data) || !WORD.test(data) : data !== '0x' || !isString(id) || !WORD.test(id))) return decodeTransferLog(log);
+
+  return {
+    standard: erc20 ? 'erc20' : 'erc721',
+    token: toLowerHex(`0x${address.slice(2)}`),
+    from: `0x${from.slice(26).toLowerCase()}`,
+    to: `0x${to.slice(26).toLowerCase()}`,
+    value: BigInt(erc20 ? data : id),
+    blockNumber: BigInt(blockNumber),
+    blockHash: toLowerHex(`0x${blockHash.slice(2)}`),
+    logIndex: Number(logIndex),
+    transactionHash: toLowerHex(`0x${transactionHash.slice(2)}`),
+  };
+}
+
 const getLogs = (rpc: RpcClient, filter: { blockHash: Hex; topics: Hex[] }): Promise<WireLog[]> => rpc.request('eth_getLogs', [filter], {
   validate: Array.isArray,
 });
@@ -130,7 +168,7 @@ export async function transfersInRange(
     }
 
     if (!isHex(log.blockHash) || expected.get(number) !== log.blockHash.toLowerCase()) {
-      throw new RpcError('transient', `Log block hash does not match header at ${number}`);
+      throw new ChainGapError(`Log block hash does not match header at ${number}`);
     }
 
     const event = decodeTransferLog(log);
@@ -254,39 +292,14 @@ export async function scanTransfers(
   }, shouldStop);
 }
 
-const paddedAddress = /^0x0{24}[0-9a-fA-F]{40}$/;
-
-/** A 32-byte indexed topic that holds a left-padded address. */
-const isAddressTopic = (topic: unknown): topic is Hex => isString(topic) && paddedAddress.test(topic);
-
-/** The address in a padded address topic, lowercase. */
-const topicAddress = (topic: Hex): Address => `0x${topic.slice(26).toLowerCase()}`;
-
-/**
- * Every Transfer in range, without an address filter (about 450 KB of JSON per mainnet block, so keep ranges at
- * most ~1k blocks). Logs whose from/to are both rejected by `accept` are skipped before the (costlier) strict decode.
- */
+/** All decoded Transfer logs, unfiltered by account (the bootstrap's RPC source; it verifies them against its headers). */
 export async function scanAllTransfers(
   rpc: RpcClient,
   range: BlockRange,
   onTransfer: (event: TransferEvent) => void,
-  accept?: (address: Address) => boolean,
-  onSkipped?: (from: Address, to: Address, decode: () => TransferEvent | undefined) => void,
 ): Promise<{ calls: number }> {
   const { calls } = await scanLogs(rpc, [TRANSFER_TOPIC], range, (log) => {
-    if (accept && Array.isArray(log.topics)) {
-      const [, fromTopic, toTopic] = log.topics;
-      const from = isAddressTopic(fromTopic) ? topicAddress(fromTopic) : undefined;
-      const to = isAddressTopic(toTopic) ? topicAddress(toTopic) : undefined;
-
-      if (from && to && !accept(from) && !accept(to)) {
-        onSkipped?.(from, to, () => decodeTransferLog(log));
-
-        return;
-      }
-    }
-
-    const event = decodeTransferLog(log);
+    const event = decodeTransferLogFast(log);
 
     if (event) onTransfer(event);
   });

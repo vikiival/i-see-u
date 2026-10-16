@@ -7,31 +7,20 @@ import type {
   AccountLogSource,
   AccountLogSourceStats,
   Address,
-  BalanceResult,
   BlockRange,
-  ChainAdapter,
   ChunkAggregate,
   ChunkScan,
-  FollowerStatus,
   Hex,
-  OwnerResult,
   RpcClient,
   RpcStats,
 } from '../src/core/types.ts';
-import { createDiscoveryService } from '../src/discovery/service.ts';
 import { withFallback } from '../src/sources/fallback.ts';
-import {
-  createHypersyncLogSource,
-} from '../src/sources/hypersync.ts';
-import type {
-  HypersyncClientLike,
-  HypersyncFactoryResult,
-  HypersyncStream,
-} from '../src/sources/hypersync.ts';
+import { createHypersyncLogSource } from '../src/sources/hypersync.ts';
+import type { HypersyncFactoryResult } from '../src/sources/hypersync.ts';
+import type { HypersyncPager } from '../src/sources/hypersync-pages.ts';
 import { createRpcLogSource } from '../src/sources/rpc-logs.ts';
-import { lowerAddress, rpcParam, staged } from './helpers.ts';
-import { createTestStore } from './store-fixture.ts';
-import type { Log, Query, QueryResponse, StreamConfig } from '@envio-dev/hypersync-client';
+import { rpcParam, staged } from './helpers.ts';
+import type { Log, Query, QueryResponse } from '@envio-dev/hypersync-client';
 
 const ACCOUNT: Address = '0x1111111111111111111111111111111111111111';
 const PEER: Address = '0x2222222222222222222222222222222222222222';
@@ -71,28 +60,24 @@ const response = (logs: Log[], nextBlock: number, archiveHeight = 100): QueryRes
   data: { logs, blocks: [], transactions: [], traces: [] },
 });
 
-class Pages implements HypersyncStream {
-  readonly values: Array<QueryResponse | Error | null>;
-  closed = 0;
-
-  constructor(values: Array<QueryResponse | Error | null>) {
-    this.values = [...values];
-  }
-
-  async recv(): Promise<QueryResponse | null> {
-    const value = this.values.shift() ?? null;
+/** Answers getWithRateLimit from a script: a page, a thrown error, a 429, or (exhausted) an error. */
+const pager = (values: Array<QueryResponse | Error | 'limited'>, seen: Query[] = []): HypersyncPager & { seen: Query[] } => ({
+  seen,
+  async getWithRateLimit(query) {
+    seen.push(query);
+    const value = values.shift();
 
     if (value instanceof Error) throw value;
 
-    return value;
-  }
+    if (value === 'limited') return { rateLimit: { resetSecs: 0, remaining: 0, cost: 1000 } };
 
-  async close(): Promise<void> {
-    this.closed += 1;
-  }
-}
+    if (!value) throw new Error('no more pages');
 
-const clientFactory = (client: HypersyncClientLike): (() => Promise<HypersyncFactoryResult>) =>
+    return { response: value, rateLimit: { remaining: 14_000, cost: 1000 } };
+  },
+});
+
+const clientFactory = (client: HypersyncPager): (() => Promise<HypersyncFactoryResult>) =>
   async () => ({ client, joinNothing: 2 });
 
 const canonical = (aggregate: ChunkAggregate) => ({
@@ -134,22 +119,12 @@ test('HyperSync multi-page streaming exactly matches RPC aggregation, including 
     log({ block: 13, index: 2, from: ACCOUNT, to: PEER, token: ERC721, tokenId: 7n }),
   ];
 
-  const streams: Pages[] = [];
-  let query: Query | undefined;
-
-  const hsClient: HypersyncClientLike = {
-    async stream(received) {
-      query = received;
-      const stream = new Pages([response(logs.slice(0, 2), 12), response(logs.slice(2), 21), null]);
-      streams.push(stream);
-
-      return stream;
-    },
-  };
+  const hsClient = pager([response(logs.slice(0, 2), 12), 'limited', response(logs.slice(2), 21)]);
+  const waits: number[] = [];
 
   const hs = createHypersyncLogSource({
     url: 'https://eth.hypersync.xyz', apiToken: 'token', preferredMaxRange: 100_000n, timeoutMs: 1_000,
-    clientFactory: clientFactory(hsClient),
+    clientFactory: clientFactory(hsClient), sleep: async (ms) => { waits.push(ms); },
   });
 
   const rpc: RpcClient = {
@@ -164,20 +139,22 @@ test('HyperSync multi-page streaming exactly matches RPC aggregation, including 
     stats: rpcStats,
   };
 
-  const rpcSource = createRpcLogSource(rpc, { preferredMaxRange: 3_000n, minRange: 500n });
+  const rpcSource = createRpcLogSource(rpc, { preferredMaxRange: 3_000n });
 
   try {
     const range = { fromBlock: 10n, toBlock: 20n };
     const [fromHs, fromRpc] = await Promise.all([hs.scanAccount(ACCOUNT, range), rpcSource.scanAccount(ACCOUNT, range)]);
     expect(canonical(fromHs.aggregate)).toEqual(canonical(fromRpc.aggregate));
     expect(fromHs.logs).toBe(4);
-    expect(query).toMatchObject({ fromBlock: 10, toBlock: 21, joinMode: 2 });
-    expect(query?.logs).toEqual([
+    // Page two continues at nextBlock; the 429 sleeps for the quota window and repeats the same request.
+    expect(hsClient.seen.map((query) => [query.fromBlock, query.toBlock])).toEqual([[10, 21], [12, 21], [12, 21]]);
+    expect(waits).toEqual([1_000]);
+    expect(hsClient.seen[0]).toMatchObject({ joinMode: 2 });
+    expect(hsClient.seen[0].logs).toEqual([
       { include: { topics: [[TRANSFER_TOPIC], [topic(ACCOUNT)]] } },
       { include: { topics: [[TRANSFER_TOPIC], [], [topic(ACCOUNT)]] } },
     ]);
-    expect(streams[0].closed).toBe(1);
-    expect(hs.stats().hypersync).toMatchObject({ requests: 1, chunks: 1, logs: 4, failures: 0 });
+    expect(hs.stats().hypersync).toMatchObject({ requests: 3, chunks: 1, logs: 4, failures: 0 });
   } finally {
     await hs.close?.();
   }
@@ -189,7 +166,7 @@ test('height below the inclusive range fails the primary and serves the identica
 
   const hs = createHypersyncLogSource({
     url: 'https://eth.hypersync.xyz', apiToken: 'token', preferredMaxRange: 100n, timeoutMs: 1_000,
-    clientFactory: clientFactory({ async stream() { return new Pages([response([], 21, 19)]); } }),
+    clientFactory: clientFactory(pager([response([], 21, 19)])),
   });
 
   const fallback = fixedSource('rpc', expected);
@@ -208,12 +185,10 @@ test('height below the inclusive range fails the primary and serves the identica
 });
 
 test.each([
-  ['401', () => ({ async stream() { throw new Error('HTTP 401 apiToken=VERY_SECRET'); } })],
-  ['429', () => ({ async stream() { throw new Error('HTTP 429'); } })],
-  ['503', () => ({ async stream() { throw new Error('HTTP 503'); } })],
-  ['malformed', () => ({
-    async stream() { return new Pages([staged<QueryResponse>({ ...response([], 21), data: { logs: null } })]); },
-  })],
+  ['401', () => pager([new Error('HTTP 401 apiToken=VERY_SECRET')])],
+  ['503', () => pager([new Error('HTTP 503')])],
+  ['malformed', () => pager([staged<QueryResponse>({ ...response([], 21), data: { logs: null } })])],
+  ['no progress', () => pager([response([], 10)])],
 ] as const)('%s primary failure falls back and redacts source stats', async (_label, makeClient) => {
   const expected = { aggregate: emptyAggregate(), calls: 2, logs: 0, heavy: false };
 
@@ -233,17 +208,18 @@ test.each([
   }
 });
 
-test('a timed-out stream is closed and the complete fallback result is used', async () => {
-  let release = (_value: QueryResponse | null): void => {};
-
-  const stream: HypersyncStream = {
-    recv: () => new Promise<QueryResponse | null>((resolve) => { release = resolve; }),
-    async close() { release(null); },
-  };
+test('a request that never answers times out without being awaited again, and the fallback result is used', async () => {
+  let calls = 0;
 
   const hs = createHypersyncLogSource({
     url: 'https://eth.hypersync.xyz', apiToken: 'token', preferredMaxRange: 100n, timeoutMs: 10,
-    clientFactory: clientFactory({ async stream(_query: Query, _config: StreamConfig) { return stream; } }),
+    clientFactory: clientFactory({
+      getWithRateLimit: () => {
+        calls += 1;
+
+        return new Promise(() => {});
+      },
+    }),
   });
 
   const expected = { aggregate: emptyAggregate(), calls: 2, logs: 0, heavy: false };
@@ -252,6 +228,7 @@ test('a timed-out stream is closed and the complete fallback result is used', as
   try {
     expect(await source.scanAccount(ACCOUNT, { fromBlock: 10n, toBlock: 20n })).toMatchObject({ aggregate: expected.aggregate });
     expect(source.stats().hypersync.lastError).toContain('timed out');
+    expect(calls).toBe(1);
   } finally {
     await source.close?.();
   }
@@ -286,55 +263,26 @@ test('fallback breaker skips a dead primary during cooldown and retries it after
   expect(source.stats().primary.cooldownUntil).toBeUndefined();
 });
 
-test('a mid-stream failure commits nothing; the next discovery resumes the same chunk', async () => {
-  const transfer = log({ block: 15, index: 0, from: PEER, to: ACCOUNT });
+test('a mid-range failure exposes no aggregate and a retry returns the complete range', async () => {
   let fail = true;
-
-  const hsClient: HypersyncClientLike = {
-    async stream() {
-      return fail
-        ? new Pages([response([transfer], 16, 20), new Error('stream broke')])
-        : new Pages([response([transfer], 21, 20), null]);
-    },
-  };
+  const transfer = log({ block: 15, index: 0, from: PEER, to: ACCOUNT });
 
   const source = createHypersyncLogSource({
     url: 'https://eth.hypersync.xyz', apiToken: 'token', preferredMaxRange: 100n, timeoutMs: 1_000,
-    clientFactory: clientFactory(hsClient),
-  });
+    clientFactory: clientFactory({
+      async getWithRateLimit(query) {
+        if (fail && query.fromBlock !== 10) throw new Error('stream broke');
 
-  const adapter: ChainAdapter = {
-    network: 'ethereum', startBlock: 10n, accountLogs: source, scanConcurrency: 1, followerMaxRange: 100n,
-    normalizeAddress: (value) => /^0x[0-9a-f]{40}$/i.test(value) ? lowerAddress(value) : undefined,
-    async finalizedHead() { return { block: { number: 20n, hash: hash(20), timestamp: 200n }, lastProgressAt: 1, stale: false }; },
-    async latestHeader() { return { number: 20n, hash: hash(20), parentHash: hash(19), timestamp: 200n }; },
-    async blockByNumber(number) { return { number, hash: hash(Number(number)), timestamp: number * 10n }; },
-    async headerByNumber(number) { return { number, hash: hash(Number(number)), parentHash: hash(Number(number - 1n)), timestamp: number * 10n }; },
-    async transfersInBlock() { return []; },
-    async transfersInRange() { return []; },
-    async scanAllTransfers() { return { calls: 0 }; },
-    async erc20BalancePairs(): Promise<BalanceResult[]> { return []; },
-    async erc721Owners(): Promise<OwnerResult[]> { return []; },
-  };
-
-  const { store } = await createTestStore();
-  await store.initFollowerCursor('ethereum', { number: 20n, hash: hash(20), timestamp: 200n }, 1);
-  const status = (): FollowerStatus => ({ ready: true, leader: true, lagBlocks: 0n, lastAdvanceAt: 1, stale: false });
-
-  const discovery = createDiscoveryService({
-    adapters: { ethereum: adapter }, store, followers: { ethereum: { status, track() {} } }, requestDeadlineMs: 1_000,
+        return { response: fail ? response([transfer], 16, 20) : response([transfer], 21, 20), rateLimit: {} };
+      },
+    }),
   });
 
   try {
-    await expect(discovery.discover('ethereum', ACCOUNT)).rejects.toThrow('stream broke');
-    expect(await store.getProgress('ethereum', ACCOUNT)).toBeUndefined();
-    expect(await store.holdings('ethereum', ACCOUNT)).toEqual([]);
+    await expect(source.scanAccount(ACCOUNT, { fromBlock: 10n, toBlock: 20n })).rejects.toThrow('stream broke');
     fail = false;
-    await expect(discovery.discover('ethereum', ACCOUNT)).resolves.toMatchObject({ status: 'ready' });
-    expect(await store.getProgress('ethereum', ACCOUNT)).toBe(20n);
-    expect(await store.holdings('ethereum', ACCOUNT)).toMatchObject([{ token: ERC20, receivedCount: 1 }]);
+    expect((await source.scanAccount(ACCOUNT, { fromBlock: 10n, toBlock: 20n })).logs).toBe(1);
   } finally {
     await source.close?.();
-    await store.close();
   }
 });

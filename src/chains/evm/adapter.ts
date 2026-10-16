@@ -2,9 +2,9 @@ import { isAddress } from 'viem';
 import type { Chain } from 'viem';
 
 import { toLowerHex } from '../../core/parse.ts';
-import type { AccountLogSource, Address, ChainAdapter, RpcClient } from '../../core/types.ts';
+import type { Address, ChainAdapter, RpcClient } from '../../core/types.ts';
 import { createHeadTracker } from './head.ts';
-import { scanAllTransfers, transfersInBlock, transfersInRange } from './logs.ts';
+import { transfersInBlock, transfersInRange } from './logs.ts';
 import { readErc20BalancePairs, readErc721Owners } from './multicall.ts';
 
 /** Default time a finalized-head observation is shared by all callers before asking the node again. */
@@ -14,10 +14,8 @@ export interface EvmAdapterOptions {
   network: string;
   chain: Chain;
   startBlock: bigint;
-  accountLogs: AccountLogSource;
   /** Mark the finalized head stale after this long without a higher block number. */
   finalizedMaxNoProgressMs: number;
-  scanConcurrency: number;
   /** Max span of one unfiltered follower getLogs call. */
   followerMaxRange: bigint;
   multicallBatch: number;
@@ -32,18 +30,14 @@ export function createEvmAdapter(rpc: RpcClient, o: EvmAdapterOptions): ChainAda
   return {
     network: o.network,
     startBlock: o.startBlock,
-    accountLogs: o.accountLogs,
-    scanConcurrency: o.scanConcurrency,
     followerMaxRange: o.followerMaxRange,
     normalizeAddress: (input) => isAddress(input, { strict: false }) ? toLowerHex(input) : undefined,
     finalizedHead: head.finalizedHead,
-    latestHeader: head.latestHeader,
     cachedLatestBlockNumber: head.latestBlockNumber,
-    blockByNumber: head.blockByNumber,
+    latestHeader: head.latestHeader,
     headerByNumber: head.blockByNumber,
     transfersInBlock: (blockHash) => transfersInBlock(rpc, blockHash),
     transfersInRange: (range, headers) => transfersInRange(rpc, range, headers),
-    scanAllTransfers: (range, onTransfer, accept, onSkipped) => scanAllTransfers(rpc, range, onTransfer, accept, onSkipped),
     erc20BalancePairs: (pairs, blockHash) => readErc20BalancePairs(rpc, pairs, blockHash, o.multicallBatch, o.multicall3),
     erc721Owners: (items, blockHash) => readErc721Owners(rpc, items, blockHash, o.multicallBatch, o.multicall3),
   };
