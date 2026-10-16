@@ -87,9 +87,9 @@ export function createLimiter(maxActive: number, maxQueued: number, retryAfterS 
 }
 
 /**
- * Run work with a signal that aborts after ms or when `parent` aborts. On the deadline it settles with `onTimeout()`
- * (which may throw), on a parent abort with a 503 "Request cancelled"; either way at once, without waiting for the
- * aborted work to stop.
+ * Run work with a signal that aborts after ms, when `parent` aborts, or when the work rejects (so no part of it, such
+ * as a sibling balance batch, keeps running). On the deadline it settles with `onTimeout()` (which may throw), on a
+ * parent abort with a 503 "Request cancelled"; either way at once, without waiting for the aborted work to stop.
  */
 export function withDeadline<T, U>(
   work: (signal: AbortSignal) => Promise<T>,
@@ -118,6 +118,7 @@ export function withDeadline<T, U>(
 
   // The executor turns a synchronous throw into a rejection, so the cleanup below always runs.
   const running = new Promise<T>((resolve) => resolve(work(signal)));
+  running.catch(() => controller.abort(new DOMException('Request work failed', 'AbortError')));
 
   return Promise.race([running, cut.promise]).finally(() => {
     clearTimeout(timer);

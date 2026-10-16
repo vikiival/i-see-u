@@ -5,7 +5,7 @@ import { createEvmAdapter } from '../src/chains/evm/adapter.ts';
 import { TRANSFER_TOPIC } from '../src/chains/evm/logs.ts';
 import { MULTICALL3 } from '../src/chains/evm/multicall.ts';
 import { addTransfer, emptyAggregate } from '../src/core/aggregate.ts';
-import type { Address, BlockHeader, BlockRef, ChainAdapter, ChunkAggregate, Hex, RpcClient, TransferEvent } from '../src/core/types.ts';
+import type { Address, BlockHeader, BlockRef, ChainAdapter, ChunkAggregate, Hex, RpcClient, RpcRequestOptions, TransferEvent } from '../src/core/types.ts';
 import { RpcError } from '../src/rpc/errors.ts';
 import { lowerAddress, rpcParam, staged } from './helpers.ts';
 
@@ -41,6 +41,8 @@ export class FakeChain {
   readonly unknownBlockOnce = new Set<Hex>();
   /** Every eth_call received, as the decoded aggregate3 call count. */
   multicallSizes: number[] = [];
+  /** The cancellation signal each eth_call received. */
+  multicallSignals: AbortSignal[] = [];
   private logsPerBlock = new Map<bigint, number>();
   private headers = new Map<bigint, BlockHeader>();
   private fork = 0n;
@@ -146,7 +148,7 @@ export class FakeChain {
   }
 
   readonly rpc: RpcClient = {
-    request: async <T>(method: string, params: unknown[]): Promise<T> => {
+    request: async <T>(method: string, params: unknown[], opts?: RpcRequestOptions): Promise<T> => {
       this.calls[method] = (this.calls[method] ?? 0) + 1;
 
       if (method === 'eth_getBlockByNumber') {
@@ -195,6 +197,8 @@ export class FakeChain {
         if (decoded.functionName !== 'aggregate3') throw new RpcError('fatal', `unexpected call ${decoded.functionName}`);
         const [calls] = decoded.args;
         this.multicallSizes.push(calls.length);
+
+        if (opts?.signal) this.multicallSignals.push(opts.signal);
         await this.beforeMulticall?.(calls.map((call) => lowerAddress(call.target)));
 
         return staged<T>(encodeFunctionResult({

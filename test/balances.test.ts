@@ -205,33 +205,45 @@ test('without balances=true no balance RPC or cache write happens', async () => 
   } finally { await s.close(); }
 });
 
-test('a shared balance batch stops its RPC only once every waiting request gave up', async () => {
-  const s = await fixture();
+const at102 = { number: 102n, hash: blockHash(102n), timestamp: 0n };
+
+/**
+ * A reader whose Multicalls hang until their signal aborts (or fail at once for `failing` tokens); `signals` collects
+ * the signal of every Multicall, in send order.
+ */
+const cancellableReader = (s: Stack, opts: { batchSize?: number; failing?: string[] } = {}) => {
   const signals: AbortSignal[] = [];
 
   const reader = createBalanceReader({
     adapter: {
       ...s.adapter,
-      erc20BalancePairs: (_pairs, _hash, signal) => {
+      erc20BalancePairs: (pairs, _hash, signal) => {
         if (signal) signals.push(signal);
+
+        if (pairs.some((pair) => opts.failing?.includes(pair.token))) return Promise.reject(new RpcError('transient', 'HTTP 503'));
 
         return new Promise((_resolve, reject) => signal?.addEventListener('abort', () => reject(signal.reason)));
       },
     },
     store: s.store,
     requestRpc: { limiter: createLimiter(2, 8), deadlineMs: 60_000 },
-    batchSize: 1_000,
+    batchSize: opts.batchSize ?? 1_000,
     windowMs: 0,
     alwaysRefresh: [],
   });
 
-  const at = { number: 102n, hash: blockHash(102n), timestamp: 0n };
+  return { reader, signals };
+};
+
+test('a shared balance batch stops its RPC only once every waiting request gave up', async () => {
+  const s = await fixture();
+  const { reader, signals } = cancellableReader(s);
   const holdings = [{ token: tokenA, lastBlock: 100n }];
   const [a, b, c] = [new AbortController(), new AbortController(), new AbortController()];
 
   try {
-    const first = reader.forAccount(account, holdings, at, 0n, [], a.signal);
-    const second = reader.forAccount(other, holdings, at, 0n, [], b.signal);
+    const first = reader.forAccount(account, holdings, at102, 0n, [], a.signal);
+    const second = reader.forAccount(other, holdings, at102, 0n, [], b.signal);
     await vi.waitFor(() => expect(signals).toHaveLength(1));
 
     a.abort();
@@ -243,10 +255,45 @@ test('a shared balance batch stops its RPC only once every waiting request gave 
     expect(signals[0].aborted).toBe(true);
 
     // A later request for the same pair starts a fresh read instead of joining the abandoned one.
-    const third = reader.forAccount(account, holdings, at, 0n, [], c.signal);
+    const third = reader.forAccount(account, holdings, at102, 0n, [], c.signal);
     await vi.waitFor(() => expect(signals).toHaveLength(2));
     expect(signals[1].aborted).toBe(false);
     c.abort();
     await expect(third).rejects.toMatchObject({ statusCode: 503 });
+  } finally { await s.close(); }
+});
+
+test('two requests for the same pair share one read, aborted only when the second one leaves too', async () => {
+  const s = await fixture();
+  const { reader, signals } = cancellableReader(s);
+  const holdings = [{ token: tokenA, lastBlock: 100n }];
+  const [a, b] = [new AbortController(), new AbortController()];
+
+  try {
+    const first = reader.forAccount(account, holdings, at102, 0n, [], a.signal);
+    const second = reader.forAccount(account, holdings, at102, 0n, [], b.signal);
+    await vi.waitFor(() => expect(signals).toHaveLength(1));
+
+    a.abort();
+    await expect(first).rejects.toMatchObject({ statusCode: 503, message: 'Request cancelled' });
+    expect(signals[0].aborted).toBe(false);
+
+    b.abort();
+    await expect(second).rejects.toMatchObject({ statusCode: 503, message: 'Request cancelled' });
+    expect(signals[0].aborted).toBe(true);
+    expect(signals).toHaveLength(1);
+  } finally { await s.close(); }
+});
+
+test('when one batch of a request fails, the request aborts its other batches instead of leaving them running', async () => {
+  const s = await fixture();
+  // One pair per batch: tokenA's batch fails at once, tokenB's would hang until aborted.
+  const { reader, signals } = cancellableReader(s, { batchSize: 1, failing: [tokenA] });
+  const holdings = [{ token: tokenA, lastBlock: 100n }, { token: tokenB, lastBlock: 100n }];
+
+  try {
+    await expect(reader.forAccount(account, holdings, at102, 0n, [])).rejects.toMatchObject({ statusCode: 503, message: 'Balance RPC unavailable' });
+    expect(signals).toHaveLength(2);
+    await vi.waitFor(() => expect(signals[1].aborted).toBe(true));
   } finally { await s.close(); }
 });

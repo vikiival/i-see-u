@@ -165,7 +165,7 @@ test('ERC-721 returns current ownership and optionally verifies it at the finali
   } finally { await s.close(); }
 });
 
-test('on-request RPC deadlines release the HTTP request while bounded work finishes', async () => {
+test('an on-request RPC deadline answers 503 and aborts the in-flight balance read', async () => {
   const chain = new FakeChain(100n);
   chain.addTransfer({ token, from: peer, to: account, value: 1n, blockNumber: 100n });
   const s = await stack(chain, { deadlineMs: 10 });
@@ -177,7 +177,11 @@ test('on-request RPC deadlines release the HTTP request while bounded work finis
     const response = await s.app.request(`${path}/erc20?balances=true`);
     expect(response.status).toBe(503);
     expect(response.headers.get('retry-after')).toBe('2');
+    // The deadline reached the Multicall through the limiter and the batch, so the RPC stops instead of finishing.
+    expect(chain.multicallSignals).toHaveLength(1);
+    expect(chain.multicallSignals[0].aborted).toBe(true);
     pause.release();
+    // The abandoned read is not joined: a later request starts a fresh one.
     await s.balances.forAccount(account, [{ token, lastBlock: 100n }], await s.adapter.headerByNumber(100n), 0n);
   } finally { pause.release(); await s.close(); }
 });
