@@ -1,5 +1,6 @@
 import { createApp } from '../src/api/routes.ts';
 import { createBalanceReader } from '../src/balances/reader.ts';
+import { createBootstrapStore } from '../src/bootstrap/store.ts';
 import { createLimiter } from '../src/core/limiter.ts';
 import type { Address, BlockHeader, BlockRange, TransferEvent } from '../src/core/types.ts';
 import { createDiscoveryService } from '../src/discovery/service.ts';
@@ -40,6 +41,7 @@ export async function stack(chain = new FakeChain(102n), options: {
   const app = createApp({
     discovery, adapters: { ethereum: adapter }, balances: { ethereum: balances }, followers: { ethereum: follower }, tails, requestRpc,
     rpcStats: () => chain.rpc.stats(), startedAt: clock.at,
+    bootstrap: (network) => createBootstrapStore(db).status(network, clock.at),
   });
 
   return {

@@ -122,7 +122,10 @@ export class FakeChain {
     this.ensureHeaders(n);
     const header = this.headers.get(n)!;
 
-    return { number: hex(n), hash: header.hash, parentHash: header.parentHash, timestamp: hex(header.timestamp), transactions: [] };
+    // A full bloom where the block has Transfers, an empty one elsewhere (enough for the bootstrap's zero-log check).
+    const logsBloom = `0x${(this.transfers.some((event) => event.blockNumber === n) ? 'f' : '0').repeat(512)}`;
+
+    return { number: hex(n), hash: header.hash, parentHash: header.parentHash, timestamp: hex(header.timestamp), logsBloom, transactions: [] };
   }
 
   private wireLog(e: TransferEvent) {
