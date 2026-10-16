@@ -2,6 +2,8 @@ import { serve } from '@hono/node-server';
 
 import { createApp } from './api/routes.ts';
 import { createBalanceReader } from './balances/reader.ts';
+import { assertStartBlock } from './bootstrap/bootstrap.ts';
+import { runConfiguredBootstrap } from './bootstrap/wire.ts';
 import { createEvmAdapter } from './chains/evm/adapter.ts';
 import { config } from './config.ts';
 import { createLimiter } from './core/limiter.ts';
@@ -16,7 +18,16 @@ const rpc = createRpcClient(config.rpc);
 const adapters = Object.fromEntries(Object.values(config.networks).map((network) =>
   [network.name, createEvmAdapter(rpc, { ...network, network: network.name })]));
 
-const { store, followerLock } = await openPostgresStore(config.databaseUrl, { max: config.db.poolMax, connectionTimeoutMillis: config.db.connectTimeoutMs });
+const { store, bootstrap, followerLock, bootstrapLock } = await openPostgresStore(config.databaseUrl, { max: config.db.poolMax, connectionTimeoutMillis: config.db.connectTimeoutMs });
+
+// A database initialized (or being bootstrapped) from another START_BLOCK cannot serve this configuration.
+try {
+  for (const network of Object.values(config.networks)) await assertStartBlock(store, bootstrap, network.name, network.startBlock);
+} catch (error) {
+  await store.close();
+  throw error;
+}
+
 const requestRpc = { limiter: createLimiter(config.request.rpcConcurrency, config.request.rpcQueue), deadlineMs: config.request.deadlineMs };
 
 const balances = Object.fromEntries(Object.values(config.networks).map((network) => [network.name, createBalanceReader({
@@ -46,14 +57,33 @@ await Promise.all([...Object.values(followers), ...Object.values(tails ?? {})].m
 
 for (const part of [...Object.values(followers), ...Object.values(tails ?? {})]) part.start();
 
+// Optional in-process bootstrap: the service stays not_ready (follower and tail wait) until it publishes the index.
+if (config.bootstrap.onStart) {
+  for (const network of Object.values(config.networks)) {
+    if (await store.indexState(network.name)) continue;
+    const lock = bootstrapLock(network.name);
+
+    if (!await lock.tryAcquire()) {
+      console.warn(`Bootstrap of ${network.name} is running elsewhere`);
+      continue;
+    }
+
+    const log = (message: string) => console.log(`[bootstrap ${network.name}] ${message}`);
+    runConfiguredBootstrap(config, network, { store, bootstrap, log }).done
+      .then(() => followers[network.name].kick(), (error) => console.error(`[bootstrap ${network.name}] failed: ${error instanceof Error ? error.message : String(error)}`))
+      .finally(() => lock.release());
+  }
+}
+
 const app = createApp({
   discovery, adapters, balances, followers, tails, requestRpc,
   maxVerifyOwnershipItems: config.request.maxVerifyOwnershipItems,
   rpcStats: () => rpc.stats(), startedAt: Date.now(),
+  bootstrap: (network) => bootstrap.status(network, Date.now()),
 }, { requestLog: process.env.LOG_LEVEL !== 'warn' && process.env.LOG_LEVEL !== 'error' });
 
 const server = serve({ fetch: app.fetch, port: config.port, hostname: '0.0.0.0' }, (info) => {
-  console.log(`i-see-u listening on http://localhost:${info.port}; global bootstrap must initialize the index before it is ready`);
+  console.log(`i-see-u listening on http://localhost:${info.port}; not ready until the bootstrap (npm run bootstrap) has published the index`);
 });
 
 let shuttingDown = false;

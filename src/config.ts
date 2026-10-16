@@ -61,8 +61,20 @@ const addresses = (k: string, value: string): Address[] => value.split(',').map(
 /** When set, replaces (not extends) each network's default list from src/networks.ts. */
 const refreshOverride = process.env.BALANCE_ALWAYS_REFRESH_TOKENS;
 
+/** START_BLOCK replaces the registry start block (a plain block number). A stored index or bootstrap must match it. */
+const startBlockOverride = (() => {
+  const value = process.env.START_BLOCK;
+
+  if (value === undefined || value === '') return undefined;
+
+  if (!/^\d+$/.test(value) || BigInt(value) < 1n) throw new Error('START_BLOCK must be a positive block number');
+
+  return BigInt(value);
+})();
+
 const networks = Object.fromEntries(Object.values(networkRegistry).map((network) => [network.name, {
   ...network, ...evmTuning,
+  startBlock: startBlockOverride ?? network.startBlock,
   alwaysRefreshTokens: refreshOverride === undefined ? network.alwaysRefreshTokens : addresses('BALANCE_ALWAYS_REFRESH_TOKENS', refreshOverride),
 }]));
 
@@ -118,6 +130,23 @@ export const config = {
     rpcQueue: int('REQUEST_RPC_QUEUE', '256'),
     /** verifyOwnership is skipped (not an error) when an account holds more NFT items than this. */
     maxVerifyOwnershipItems: int('MAX_VERIFY_OWNERSHIP_ITEMS', '2000'),
+  },
+  /** One-time global load (`npm run bootstrap`, or BOOTSTRAP_ON_START in the server). */
+  bootstrap: {
+    onStart: bool('BOOTSTRAP_ON_START', false),
+    segmentBlocks: BigInt(int('BOOTSTRAP_SEGMENT_BLOCKS', '1000')),
+    headerChunkBlocks: BigInt(int('BOOTSTRAP_HEADER_CHUNK_BLOCKS', '5000')),
+    /** Concurrent Quicknode segment workers (unfiltered 100-block getLogs). */
+    rpcWorkers: int('BOOTSTRAP_RPC_WORKERS', '4'),
+    rpcLogRange: BigInt(int('BOOTSTRAP_RPC_LOG_RANGE', '100')),
+    /** Bulk getLogs answers take 4-35 s under concurrency; the request-path timeout is too short for them. */
+    rpcTimeoutMs: int('BOOTSTRAP_RPC_TIMEOUT_MS', '60000'),
+    /** Optional: without it the bootstrap is RPC-only (and pays one call per header). Never logged. */
+    hypersyncApiKey: process.env.HYPERSYNC_API_KEY || undefined,
+    hypersyncUrl: process.env.HYPERSYNC_URL || ethereum.hypersyncUrl,
+    /** Per-request idle timeout for HyperSync (not a whole-range timeout). */
+    hypersyncIdleMs: int('HYPERSYNC_TIMEOUT_MS', '120000'),
+    maintenanceWorkMem: env('BOOTSTRAP_MAINTENANCE_WORK_MEM', '1GB'),
   },
   /** Refuse discovery when the follower has not advanced for longer than this. */
   maxHeadProgressAgeMs: int('MAX_HEAD_AGE_MS', '1800000'),

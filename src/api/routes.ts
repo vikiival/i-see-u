@@ -3,6 +3,7 @@ import { logger } from 'hono/logger';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 
 import type { BalanceReader, RequestRpc } from '../balances/reader.ts';
+import type { BootstrapStatus } from '../bootstrap/store.ts';
 import { unavailable, withDeadline } from '../core/limiter.ts';
 import { isNumber } from '../core/parse.ts';
 import type {
@@ -32,6 +33,8 @@ export interface RouteDeps {
   maxVerifyOwnershipItems?: number;
   rpcStats: () => RpcStats;
   startedAt: number;
+  /** Shared bootstrap progress per network, read from the database (any process may be running the loader). */
+  bootstrap?: (network: string) => Promise<BootstrapStatus | undefined>;
 }
 
 const booleanQuery = (value: string | undefined, name: string): boolean => {
@@ -92,6 +95,21 @@ const statusJson = (status: FollowerStatus) => ({
   lastError: status.lastError,
   stale: status.stale,
   unhealthy: status.unhealthy,
+});
+
+const bootstrapJson = (status: BootstrapStatus) => ({
+  status: status.status,
+  startBlock: status.startBlock.toString(),
+  targetBlock: status.targetBlock.toString(),
+  headers: `${status.headersLoaded}/${status.headersTotal}`,
+  segmentsDone: status.segmentsDone,
+  segmentsTotal: status.segmentsTotal,
+  segmentsFailed: status.segmentsFailed,
+  logs: status.logs,
+  logsPerS: status.logsPerS,
+  etaS: status.etaS,
+  startedAt: new Date(status.startedAt).toISOString(),
+  error: status.error,
 });
 
 const tailJson = (status: TailStatus) => ({
@@ -336,10 +354,17 @@ export function createApp(deps: RouteDeps, opts: { requestLog?: boolean } = {}):
 
     const ready = networks.every((network) => network.ready);
 
+    const bootstrap = deps.bootstrap && Object.fromEntries((await Promise.all(networks.map(async ({ network }) => {
+      const status = await deps.bootstrap!(network).catch(() => undefined);
+
+      return status && status.status !== 'done' ? [[network, bootstrapJson(status)]] : [];
+    }))).flat());
+
     return c.json({
       status: ready ? 'ready' : 'not_ready',
       networks,
       uptimeS: Math.max(0, Math.floor((Date.now() - deps.startedAt) / 1_000)),
+      ...(bootstrap && Object.keys(bootstrap).length > 0 && { bootstrap }),
       followers: Object.fromEntries(Object.entries(deps.followers).map(([network, f]) => [network, statusJson(f.status())])),
       ...(deps.tails && { tails: Object.fromEntries(Object.entries(deps.tails).map(([network, tail]) => [network, tailJson(tail.status())])) }),
       rpc: deps.rpcStats(),

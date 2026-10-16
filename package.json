@@ -8,6 +8,7 @@
     "start": "node src/server.ts",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "node src/store/migrate.ts",
+    "bootstrap": "node src/bootstrap/main.ts",
     "compare:sources": "node scripts/compare-sources.ts",
     "typecheck": "tsc --noEmit",
     "lint": "oxlint src test scripts",
