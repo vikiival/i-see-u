@@ -37,16 +37,18 @@ export function createLimiter(maxActive: number, maxQueued: number, retryAfterS 
     async run<T>(fn: (signal: AbortSignal) => Promise<T>, opts: RunOptions = {}): Promise<T> {
       const { deadlineAt } = opts;
       const expired = (): boolean => deadlineAt !== undefined && Date.now() >= deadlineAt;
+      // One clock read: a second one could see the deadline pass and hand AbortSignal.timeout a negative delay.
+      const remainingMs = deadlineAt === undefined ? Infinity : deadlineAt - Date.now();
 
       const cancelled = (when: string, cause?: unknown): Error => Object.assign(
         unavailable(`Request ${expired() ? 'deadline passed' : 'cancelled'} ${when}`, retryAfterS),
         { cause: cause ?? opts.signal?.reason },
       );
 
-      if (opts.signal?.aborted || expired()) throw cancelled('before it ran');
+      if (opts.signal?.aborted || remainingMs <= 0) throw cancelled('before it ran');
       const signals = opts.signal ? [opts.signal] : [];
 
-      if (deadlineAt !== undefined) signals.push(AbortSignal.timeout(deadlineAt - Date.now()));
+      if (remainingMs !== Infinity) signals.push(AbortSignal.timeout(remainingMs));
       const signal = AbortSignal.any(signals);
 
       if (active >= maxActive) {
@@ -114,7 +116,10 @@ export function withDeadline<T, U>(
   if (parent?.aborted) cancel();
   else parent?.addEventListener('abort', cancel, { once: true });
 
-  return Promise.race([work(signal), cut.promise]).finally(() => {
+  // The executor turns a synchronous throw into a rejection, so the cleanup below always runs.
+  const running = new Promise<T>((resolve) => resolve(work(signal)));
+
+  return Promise.race([running, cut.promise]).finally(() => {
     clearTimeout(timer);
     parent?.removeEventListener('abort', cancel);
   });

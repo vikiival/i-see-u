@@ -43,7 +43,7 @@ export async function nativeHypersyncClient(url: string, apiToken: string, timeo
 export const wireLog = (log: Log): WireLog => {
   const topics = [...log.topics];
 
-  while (topics.at(-1) == null) topics.pop();
+  while (topics.length > 0 && topics.at(-1) == null) topics.pop();
 
   return {
     address: log.address,

@@ -157,13 +157,21 @@ export function createApp(deps: RouteDeps, opts: { requestLog?: boolean } = {}):
     if (hit) return hit;
 
     // Shared by every request polling this block, so it stops at its own deadline rather than any one request's.
-    const promise = deps.requestRpc.limiter.run(
-      (signal) => adapter.erc721Owners(items, blockHash, signal),
-      { deadlineAt: Date.now() + deps.requestRpc.deadlineMs },
-    );
+    const promise = deps.requestRpc.limiter.run(async (signal) => {
+      try {
+        return await adapter.erc721Owners(items, blockHash, signal);
+      } catch (error) {
+        // Outage, auth or rate limit: a 503 like balance reads, never a 500.
+        throw rpcErrorOf(error) ? Object.assign(unavailable('Ownership RPC unavailable', 5), { cause: error }) : error;
+      }
+    }, { deadlineAt: Date.now() + deps.requestRpc.deadlineMs });
+
+    const evict = (): void => { if (ownerCache.get(key) === promise) ownerCache.delete(key); };
 
     ownerCache.set(key, promise);
-    promise.catch(() => { if (ownerCache.get(key) === promise) ownerCache.delete(key); });
+
+    // Keep the single flight, but cache only final answers: a transient per-item error is retried by the next request.
+    promise.then((owners) => { if (owners.some((owner) => owner.status === 'error' && owner.transient)) evict(); }, evict);
 
     // Evict oldest first (Map iterates in insertion order; deleting while iterating is safe).
     for (const oldest of ownerCache.keys()) {

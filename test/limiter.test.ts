@@ -115,3 +115,36 @@ test('withDeadline aborts the work when the parent signal does', async () => {
   await expect(pending).rejects.toMatchObject({ statusCode: 503, message: 'Request cancelled', cause: expect.objectContaining({ message: 'client went away' }) });
   expect(seen?.aborted).toBe(true);
 });
+
+test('a deadline that passes between clock reads still runs the job instead of throwing a RangeError', async () => {
+  // The expiry check sees 1 ms left; any later read is already past the deadline.
+  vi.spyOn(Date, 'now').mockReturnValueOnce(999).mockReturnValue(1_001);
+  const limiter = createLimiter(1, 1);
+
+  try {
+    expect(await limiter.run(async () => 'ran', { deadlineAt: 1_000 })).toBe('ran');
+  } finally { vi.restoreAllMocks(); }
+});
+
+test('withDeadline turns a synchronous throw into a rejection and clears its timer', async () => {
+  vi.useFakeTimers();
+
+  try {
+    const pending = withDeadline(() => { throw new Error('sync'); }, 60_000, () => 'timeout');
+    await expect(pending).rejects.toThrow('sync');
+    expect(vi.getTimerCount()).toBe(0);
+  } finally { vi.useRealTimers(); }
+});
+
+test('withDeadline with an already aborted parent rejects at once and hands the work an aborted signal', async () => {
+  let seen: AbortSignal | undefined;
+
+  const pending = withDeadline((signal) => {
+    seen = signal;
+
+    return new Promise<string>(() => {});
+  }, 60_000, () => 'timeout', AbortSignal.abort());
+
+  await expect(pending).rejects.toMatchObject({ statusCode: 503, message: 'Request cancelled' });
+  expect(seen?.aborted).toBe(true);
+});

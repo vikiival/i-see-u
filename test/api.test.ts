@@ -2,6 +2,8 @@ import { expect, test } from 'vitest';
 
 import { createApp } from '../src/api/routes.ts';
 import { createLimiter } from '../src/core/limiter.ts';
+import type { OwnerResult } from '../src/core/types.ts';
+import { RpcError } from '../src/rpc/errors.ts';
 import { address, blockHash, FakeChain, gate } from './fake-chain.ts';
 import { blockRange, headersFor, stack } from './stack.ts';
 
@@ -178,4 +180,58 @@ test('on-request RPC deadlines release the HTTP request while bounded work finis
     pause.release();
     await s.balances.forAccount(account, [{ token, lastBlock: 100n }], await s.adapter.headerByNumber(100n), 0n);
   } finally { pause.release(); await s.close(); }
+});
+
+/** An ERC-721 stack whose ownership sweep is `owners`, served by its own app. */
+async function ownershipFixture(owners: () => Promise<OwnerResult[]>) {
+  const chain = new FakeChain(102n);
+  chain.addTransfer({ token, standard: 'erc721', from: peer, to: account, value: 7n, blockNumber: 100n });
+  const s = await stack(chain);
+
+  const app = createApp({
+    discovery: s.discovery, adapters: { ethereum: { ...s.adapter, erc721Owners: owners } }, balances: { ethereum: s.balances },
+    followers: { ethereum: s.follower }, requestRpc: { limiter: createLimiter(2, 2), deadlineMs: 1000 }, rpcStats: () => chain.rpc.stats(), startedAt: 0,
+  });
+
+  await s.follower.tick();
+
+  return { s, app };
+}
+
+test('an ownership RPC failure, even a fatal one such as HTTP 401, is a 503 and is not cached', async () => {
+  let calls = 0;
+
+  const { s, app } = await ownershipFixture(async () => {
+    calls += 1;
+
+    throw new RpcError('fatal', 'HTTP 401');
+  });
+
+  try {
+    const response = await app.request(`${path}/erc721?verifyOwnership=true`);
+    expect(response.status).toBe(503);
+    expect(response.headers.get('retry-after')).toBe('5');
+    expect(await response.json()).toEqual({ error: 'Ownership RPC unavailable' });
+    await app.request(`${path}/erc721?verifyOwnership=true`);
+    expect(calls).toBe(2);
+  } finally { await s.close(); }
+});
+
+test('a transient per-item ownership error is retried by the next request at the same block', async () => {
+  const answers: OwnerResult[][] = [
+    [{ status: 'error', error: 'HTTP 503', transient: true }],
+    [{ status: 'ok', owner: account }],
+  ];
+
+  let calls = 0;
+  const { s, app } = await ownershipFixture(async () => answers[Math.min(calls++, answers.length - 1)]);
+  const tokensOf = async () => (await (await app.request(`${path}/erc721?verifyOwnership=true`)).json()).collections[0].tokens;
+
+  try {
+    expect(await tokensOf()).toEqual([expect.objectContaining({ ownerStatus: 'error' })]);
+    expect(await tokensOf()).toEqual([expect.objectContaining({ ownerStatus: 'ok', owner: account })]);
+    // The final answer is cached.
+    await tokensOf();
+    expect(calls).toBe(2);
+  } finally { await s.close(); }
 });

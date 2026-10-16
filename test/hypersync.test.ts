@@ -15,7 +15,7 @@ import type {
   RpcStats,
 } from '../src/core/types.ts';
 import { withFallback } from '../src/sources/fallback.ts';
-import { createHypersyncLogSource } from '../src/sources/hypersync.ts';
+import { createHypersyncLogSource, wireLog } from '../src/sources/hypersync.ts';
 import type { HypersyncFactoryResult } from '../src/sources/hypersync.ts';
 import type { HypersyncPager } from '../src/sources/hypersync-pages.ts';
 import { createRpcLogSource } from '../src/sources/rpc-logs.ts';
@@ -285,4 +285,10 @@ test('a mid-range failure exposes no aggregate and a retry returns the complete 
   } finally {
     await source.close?.();
   }
+});
+
+test('wireLog trims trailing null topics and stops on an empty or all-null topic list', () => {
+  expect(wireLog({ topics: [TRANSFER_TOPIC, null, undefined] }).topics).toEqual([TRANSFER_TOPIC]);
+  expect(wireLog({ topics: [] }).topics).toEqual([]);
+  expect(wireLog({ topics: [null, undefined] }).topics).toEqual([]);
 });
