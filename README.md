@@ -18,9 +18,9 @@ npm test                              # real migrations on PGlite; no network or
 npm run lint
 ```
 
-**Global bootstrap is pending.** A fresh database intentionally returns **503 `not_ready`**, including `/health`. Startup never creates a cursor at the head and pretends earlier history exists. The future bootstrap initializes the index and fills contiguous ranges through the same store API as the follower. The follower can resume an initialized index, with bounded catch-up work each tick.
+**A fresh database is not ready until the bootstrap has run.** `/health` and account reads return **503 `not_ready`** (with bootstrap progress in `/health`) until `npm run bootstrap` (or `BOOTSTRAP_ON_START=true`) has loaded every Transfer from the start block to a pinned finalized block and published the index. Startup never creates a cursor at the head. The follower and tail then continue from that block. See [Bootstrap](#bootstrap).
 
-The migration directory is a **fresh baseline for an empty PoC database**, not an upgrade of the old aggregate-only database. Use a new database/schema when moving from that version; preserve an old database separately if needed. After schema changes run `npm run db:generate`. Generated SQL is not hand-edited. `0001_balance_revision` adds the snapshot repair revision; `0002_tail_journal` adds `tail_blocks`/`tail_transfers`. `npm run db:migrate` applies migrations without starting the server.
+The migration directory is a **fresh baseline for an empty PoC database**, not an upgrade of the old aggregate-only database. Use a new database/schema when moving from that version; preserve an old database separately if needed. After schema changes run `npm run db:generate`. Generated SQL is not hand-edited. `0001_balance_revision` adds the snapshot repair revision; `0002_tail_journal` adds `tail_blocks`/`tail_transfers`; `0003_bootstrap` adds the bootstrap staging tables and `0004_bootstrap_unlogged` (custom SQL) makes `bootstrap_transfers` UNLOGGED. `npm run db:migrate` applies migrations without starting the server.
 
 Runtime config loads `.env` with Node; already exported environment variables take precedence. The old `.env.example` may contain obsolete backfill/worker knobs; these no longer configure runtime behavior.
 
@@ -42,6 +42,32 @@ Discovery responses identify `blockHeight`, `blockHash`, `blockTimestamp`, `fina
 History merges two bounded indexed scans per table (finalized `transfers`, and with latest `tail_transfers` above the cursor), excludes the duplicate side of self-transfers, and never uses OFFSET. Tail rows carry `unfinalized: true`. `next: null` means the end. A cursor carries the original `throughBlock` bound and repair revision; appends do not introduce new rows into later pages. Responses expose `throughBlock` separately from the served block. A repair/rebuild invalidates old cursors with **409**; so does a latest cursor whose `throughBlock` is above both the finalized cursor and the current tail tip (or that is continued with `finality=finalized`). A reorg between pages can change unfinalized rows of a later page; restart from the first page after a `tailError` or reorg if exactness matters.
 
 Readiness is shared by every replica: a recent finalized-head observation must exist, the contiguous cursor must have reached it, and no repair may be pending. Incomplete, stale or suspect indexes return **503 `{ status: "not_ready", error }`** with `Retry-After`; there is no 202. The tail never makes the service not ready; it only degrades latest to finalized. Other errors: 400 invalid input (including `finality` other than `latest`/`finalized`), 404 unknown network, 503 RPC/queue/deadline/database acquisition failures.
+
+## Bootstrap
+
+```sh
+docker compose up -d --wait postgres
+START_BLOCK=26198554 npm run bootstrap   # optional override; default 25,933,634
+npm start                                # follower continues at B + 1, tail serves the tip
+```
+
+`npm run bootstrap` (`src/bootstrap/`) is a one-time, resumable load of every ERC-20/721 `Transfer` in **[S, B]**: S is `START_BLOCK` (a plain block number; default is the registry's 25,933,634), B is the finalized block read once when the run is created and persisted in `bootstrap_runs`. B never moves during a run. After any failure or kill, rerun the same command: it resumes. After success, a rerun is a no-op. `BOOTSTRAP_ON_START=true` runs the same loader inside `npm start` while the service stays `not_ready`. A session advisory lock allows one loader per network.
+
+1. **Headers.** The chain S-1..B (anchor S-1 from RPC) is staged in `bootstrap_headers` in 5,000-block chunks from HyperSync (`includeAllBlocks`, about 1 request per chunk). Each chunk must be contiguous, link its parent hashes, join the previous chunk, and (the last one) end at B's hash. A chunk that fails is refetched from RPC (one `eth_getBlockByNumber` per block). Each header keeps whether its `logsBloom` may contain the Transfer topic.
+2. **Segments** of 1,000 blocks (`bootstrap_segments`) are the unit of commit, retry and resume. One HyperSync worker takes segments from the low end; `BOOTSTRAP_RPC_WORKERS` Quicknode workers take them from the high end with unfiltered topic0 `eth_getLogs` over 100-block calls. A 500-block call reached about 370 MB of JSON. The existing split-on-too-large/timeout still applies. Each segment runs in one transaction. Verified pages stream into the UNLOGGED, index-free `bootstrap_transfers`, and the segment is marked done in the same commit. A crash leaves neither rows nor the done marker. Verification checks three things. Every log's block hash must match the staged header. `(block, logIndex)` must strictly increase. A block with no decoded Transfer whose bloom may contain the topic is asked again on the other source (`eth_getLogs({blockHash})` or a one-block HyperSync query). Any failure or source error refetches the whole segment from the other source. A segment that fails on both stays pending; the run then exits non-zero after loading everything else.
+3. **Finalize** is one transaction. It checks that every segment is done, the staged chain is complete and linked from S-1 to the pinned hash of B, and staged row count equals the sum of segment counts. It also checks that `ingestion_state` and `transfers` are empty for the network. It drops the five secondary indexes and inserts `transfers` (the primary key rejects duplicates) and `block_headers`. It builds `holdings` and `nft_ownership` with the follower's own SQL in one set-based pass. It recreates the indexes (`BOOTSTRAP_MAINTENANCE_WORK_MEM`), sets `ingestion_state` (cursor and observed head = B), and empties staging. `VACUUM (ANALYZE)` follows. The follower's next tick appends B+1 onward with its usual parent-hash check against B.
+
+**Sources.** HyperSync is optional (`HYPERSYNC_API_KEY`). Without it the bootstrap is RPC-only and pays one call per header. The free tier allows **15 requests/min**, and responses are truncated at about 28k-150k logs. HyperSync is therefore paged with `getWithRateLimit` (`src/sources/hypersync-pages.ts`). On a 429 the pager sleeps for `resetSecs`, and it uses a per-request idle timeout (`HYPERSYNC_TIMEOUT_MS`). A request that times out is abandoned, not awaited. At most 2 requests are in flight. `stream()` and `collect()` are not used. With the client's default stream settings, many small requests burned the quota and then waited silently in `recv()`; that was the old "hang". `stream.close()` blocks while rate-limited, and `StreamConfig.maxNumLogs` ends a stream early as if it were complete. The `scripts/compare-sources.ts` diagnostic source (`src/sources/hypersync.ts`) uses the same pager. Bulk decoding uses a hand-written decoder for the canonical log shape, about 550k logs/s versus 38k/s for viem. Every other shape falls back to viem, and a fuzz test asserts that the two always agree.
+
+**Progress.** The loader logs every 10 s: headers, segments done/total, logs, logs/s and ETA since the last (re)start. `/health` shows the same from the database under `bootstrap` (any process can run the loader) and stays `not_ready` until finalize commits.
+
+**`START_BLOCK`.** A stored index or bootstrap run with a different start block makes both `npm start` and `npm run bootstrap` fail with `START_BLOCK is X but the … starts at Y; a different start block needs a fresh database`. To change S, use a new database.
+
+**Measured (live smoke, 2026-10-15).** `START_BLOCK=26198554` gives 2,001 blocks to B = 26,200,554. That is 876,614 Transfers (436k from HyperSync in 7 requests including headers, 440k from Quicknode in 11 calls), 386,664 holdings rows and 15,028 NFTs. The run took **33 s**: 24 s loading (about 36k logs/s combined) and about 9 s finalize plus analyze. `transfers` with indexes is about 340 B/row. 15 Quicknode calls in total. `npm start` was then `ready` at once. The tail caught up from B to the tip (about 80 blocks: 1 header call per block plus 1-2 range `getLogs`), and latest served the tip.
+
+**Projected** (from the measurements above and in the design: HyperSync quota-bound at about 21k logs/s, four RPC workers at about 20k logs/s, finalize at roughly 0.15M rows/s). **100k blocks** (53.8M logs): about 22-25 min loading plus about 6-10 min finalize, so about 30-35 min, about 500-550 Quicknode calls (about 11k credits) and about 20 HyperSync header requests. **Full window from 25,933,634** (about 266k blocks, about 128M logs, estimated): about 55 min loading plus 15-25 min finalize, so about 1.2-1.5 h and about 1,300 calls (about 27k credits). Disk is about 40 GB for `transfers` with indexes plus up to about 19 GB of transient staging. The follower's catch-up after the handover is 1-2 ranges.
+
+**Limits.** The two-source check covers suspicious zero-log blocks, not a full second fetch. A source that drops some (not all) logs of a block whose other logs it returns is not detected. A PostgreSQL crash truncates the UNLOGGED staging table; the next run detects that and reloads every segment. A deep header inconsistency between two stored chunks fails finalize with a message, without automatic repair. Memory is bounded by one page per worker: a 100-block RPC response or one HyperSync page.
 
 ## Balances (`balances=true`)
 
@@ -81,7 +107,7 @@ The durable index stays finalized-only (~13 min behind the tip). Liveness comes 
 
 ## Ingestion and repair
 
-1. Bootstrap calls `initialize(network, startBlock, anchorHeader, at)` with the header at `startBlock - 1`, then `observeHead(network, finalizedHead, at)`.
+1. The bootstrap (above) publishes [S, B] and `ingestion_state` at B in one transaction; `initialize(network, startBlock, anchorHeader, at)` with the header at `startBlock - 1` remains for small and test setups.
 2. `appendRange(network, range, headers, transfers, at)` receives all headers, including empty blocks, and all decoded transfers. It checks range coverage, parent linkage and log hashes, locks the network cursor and atomically commits raw rows, derived rows and progress. A fully committed replay is a no-op; corrections require replacement.
 3. The finalized follower holds a per-network session advisory lock, fetches complete header chains with bounded concurrency, then unfiltered `getLogs`. It has no account set. Each range uses the same append API; cursor locking also protects against competing writers.
 4. Gaps/hash disagreements enter `repair_queue`. An alternate-source repair runner (pending) refetches the suspect range and calls `replaceRange`. The transaction checks both neighbors, remembers old and new participants, replaces raw rows/headers, rebuilds touched accounts from their complete retained histories, and restores the latest owner for touched NFTs. It invalidates affected caches and increments the repair revision. Fully covered queue entries are removed only with a successful replacement/append.
@@ -95,6 +121,12 @@ All database conversions are in `src/store/columns.ts` plus the name-to-ID regis
 |---|---|---|
 | `RPC_URL`, `RPC_FALLBACK_URLS` | required, empty | Primary and comma-separated fallback RPC endpoints |
 | `DATABASE_URL` | local `iseeu` PostgreSQL database | Connection string |
+| `START_BLOCK` | 25933634 | Network start block S (plain number); must match the stored index or bootstrap run |
+| `BOOTSTRAP_ON_START` | false | Run the bootstrap inside `npm start` when the index is missing |
+| `BOOTSTRAP_RPC_WORKERS`, `BOOTSTRAP_RPC_LOG_RANGE`, `BOOTSTRAP_RPC_TIMEOUT_MS` | 4, 100, 60000 | Quicknode segment workers, blocks per `eth_getLogs`, bulk call timeout |
+| `BOOTSTRAP_SEGMENT_BLOCKS`, `BOOTSTRAP_HEADER_CHUNK_BLOCKS` | 1000, 5000 | Segment (commit/resume unit) and header-request sizes |
+| `BOOTSTRAP_MAINTENANCE_WORK_MEM` | 1GB | `maintenance_work_mem` for the finalize index builds |
+| `HYPERSYNC_API_KEY`, `HYPERSYNC_URL`, `HYPERSYNC_TIMEOUT_MS` | unset, `https://eth.hypersync.xyz`, 120000 | Optional bootstrap source; per-request idle timeout |
 | `PORT` | 3000 | HTTP port |
 | `RPC_TIMEOUT_MS`, `RPC_MAX_ATTEMPTS`, `RPC_MAX_RPS` | 15000, 6, 20 | Timeout, retry budget, shared outgoing rate cap |
 | `ETH_FOLLOWER_MAX_RANGE` | 500 (maximum 1000) | Unfiltered log range; large responses require bounded memory |
@@ -117,7 +149,7 @@ All database conversions are in `src/store/columns.ts` plus the name-to-ID regis
 | `MAX_VERIFY_OWNERSHIP_ITEMS` | 2000 | Cap on optional ownership verification |
 | `DB_POOL_MAX`, `DB_CONNECT_TIMEOUT_MS` | 20, 5000 | Pool size and acquisition timeout; one connection per follower leader lock |
 
-The standalone `scripts/compare-sources.ts` and `src/sources/` remain diagnostic tools for RPC/HyperSync comparison. They are not wired into discovery or ingestion, and their account aggregates cannot populate the raw global index. Their vendor-related variables apply only to that diagnostic.
+`scripts/compare-sources.ts` with `src/sources/hypersync.ts`, `rpc-logs.ts` and `fallback.ts` remains a per-account RPC/HyperSync comparison diagnostic, not wired into discovery or ingestion. The bootstrap has its own global sources in `src/bootstrap/sources.ts` and shares the HyperSync pager.
 
 ## Limits
 
@@ -125,4 +157,4 @@ Only standard three-topic ERC-20 and four-topic ERC-721 Transfer logs are includ
 
 RPC retains bounded retries, rate limiting, endpoint breakers/failover, unsupported-method memory, result validation and split-on-size/timeout log queries. A linked header chain detects fork/gap inconsistencies, **not silently omitted logs**. Alternate-source comparison and queue processing remain operational work.
 
-Latest data is unfinalized: rows above `finalizedBlockHeight` and balances read at the tip can be reorged out (the tail repairs itself within one slot; deep reorgs degrade to finalized). History pages are not reorg-stable across the tail. The tail stores every Transfer of up to `TAIL_MAX_AHEAD_BLOCKS` blocks (normally 64–96 blocks, roughly 100k rows; a stalled finality grows this toward ~1M rows). Each latest request adds one indexed `tail_transfers` lookup. Full-window bootstrap throughput, 180M-row query plans, vacuum/WAL behavior and one-million-account load have not been benchmarked. Large repairs serialize that network's writer and may scan substantial account history. See the report's partitioning tradeoff before the full bootstrap.
+Latest data is unfinalized: rows above `finalizedBlockHeight` and balances read at the tip can be reorged out (the tail repairs itself within one slot; deep reorgs degrade to finalized). History pages are not reorg-stable across the tail. The tail stores every Transfer of up to `TAIL_MAX_AHEAD_BLOCKS` blocks (normally 64–96 blocks, roughly 100k rows; a stalled finality grows this toward ~1M rows). Each latest request adds one indexed `tail_transfers` lookup. Full-window bootstrap throughput (projected above, measured only on 2,001 blocks), 180M-row query plans, vacuum/WAL behavior and one-million-account load have not been benchmarked. Large repairs serialize that network's writer and may scan substantial account history. See the report's partitioning tradeoff before the full bootstrap.
