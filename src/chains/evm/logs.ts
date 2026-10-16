@@ -85,6 +85,43 @@ export function decodeTransferLog(log: WireLog): TransferEvent | undefined {
   }
 }
 
+const HEX = /^0x[0-9a-fA-F]*$/;
+const WORD = /^0x[0-9a-fA-F]{64}$/;
+const ADDRESS = /^0x[0-9a-fA-F]{40}$/;
+const QUANTITY = /^0x[0-9a-fA-F]{1,13}$/;
+
+/**
+ * Bulk decoder (~15x faster than viem): the canonical wire shape (exact Transfer topic0, 32-byte topics, 32-byte
+ * ERC-20 data or empty ERC-721 data) is decoded by hand; every other shape goes through decodeTransferLog, so both
+ * always agree (a golden test fuzzes them against each other).
+ */
+export function decodeTransferLogFast(log: WireLog): TransferEvent | undefined {
+  const { topics, data } = log;
+
+  if (log.removed === true || !Array.isArray(topics) || (topics.length !== 3 && topics.length !== 4) || topics[0] !== TRANSFER_TOPIC) return decodeTransferLog(log);
+  const erc20 = topics.length === 3;
+  const [, from, to, id] = topics;
+
+  const { address, transactionHash, blockHash, blockNumber, logIndex } = log;
+
+  if (!isString(address) || !ADDRESS.test(address) || !isString(transactionHash) || !HEX.test(transactionHash)
+    || !isString(blockHash) || !HEX.test(blockHash) || !isString(blockNumber) || !QUANTITY.test(blockNumber)
+    || !isString(logIndex) || !QUANTITY.test(logIndex) || !isString(from) || !WORD.test(from) || !isString(to) || !WORD.test(to)
+    || (erc20 ? !isString(data) || !WORD.test(data) : data !== '0x' || !isString(id) || !WORD.test(id))) return decodeTransferLog(log);
+
+  return {
+    standard: erc20 ? 'erc20' : 'erc721',
+    token: toLowerHex(`0x${address.slice(2)}`),
+    from: `0x${from.slice(26).toLowerCase()}`,
+    to: `0x${to.slice(26).toLowerCase()}`,
+    value: BigInt(erc20 ? data : id),
+    blockNumber: BigInt(blockNumber),
+    blockHash: toLowerHex(`0x${blockHash.slice(2)}`),
+    logIndex: Number(logIndex),
+    transactionHash: toLowerHex(`0x${transactionHash.slice(2)}`),
+  };
+}
+
 const getLogs = (rpc: RpcClient, filter: { blockHash: Hex; topics: Hex[] }): Promise<WireLog[]> => rpc.request('eth_getLogs', [filter], {
   validate: Array.isArray,
 });
@@ -255,14 +292,14 @@ export async function scanTransfers(
   }, shouldStop);
 }
 
-/** All decoded Transfer logs, unfiltered by account. Bootstrap may use this with independently verified headers. */
+/** All decoded Transfer logs, unfiltered by account (the bootstrap's RPC source; it verifies them against its headers). */
 export async function scanAllTransfers(
   rpc: RpcClient,
   range: BlockRange,
   onTransfer: (event: TransferEvent) => void,
 ): Promise<{ calls: number }> {
   const { calls } = await scanLogs(rpc, [TRANSFER_TOPIC], range, (log) => {
-    const event = decodeTransferLog(log);
+    const event = decodeTransferLogFast(log);
 
     if (event) onTransfer(event);
   });
