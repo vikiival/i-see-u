@@ -24,7 +24,7 @@ Times are local (CEST). "We" is Viktor plus AI agents: a Claude orchestrator han
 | 23:50–01:15 | `/improve` audit and fixes (branch `feat/improve`) | Three parallel audits (Codex sol, 2× Opus), 5 fix plans run by Sonnet, sol and Opus in isolated worktrees, each reviewed. 115 tests; live run passed every check |
 | 11:00–13:30 | Budget: change-driven balance refresh (plan 006) | Opus built levers 1+3, 1 revision (orphaned snapshots on non-leaders). Balance sweep ~43M → ~1.6–6M credits/month; total ≈53M → ≈12–17M (estimates). 130 tests |
 | evening | SQD squid-sdk RPC source, revisited (`../disquid`) | Sonnet, source-level. Not adopted. Full blocks and unfiltered `getLogs` are hardcoded; a patch to three packages would reach our call count. Kept as a speculative spike in `../disquid` |
-| 2026-10-16 | Cancellation, Codex review and fixes | Effect not adopted; plain `AbortSignal` makes abandoned request-path work stop. Codex gpt-6-sol review: 6 of 8 findings fixed, 2 kept by design. 164 tests |
+| 2026-10-16 | Cancellation, Codex review and fixes | Effect not adopted; plain `AbortSignal` makes abandoned request-path work stop. Two Codex gpt-6-sol reviews: 6 of 8 and then 5 of 5 findings addressed, 2 kept by design. 166 tests |
 
 ---
 
@@ -513,7 +513,17 @@ Cold backfill is unchanged: about 172 calls per new account, one-off.
 | Partial multicall success hides a 401/429 in one chunk | Not changed | Plan 004's intended partial-result semantics |
 | Ownership sweep ignores client disconnects | Not changed | Deliberate: shared sweep, bounded by its deadline |
 
-**Tests:** 147 → **164**. New coverage shows aborted work makes no further RPC attempts (limiter, RpcClient, log scans), that a shared balance batch is aborted only by its last waiter, and each review fix. Under file parallelism, `npm test` sometimes hits Vitest's 5 s timeout on PGlite-heavy files; HEAD before these changes did the same (plan 007). Serial runs pass.
+**Second review (Codex gpt-6-sol, read-only, on the four commits `77e3925..fa26745`).** It again found no unhandled rejection, listener leak or deadline→500 mapping. All 5 findings were confirmed and addressed in `5212360`:
+
+| Finding | Fix |
+|---|---|
+| **High:** when one of a request's balance batches failed, the request still counted as waiting on its other batches, so they kept spending RPC credits after the 503. This gap came from the first commit | `withDeadline` also aborts the work when it rejects; a test fails one batch and asserts its sibling is aborted (verified to fail without the fix) |
+| README claimed an abandoned batch saves nothing; a `saveBalances` already in progress still commits | Kept the behaviour (the read is paid for and exact at its block) and corrected the README |
+| The shared-batch test used different accounts, so joining an in-flight read for the same pair was untested | New test: two requests for one pair share one read until both leave |
+| The route deadline test passed without cancellation (`FakeChain` ignored the signal) and its name described the old behaviour | `FakeChain` records `eth_call` signals; the renamed test asserts the in-flight Multicall is aborted |
+| REPORT said every ownership RPC failure is a 503; a sweep where only some chunks fail still returns per-item errors | Reworded: a failed sweep is the 503 |
+
+**Tests:** 147 → **166**. New coverage shows aborted work makes no further RPC attempts (limiter, RpcClient, log scans, and the balance route end to end), that a shared balance batch is aborted only by its last waiter, and each review fix. Under file parallelism, `npm test` sometimes hits Vitest's 5 s timeout on PGlite-heavy files; HEAD before these changes did the same (plan 007). Serial runs pass.
 
 ---
 
