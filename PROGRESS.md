@@ -25,6 +25,7 @@ Times are local (CEST). "We" is Viktor plus AI agents: a Claude orchestrator han
 | 11:00–13:30 | Budget: change-driven balance refresh (plan 006) | Opus built levers 1+3, 1 revision (orphaned snapshots on non-leaders). Balance sweep ~43M → ~1.6–6M credits/month; total ≈53M → ≈12–17M (estimates). 130 tests |
 | evening | SQD squid-sdk RPC source, revisited (`../disquid`) | Sonnet, source-level. Not adopted. Full blocks and unfiltered `getLogs` are hardcoded; a patch to three packages would reach our call count. Kept as a speculative spike in `../disquid` |
 | 2026-10-16 | Cancellation, Codex review and fixes | Effect not adopted; plain `AbortSignal` makes abandoned request-path work stop. Two Codex gpt-6-sol reviews: 6 of 8 and then 5 of 5 findings addressed, 2 kept by design. 166 tests |
+| 2026-10-16 to 18 | Subsquid reimplementation (`../disquid`), measured live | Claude orchestrator with Opus and Sonnet subagents; Viktor added ERC-721. RPC-only `EvmRpcDataSourceBuilder` plus our RPC layer: 103.6k blocks in 3 h for 1.02 calls/block, 18.2k calls/day at the head, 8 live reorgs handled, 0 parity mismatches against i-see-u, about 3k req/s per API process ([BENCHMARK.md](BENCHMARK.md)) |
 
 ---
 
@@ -525,6 +526,47 @@ Cold backfill is unchanged: about 172 calls per new account, one-off.
 
 **Tests:** 147 → **166**. New coverage shows aborted work makes no further RPC attempts (limiter, RpcClient, log scans, and the balance route end to end), that a shared balance batch is aborted only by its last waiter, and each review fix. Under file parallelism, `npm test` sometimes hits Vitest's 5 s timeout on PGlite-heavy files; HEAD before these changes did the same (plan 007). Serial runs pass.
 
+
+## 18. Subsquid reimplementation, measured live (`../disquid`, 2026-10-16 to 18)
+
+**Trigger.** §16 rejected the SQD RPC source on paper. Viktor knows squid well and wanted the assignment re-implemented on the latest SDK (`@subsquid/squid-sdk` 0.6.2, the newest release): `EvmRpcDataSourceBuilder`, RPC only, no Portal, start block 26,104,555 for simplicity, GraphQL from squid, and a schema ready for ERC-721/1155. A Claude orchestrator wrote the design (`../disquid/DESIGN.md`, the schema) and split the work among parallel subagents on disjoint files:
+
+| Piece | Agent | Result |
+|---|---|---|
+| SDK survey | Opus, read-only | Confirmed §16's three cost issues. Found two more: `retryAttempts` is 0 and there is no request timeout, so one 429 exits the processor; and **a head reorg crashes the processor**, because `ForkException` carries one ref and `findRollbackIndex` returns -1 ("Unable to process fork") |
+| Processor and standards | Sonnet | A decoder registry with several decoders per topic0. A fold into one `AccountToken` row per (account, token, standard). `Block` headers kept for canonicality checks |
+| RPC layer (`src/source`) | Opus | `DiscoveryRpcSourceBuilder extends EvmRpcDataSourceBuilder`. Header-only blocks, topic0 pushdown with range splitting, block-hash membership check with refetch by hash, retries and timeouts, slot-aligned head polling, cached finalized head, and fork ancestry rebuilt by parent hash. No `node_modules` patch |
+| GraphQL API | Opus | `tokenDiscovery` reads the rows and the head block (height, hash, time) in one snapshot, with keyset pagination. Balances: Multicall3 pinned to the block hash, coalesced across requests, change-driven LRU cache |
+| Token metadata | Sonnet | name/symbol/decimals in one Multicall3 per 50 new tokens, `bytes32` symbols decoded, PENDING tokens retried and swept |
+| ERC-721 | Viktor | `NftItem` keeps the current owner per item (last `to` wins) |
+| Reviews | Opus (code), Codex gpt-6-luna (architecture) | Code: no critical defects; open items are balance-cache honesty, gas starvation in shared Multicalls, a lagging balance node and a 20 ms coalescing window that is too short. Architecture: keep the global index, fix serving, storage and spam |
+
+**Viktor: "run it first, optimize after".** The orchestrator had queued the RPC optimisation before the first live run. The processor was started on the **stock** builder instead, and it worked end to end with 0 parity mismatches over 2k blocks. It also showed that **database writes, not RPC, limited catch-up** (8–12 blocks/s, with the handler no faster than the stream). The optimised source swapped in with a one-line change and resumed from the database at 14–15 blocks/s.
+
+**Zero-value Transfers.** Measured on our raw data: they make up 8.4% of pairs and 12.6% of accounts, so they are skipped at ingest. Most spam is fake tokens moving non-zero amounts, so a verified-token list is still needed. With metadata, a fake "USDT" now displays `USDT`.
+
+**Re-index with every change (Sonnet).** 103,617 blocks in 2 h 59 min:
+- 106,084 RPC calls, about 2.1M credits.
+- 0 mismatches for ERC-20, ERC-721 pairs and NFT owners.
+
+It then followed the head for 34.6 h:
+- 18.2k calls/day.
+- **8 real reorgs**, each 1 block deep, all rolled back. This is the first live reorg evidence for either implementation.
+- A DNS outage of the RPC host, retried without a crash.
+
+The detached processes were later killed with the agent session that started them. They resumed from the database on restart.
+
+**API load (localhost, one process).** About 3,000 req/s, with p50 3.2 ms and p99 5.9 ms at 10 connections. With balances and every pair a cache miss, 44 req/s at p50 104 ms. The assignment's 5k users per minute is about 83 req/s.
+
+**Scale discussion.** A million users in total means discovery cannot be per-account on demand: one global index of all Transfers is the long-term design, and its cost does not grow with the number of users. At 15 GB per 114.6k blocks, storage is the next limit. About 550 B/row (string ids, three indexes) compares with i-see-u's 240 B/row. Open items:
+- multi-RPC failover via `EvmFallbackDataSourceBuilder` with custom sources;
+- a verified/spam tier;
+- a balance cache shared in Postgres;
+- a single-statement API query with a `sinceBlock` not-modified answer;
+- locking down the generated CRUD.
+
+All numbers, method and caveats: [BENCHMARK.md](BENCHMARK.md).
+
 ---
 
 ## Mistakes and reversals (the interesting part)
@@ -545,6 +587,9 @@ Cold backfill is unchanged: about 172 calls per new account, one-off.
 | A 46 s cold request in Viktor's own test | Contention with a parallel benchmark on the same endpoint, plus a wrong test address. Re-measured at 3.3 s |
 | Plan 005 dropped expired *queued* jobs, but work already running past its deadline kept going | Running attempts, retries and backoff kept spending credits. `AbortSignal` cancellation now stops them (§17) |
 | Parallel test timeouts after the cancellation change looked like a regression | The unchanged baseline failed the same way on one run in two; it is PGlite load (plan 007), not the change |
+| The orchestrator queued the RPC optimisation before any live run (disquid) | Viktor: run first. The stock run showed database writes, not RPC, limited catch-up |
+| Expected the zero-value skip to remove most spam | Measured 8.4% of pairs. Fake tokens with non-zero amounts dominate, so a verified list is needed |
+| Detached `nohup` processes started by a subagent | Killed with that agent's session after 34.6 h. Long runs belong to a supervisor or the main session |
 
 ---
 
@@ -570,7 +615,7 @@ Cold backfill is unchanged: about 172 calls per new account, one-off.
 ## Next
 
 1. **Share the repo** (pushed to github.com/vikiival/i-see-u, private: add Jakub and Tali as collaborators).
-2. **Observe a real reorg live** (about 4–8 per day), or replay one against a fork, to back the tail tests with a real event.
+2. **Observe a real reorg live in i-see-u's tail** (about 4–8 per day). `../disquid` saw 8 in 34.6 h, all 1 block deep (§18), so the rate is confirmed; i-see-u's own tail still lacks a live event.
 3. **Diagnose the HyperSync Binance stream hang (§12)** before turning `LOG_SOURCE=auto` on by default. Also check the Linux napi build.
 4. **Presentation:** the arc above, the chunk-size table, the cost table, and the path from finalized-only to the realtime tail with reorgs.
 5. **Tuning:** raise `RPC_MAX_RPS` toward the plan's 50 (normal cold scan about 3.5 s). Verify credits per call and per batch on the Quicknode dashboard.
