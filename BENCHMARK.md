@@ -12,32 +12,85 @@ The Subsquid reimplementation in `../disquid` was run live against Ethereum main
 | Indexed | ERC-20 and ERC-721 `Transfer` logs, folded into one row per (account, token, standard), plus ERC-721 current owner per item, token metadata and recent block headers. Zero-value ERC-20 Transfers are skipped |
 | RPC layer | `DiscoveryRpcSourceBuilder`, a subclass of `EvmRpcDataSourceBuilder` with the same API. It adds header-only blocks, topic0 pushed into `eth_getLogs` with range splitting, a log-vs-header block-hash check, retries with timeouts, slot-aligned head polling and a reorg fix. Without these changes ("stock") the SDK fetches full blocks and unfiltered logs, polls the head every 100 ms, exits on the first 429, and crashes on the first head reorg |
 
-## Fair comparison: same range, same data (in progress, 2026-10-18/19)
+## Fair comparison: same range, same data (2026-10-18/19)
 
-**Status: partial.** The bootstrap is still running; the API, balance and storage rows will be filled in when it finishes. The earlier i-see-u numbers below come from a different range (from 25,933,634) and a different database, so this section replaces them for any squid-against-i-see-u comparison.
+Both systems index the same blocks from the same start block, 26,104,555. Every figure in this section is measured, unless it is marked *derived*. This section supersedes the earlier squid-against-i-see-u numbers further down, which came from different ranges and databases.
 
 **Method.**
-- **Database:** i-see-u loads into a fresh database (`iseeu_bench`) from the **same start block as the squid, 26,104,555**, using its current bootstrap path. That path writes raw Transfers plus `holdings` and `nft_ownership` per 1,000-block segment, with HyperSync taking segments from the low end and Quicknode workers from the high end, headers from HyperSync.
-- **Pinned end:** finalized B = **26,221,956**, so 117,402 blocks.
-- **Counting:** Quicknode calls go through a counting proxy.
-- **The one data difference:** the squid skips zero-value ERC-20 Transfers and i-see-u does not, about 8% of pairs (§7).
-- **The interruption:** the run stopped at segment 32/118 because the Mac's disk was full, and resumed the next morning from the same pinned B after the old 60 GB `iseeu` database was dropped. The bootstrap is resumable, so no work was repeated.
+- **i-see-u:** loaded into a fresh database (`iseeu_bench`) with its current bootstrap path, pinned at finalized B = **26,221,956**. That is 117,402 blocks: HyperSync for the headers and part of the logs, Quicknode workers with 100-block topic0 `eth_getLogs`, and raw Transfers plus aggregates committed per 1,000-block segment.
+- **Squid:** its index already started at 26,104,555.
+- **Same height:** both were brought to the head (i-see-u's follower and tail, the squid's processor) and tested at about **26,225,700**.
+- **RPC counting:** every Quicknode call went through a counting proxy per process, with a separate one for the squid's balance reads.
+- **Same data:** both databases give the same ERC-20 token counts for the test accounts (average 38.7, max 13,386 against 13,385). The one difference is that the squid skips zero-value ERC-20 Transfers, which leaves it about 7% fewer pairs on this range.
+- **Load method:** the same closed-loop generators as §5, on one M3 Pro, with each system's processor following the head during its tests. i-see-u ran first, then the squid.
+- **Interruptions:** the bootstrap was interrupted twice and resumed both times (it is resumable).
+  - The first stop was a full disk, fixed by dropping the old 60 GB database.
+  - The second was the Mac sleeping for about 72 min; HyperSync hit DNS errors and 4 segments needed a retry pass.
+  - Times below are active time, with sleep gaps taken out of the logs.
 
-**Catch-up on the same range, so far:**
+### Catch-up
 
-| | i-see-u bootstrap (HyperSync + Quicknode) | Squid re-index (RPC only) |
+| | i-see-u bootstrap | Squid re-index (§1) |
 |---|---|---|
-| Headers | 117,403 headers from HyperSync in about **30 s** (2 quota waits of 13 s and 36 s) | 1 `eth_getBlockByNumber` per block |
-| Segments 1–32 (cold indexes) | 32k blocks in about **15.5 min**, about 34 blocks/s, 20.7k logs/s | — |
-| Segments 33–72 (resumed, growing indexes) | 40k blocks in **38.7 min**, about 17 blocks/s, 9.5k logs/s | — |
-| So far | **72k blocks, 42.05M Transfers in 54 min, about 22 blocks/s** | 103,617 blocks in 2 h 59 min, **9.7 blocks/s** |
-| Quicknode calls | **631** so far (283 + 348, almost all 100-block `eth_getLogs`, 0 errors) | 106,084 for 103.6k blocks |
-| Database size | **25 GB at 72k blocks** (raw Transfers plus aggregates); projected about 41–45 GB for 117k blocks (*derived*) | 15 GB at 114.6k blocks (aggregates only) |
+| Blocks | 117,402 (26,104,555–26,221,956) | 103,617 (26,104,555–26,208,172) |
+| Active time | **about 109 min** (three passes: 16 + 87 + 6 min) | **2 h 59 min** |
+| Speed | **about 18 blocks/s**: 34 on cold indexes, falling as `transfers` and `holdings` grew | **9.7 blocks/s** |
+| Quicknode calls | **982**, 0.008 per block (headers from HyperSync, logs in 100-block ranges) | **106,084**, 1.02 per block (RPC only) |
+| Rows written | 65.66M raw Transfers plus 30.1M `holdings` | 28.1M `account_token` (aggregates only) |
+| Afterwards, to the head | 3,667 blocks in about 19 min by the follower (about 3.2 blocks/s). The API answers 503 until this finishes | 6.4k blocks in about 20 min |
 
-**Early reading.**
-- **Speed:** on the same range, i-see-u's bootstrap is about **2× faster** than the squid so far, but it slows down as its indexes grow, from 34 to 17 blocks/s.
-- **Cost:** it uses about **115× fewer Quicknode calls per block** (0.009 against 1.02), because HyperSync supplies the headers and half the logs.
-- **Storage:** it stores about **3× more**, because it keeps every raw Transfer.
+### API without balances
+
+The accounts are the 2,844 test accounts with 100 or fewer ERC-20 tokens. Both systems returned the same tokens, **13.0 per response** on average. i-see-u has no page limit and the squid caps a page at 100, so the 116 heavier accounts were left out.
+
+| Connections | i-see-u REST: req/s | p50 | p99 | Squid GraphQL: req/s | p50 | p99 |
+|---|---|---|---|---|---|---|
+| 1 | 620 | 1.5 ms | 2.7 ms | 646 | 1.2 ms | 6.1 ms |
+| 10 | 2,365 | 4.2 ms | 6.0 ms | **3,816** | 2.5 ms | 4.5 ms |
+| 50 | 2,299 (**28% 503**: a finalized-epoch window) | 20.5 ms | 45.6 ms | **4,091** | 12.1 ms | 15.8 ms |
+| 100 | 2,267 | 43.3 ms | 54.9 ms | **3,795** | 25.2 ms | 35.8 ms |
+
+On all 3,000 accounts, where heavy accounts make i-see-u responses about 2× larger (36.8 against 16.6 tokens), the gap was the same: 2,107 against 3,499 req/s at 10 connections, both with 0 errors.
+
+### API with balances, cold caches
+
+All 3,000 accounts, 5 connections for 20 s. Both caches were empty: the squid API had just started, and the i-see-u database was new, so it held no balance snapshots.
+
+| | i-see-u | Squid |
+|---|---|---|
+| Req/s | 52 | **72** |
+| p50 / p95 / p99 | 89 / 176 / 545 ms | **69 / 100 / 128 ms** |
+| Tokens per response | 35.4 (all) | 16.4 (first page of up to 100) |
+| `eth_call`s | **198** for 1,036 requests, about 185 balance reads per call | 276 for 1,446 requests, about 86 balance reads per call |
+| Errors | 0 | 0 |
+
+Both need about 0.19 `eth_call` per request. i-see-u packs about 2× more balance reads into each Multicall, because its batches are larger (1,000 pairs against 500) and its window longer (25 ms against 20 ms).
+
+### Storage, same range, at about 26,225,700
+
+| | i-see-u | Squid |
+|---|---|---|
+| Whole database | **37 GB** | **16 GB** |
+| Per-pair aggregate | `holdings`: 30.12M rows, 9.0 GB, **309 B/row** | `account_token`: 28.10M rows, 16 GB, **593 B/row** |
+| Raw Transfers | `transfers`: 65.58M rows, 28 GB, 453 B/row (16 GB of it indexes: the from/to history indexes and the primary key) | none |
+| NFT items | `nft_ownership`: 611k rows, 169 MB | `nft_item`: 630k rows, 259 MB |
+
+### Head RPC (from §2; different windows)
+
+| i-see-u | Squid |
+|---|---|
+| 29.5k calls/day, 4.1 per block (45 min) | **18.2k calls/day**, about 2.5 per block (34.6 h) |
+
+### Verdict
+
+| Dimension | Winner | Why |
+|---|---|---|
+| Catch-up speed | **i-see-u**, about 1.9× | Bulk segment writes. The squid reads, merges and upserts per batch |
+| Catch-up RPC cost | **i-see-u**, about 120× fewer calls per block | HyperSync supplies the headers. The squid is RPC-only, so one header call per block |
+| API throughput and latency | **Squid**, 1.6–1.8× the req/s and about 40% lower p50 | One indexed lookup in one GraphQL process. i-see-u also overlays the tail and returns 503 for 13–18 s every 6.4 min |
+| Balance reads | Mixed | Squid has lower latency. i-see-u makes about 2× fewer `eth_call`s per balance read |
+| Storage | **Squid** in total (2.3× smaller); **i-see-u** per aggregate row (about 2× leaner) | i-see-u keeps raw history (history endpoint, repair). Squid entities need string ids |
+| Head RPC cost | **Squid**, about 1.6× cheaper | i-see-u's finalized follower re-fetches headers the tail already has |
 
 ## Headline numbers
 
@@ -45,19 +98,22 @@ The Subsquid reimplementation in `../disquid` was run live against Ethereum main
 |---|---|
 | Catch-up, 103,617 blocks | **2 h 59 min**, 9.7 blocks/s on average (30 at the start, 17–18 on busy blocks) |
 | RPC calls for catch-up | **106,084** (1.02 per block) in 13,263 HTTP requests, about **2.1M credits** |
-| i-see-u bootstrap, for comparison (HyperSync plus Quicknode, old staging path) | 270,429 blocks in about **1 h 45 min** (load about 43 min plus finalize about 60 min) |
+| i-see-u bootstrap, same range (fair run) | 117,402 blocks in about **109 min** of active time, **about 18 blocks/s**, **982 Quicknode calls** (0.008 per block, against the squid's 1.02) |
 | RPC calls at the head | **18.2k/day** (p50 12/min, p95 17/min), about **11M credits/month** |
 | i-see-u, RPC calls at the head (global-index tail plus finalized follower, 45 min on 2026-10-18) | **29.5k/day** (p50 15/min, p95 50/min), about **17.7M credits/month**, 4.1 calls per block, 0 errors |
 | Head lag | Indexed block about 9 s behind wall-clock time |
 | Live reorgs | **8 in 34.6 h**, all 1 block deep, all rolled back and resumed. The stock SDK crashes on the first one |
 | Parity with i-see-u | **0 mismatches**: ERC-20 386,213 pairs, ERC-721 5,627 pairs, 12,381 NFT owners |
-| API without balances, one process | **~3,000 req/s**, p50 3.2 ms and p99 5.9 ms at 10 connections, 0 errors |
-| API with balances, every pair a cache miss | 44 req/s at 5 connections, p50 104 ms, 0 errors |
-| i-see-u API without balances, one process (REST, default `finality=latest`, about 57-66 tokens per response) | **~2,000 req/s** at 50 connections, **~1,820** at 10 (p50 4.4 ms, p99 24 ms), 0 errors off epoch boundaries. A **503 `not_ready` window of 13-18 s** opens at each finalized epoch (every 6.4 min), and a 100-connection run that hit it had 18-38% 503s |
-| i-see-u API with balances, cold cache | 50 req/s at 5 connections, p50 87 ms, 0 errors, **210 `eth_call`s** for 1,005 requests |
-| Storage after 114.6k blocks | `account_token` 27.07M rows, **15 GB** (about 550 B/row). Whole database 15 GB |
+| API without balances, one process, same data (fair run) | **3,816 req/s** at 10 connections (p50 2.5 ms, p99 4.5 ms), up to 4,091 at 50, 0 errors |
+| API with balances, cold cache (fair run) | 72 req/s at 5 connections, p50 69 ms, 276 `eth_call`s for 1,446 requests, 0 errors |
+| i-see-u API without balances, same data (fair run) | **2,365 req/s** at 10 connections (p50 4.2 ms, p99 6.0 ms), about 2,300 at 50–100. A **503 `not_ready` window of 13–18 s** at every finalized epoch (6.4 min); one 50-connection run had 28% 503s |
+| i-see-u API with balances, cold cache (fair run) | 52 req/s at 5 connections, p50 89 ms, **198 `eth_call`s** for 1,036 requests (about 2× more balance reads per call than the squid) |
+| Storage, same range (fair run, about 121k blocks) | Squid **16 GB** (`account_token` 28.10M rows, 593 B/row). i-see-u **37 GB** (`holdings` 30.12M rows at 309 B/row, plus 65.58M raw Transfers, 28 GB) |
 
 ## 1. Ingestion (catch-up)
+
+> **Earlier, unequal data.** The i-see-u figures in this section come from earlier runs on different ranges or databases. For squid against i-see-u, use the [fair comparison](#fair-comparison-same-range-same-data-2026-101819) above.
+
 
 | Run | Source | Speed | What limited it |
 |---|---|---|---|
@@ -90,7 +146,7 @@ The Subsquid reimplementation in `../disquid` was run live against Ethereum main
   - Postgres `COPY`: 724k rows/s into an unindexed unlogged table, 126k rows/s with indexes.
 - **Not yet run live:** the current indexed-segment path (a Codex rework that commits raw rows and aggregates per segment and publishes in minutes) has **not** been benchmarked end to end. At 126k rows/s, raw inserts alone would take about 18 min for 138.5M rows (*derived*).
 
-**Squid against i-see-u on catch-up.** i-see-u's old path loaded about 105 blocks/s before its finalize, and about 43 blocks/s end to end including it. The squid managed 9.7 blocks/s. The gap comes from the write path: i-see-u bulk-inserts per segment, while the squid reads, merges and upserts per batch. The data source is not the cause. The reverse also holds: i-see-u's **follower** (the path that runs after bootstrap, one `appendRange` per 500 blocks) caught up at only about **3.7 blocks/s** on the 60 GB index (2.2 blocks/s wall clock, including a host sleep), slower than the squid's 9.7 blocks/s, because it writes every raw Transfer (about 680 per block) plus the aggregate upserts into four indexes. For cost, the squid can only match i-see-u by leaving RPC-only: a Portal source, or a custom HyperSync source in `EvmFallbackDataSourceBuilder` (§10).
+**Squid against i-see-u on catch-up.** On the same range (fair comparison above), i-see-u's current bootstrap ran at about 18 blocks/s with 982 Quicknode calls, against the squid's 9.7 blocks/s and 106,084 calls. The speed gap comes from the write path: i-see-u bulk-writes per segment, while the squid reads, merges and upserts per batch. The cost gap comes from HyperSync supplying the headers. i-see-u's **follower**, the path after the bootstrap, is slower: about 3.2–3.7 blocks/s, because it writes every raw Transfer plus the aggregate upserts. For cost, the squid can only match i-see-u by leaving RPC-only: a Portal source, or a custom HyperSync source in `EvmFallbackDataSourceBuilder` (§10).
 
 ## 2. Following the head
 
@@ -149,6 +205,9 @@ i-see-u stores every raw Transfer (139.8M rows from 25,933,634), so it is an ind
 
 ## 5. API load
 
+> **Earlier, unequal data.** The i-see-u figures in this section come from earlier runs on different ranges or databases. For squid against i-see-u, use the [fair comparison](#fair-comparison-same-range-same-data-2026-101819) above.
+
+
 **Method.**
 - **Load:** closed loop, with N connections each sending the next request as soon as the previous one returns. Each run lasted 30 s, against `tokenDiscovery(account, first: 100)`.
 - **Accounts:** 3,000 random accounts sampled from `account_token`. A response carried 18.4 tokens on average, which is heavier than a typical account.
@@ -189,6 +248,9 @@ i-see-u stores every raw Transfer (139.8M rows from 25,933,634), so it is an ind
 
 ## 6. Storage
 
+> **Earlier, unequal data.** The i-see-u figures in this section come from earlier runs on different ranges or databases. For squid against i-see-u, use the [fair comparison](#fair-comparison-same-range-same-data-2026-101819) above.
+
+
 | | Subsquid (`../disquid`) | i-see-u |
 |---|---|---|
 | Blocks covered | 114.6k (from 26,104,555) | 272.4k (from 25,933,634) |
@@ -223,6 +285,9 @@ Most spam is fake tokens moving non-zero amounts, which this skip doesn't catch.
 - **Now:** all 69,752 tokens are `FETCHED`. New tokens get metadata in the same insert, with one `eth_call` per 50 new tokens per batch.
 
 ## 9. Monthly RPC budget (Quicknode Build, 80M credits)
+
+> **Earlier, unequal data.** The i-see-u figures in this section come from earlier runs on different ranges or databases. For squid against i-see-u, use the [fair comparison](#fair-comparison-same-range-same-data-2026-101819) above.
+
 
 | Item | Subsquid (`../disquid`) | i-see-u (current branch) |
 |---|---|---|
@@ -278,6 +343,15 @@ i-see-u's bootstrap loaded about 105 blocks/s on its old staging path, measured 
 
 ## Caveats
 
+- **Fair run, remaining differences:**
+  - The squid skips zero-value ERC-20 Transfers, leaving about 7% fewer pairs on the same range.
+  - REST against GraphQL.
+  - i-see-u returns all tokens, while the squid pages at 100. The no-balance tables therefore use accounts with 100 or fewer tokens; the balance table uses all accounts, so its tokens per response differ.
+  - i-see-u was tested first and the squid second, minutes apart, each with its own processor following the head.
+  - Each figure comes from a single run.
+- **The bootstrap was interrupted twice:** once by a full disk and once by about 72 min of host sleep, which caused DNS errors and a 4-segment retry pass. Its time is active time, computed from the log timestamps with gaps over 60 s removed. Without the sleep, HyperSync would probably have loaded more of the logs; in the resumed passes Quicknode workers loaded most of them.
+- **The old 60 GB i-see-u database (from 25,933,634) was dropped** to make room. Sections that cite it (§1 full window, §4 parity, §6) are historical. The fair-run database `iseeu_bench` (37 GB) is still there; drop it with `docker exec i-see-u-postgres-1 psql -U iseeu -d postgres -c 'DROP DATABASE iseeu_bench'`.
+
 - **One machine, one provider, one run.** Speeds depend on Quicknode's latency on the day. During i-see-u's earlier per-account work (PROGRESS §7), per-call latency varied 5–10× within one day (0.2–0.4 s in the morning, 1.7–2.0 s later).
 - **API numbers are from localhost**, so there is no network RTT, and the load generator competed with the server for CPU.
 - **History starts at 26,104,555 on purpose.** Holdings untouched since then are invisible.
@@ -321,3 +395,13 @@ node loadtest-rest.mjs accounts.txt 10 30          # <connections> <seconds> [ba
 ```
 
 Re-running `scripts/parity.sh 26106500` on 2026-10-18 again gave 0 mismatches: 386,213 ERC-20 pairs (189,159 full rows) and 5,627 ERC-721 pairs (2,670 full rows). Fewer full rows qualify now because more pairs have activity after the cut-off.
+
+**Fair run (same range).** These run from the i-see-u directory unless noted. The counting proxy (`../disquid/scripts/rpc-proxy.mjs`) forwards to `UPSTREAM_RPC_URL` and logs calls per method to `PROXY_OUT`.
+
+```bash
+docker exec i-see-u-postgres-1 psql -U iseeu -d postgres -c 'CREATE DATABASE iseeu_bench'   # then apply i-see-u's migrations with DATABASE_URL pointing at it
+START_BLOCK=26104555 DATABASE_URL=postgresql://iseeu:iseeu@localhost:5432/iseeu_bench RPC_URL=http://127.0.0.1:8546 npm run bootstrap   # rerun to resume
+START_BLOCK=26104555 DATABASE_URL=postgresql://iseeu:iseeu@localhost:5432/iseeu_bench RPC_URL=http://127.0.0.1:8546 npm start
+node ../disquid/scripts/loadtest-rest.mjs accounts-le100.txt 10 30   # i-see-u REST
+node ../disquid/scripts/loadtest.mjs accounts-le100.txt 10 30          # squid GraphQL (processor and API started from ../disquid)
+```
