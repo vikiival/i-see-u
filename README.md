@@ -13,6 +13,9 @@ npm install
 cp .env.example .env                 # configure RPC_URL and DATABASE_URL
 docker compose up -d postgres
 npm start                             # migrate, start finalized follower and tail, serve :3000
+npm run dev                           # same server, restart on source changes
+npm run status                        # print shared DB progress per network, then exit
+SERVE_ONLY=true npm start              # API replica; no indexing workers or leader locks
 npx tsc --noEmit -p .
 npm test                              # real migrations on PGlite; no network or Docker
 npm run lint
@@ -23,6 +26,8 @@ npm run lint
 The migration directory is a **fresh baseline for an empty PoC database**, not an upgrade of the old aggregate-only database. Use a new database/schema when moving from that version; preserve an old database separately if needed. After schema changes run `npm run db:generate`. Generated SQL is not hand-edited. `0001_balance_revision` adds the snapshot repair revision; `0002_tail_journal` adds `tail_blocks`/`tail_transfers`; `0003_bootstrap` adds the bootstrap staging tables and `0004_bootstrap_unlogged` (custom SQL) makes `bootstrap_transfers` UNLOGGED. `0005_bootstrap_applied` adds the per-segment applied marker; old staged segments default to false. `npm run db:migrate` applies migrations without starting the server.
 
 Runtime config loads `.env` with Node; already exported environment variables take precedence. The old `.env.example` may contain obsolete backfill/worker knobs; these no longer configure runtime behavior.
+
+`npm run status` uses the same configuration and discovery status logic, prints cursor/head/tail tip, serving mode/reason and bootstrap run bounds/segment counts as one JSON line per network, then closes the connection. It performs no RPC or migrations and never prints connection strings or raw driver errors.
 
 ## API
 
@@ -36,6 +41,9 @@ Runtime config loads `.env` with Node; already exported environment variables ta
 | `GET /v1/ethereum/accounts/{address}/transfers?limit=50` | Raw ERC-20/ERC-721 transfers newest first; `limit` is 1–200 |
 | `…/transfers?limit=50&before={next}` | Next keyset page; use the previous response's `next` unchanged |
 | `GET /health` | Shared database readiness per network, local follower and tail diagnostics (tip, lag, reorgs, errors) and redacted RPC stats; `serving` per network; 503 only on a failed database probe |
+| `GET /livez` | Always 200 `{ "status": "ok" }`; no database or RPC access |
+| `GET /readyz` | 200 when every network meets `READYZ_ALLOW` (default `full`), otherwise 503; per-network serving mode and reason |
+| `GET /metrics` | Prometheus text exposition (`text/plain; version=0.0.4`); shared DB progress and local process diagnostics |
 
 Published-index discovery responses identify `blockHeight`, `blockHash`, `blockTimestamp`, `finality` and the network start block. **`finality=latest` (default)** serves the tail tip: `blockHeight`/`blockHash` are the tip, `finalizedBlockHeight`/`finalizedBlockHash` the finalized cursor below it. Counts include unfinalized Transfers and name that part as `unfinalizedSentCount`/`unfinalizedReceivedCount`; NFTs received in tail blocks carry `unfinalized: true`, NFTs sent in tail blocks disappear. If the finalized index is stale, or the tail is unhealthy, empty, or its tip is older than `TAIL_MAX_TIP_AGE_MS`, the response is the finalized view with `finality: "finalized"` and a `tailError` explaining why; index readiness never causes a 503. A disabled tail serves finalized only. **`finality=finalized`** always serves the cursor without overlay and without `tailError`. `lastProgressAt` is the tip's block time (latest) or the cursor commit time (finalized); `lagBlocks` is the latest-head distance. Blocks, uint256 values, token IDs and **sent/received counts are decimal strings**. Historical NFT movements live in `/transfers`; the NFT endpoint no longer stores one historical held flag per account/item. Burned NFTs have no current holder.
 
@@ -63,6 +71,18 @@ Before any run/index exists, responses have empty holdings/NFTs/history, `covere
 Partial history exposes the same coverage and, for a run, `throughBlock: B`. Its opaque `next` cursors must be reused unchanged; **409** requires restarting when any segment is applied or the index publishes, preventing missing newly inserted rows between pages. `balances=true` in partial mode omits per-token balances and returns `balancesCurrent: false`, `balancesStatus: "omitted"`, `balancesReason`. Ownership verification is skipped with `ownershipError` and per-item `ownerStatus: "skipped"`. Neither option performs RPC in partial mode. Existing optional hash-pinned balance/ownership reads remain unchanged for published snapshots.
 
 The tail never makes finalized data unavailable; it only degrades latest to finalized. Other errors: 400 invalid input (including `finality` other than `latest`/`finalized`), 404 unknown network, 503 RPC/queue/deadline/database acquisition failures.
+
+## Observability
+
+Scrape `/metrics` on each replica. Each network uses one summary SQL statement: cursor/head, pending repair existence, indexed tail-tip lookup and bootstrap segment counts. It never scans transfers, account data or bootstrap headers and does no RPC. Missing cursors/tips/runs omit their corresponding samples. Progress and serving gauges describe shared database state; RPC, limiter, reorg and watchdog stats describe the local process and reset on restart. HyperSync counters appear only for an in-process bootstrap with that source enabled.
+
+RPC metrics distinguish `client="runtime"` and any `client="bootstrap:<network>"` bulk clients running inside this process.
+
+Metric names: `finalized_cursor_block`, `finalized_head_block`, `follower_lag_blocks`, `cursor_age_seconds`, `tail_tip_block`, `tail_tip_age_seconds`, `tail_reorgs_total`, `tail_wipes_total`, `head_stalled`, `serving{network,mode="full|stale|partial"}` (one-hot gauges), `bootstrap_segments_done`, `bootstrap_segments_applied`, `bootstrap_segments_total`, `rpc_requests_total`, `rpc_attempts_total`, `rpc_errors_total`, `rpc_retries_total`, `rpc_429_total`, `rpc_breaker_open`, `hypersync_requests_total`, `hypersync_rate_limit_waits_total`, `http_request_duration_seconds` (histogram: `_bucket`, `_sum`, `_count`), `limiter_queue_depth` and `limiter_rejections_total`. RPC attempts/errors use redacted endpoint, method and outcome labels; endpoint indices distinguish URLs sharing a host. HTTP labels use route patterns and status, with `unmatched` for unknown paths. Limiter rejections count queue-capacity refusals; tail wipes count deep-reorg wipes by this process. HyperSync quota waits include proactive waits as well as 429s.
+
+`/livez` checks that HTTP is alive. `/readyz` defaults to requiring every network to serve `full`; `READYZ_ALLOW=stale` also accepts stale published data and `partial` accepts all serving modes. A database failure always fails readiness. `/health` retains its existing database-availability semantics. `SERVE_ONLY=true` loads shared read state and serves discovery, history and optional on-request balances/ownership, without starting bootstrap/follower/tail loops or acquiring their leader locks; `BOOTSTRAP_ON_START` is ignored in this mode.
+
+The leader's latest-head watchdog trips the breaker of the endpoint that returned a non-advancing head after `HEAD_STALL_MS`. An older head does not reset the clock; a strictly higher head clears `headStalled`. The next poll selects a fallback when configured; normal breaker cooldown still applies. Tail status and `/health` expose `headStalled`, and stalled tails degrade latest reads to finalized. The follower's existing background latest refresh also feeds the watchdog under its leader lock, including when the tail is disabled or catching up.
 
 ## Bootstrap
 
@@ -150,6 +170,9 @@ All database conversions are in `src/store/columns.ts` plus the name-to-ID regis
 | `BOOTSTRAP_MAINTENANCE_WORK_MEM` | 1GB | `maintenance_work_mem` for the finalize index builds |
 | `HYPERSYNC_API_KEY`, `HYPERSYNC_URL`, `HYPERSYNC_TIMEOUT_MS` | unset, `https://eth.hypersync.xyz`, 120000 | Optional bootstrap source; per-request idle timeout |
 | `PORT` | 3000 | HTTP port |
+| `SERVE_ONLY` | false | API replica only; skip background indexing/bootstrap and leader locks |
+| `READYZ_ALLOW` | full | Minimum accepted readiness: `full`, `stale` (also full), or `partial` (all modes) |
+| `HEAD_STALL_MS` | 60000 | Leader latest-head watchdog threshold; penalize the returning endpoint if no higher head appears |
 | `RPC_TIMEOUT_MS`, `RPC_MAX_ATTEMPTS`, `RPC_MAX_RPS` | 15000, 6, 20 | Timeout, retry budget, shared outgoing rate cap |
 | `ETH_FOLLOWER_MAX_RANGE` | 500 (maximum 1000) | Unfiltered log range; large responses require bounded memory |
 | `FOLLOWER_POLL_MS` | 30000 | Finalized-head poll interval |
