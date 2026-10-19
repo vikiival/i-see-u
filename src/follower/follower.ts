@@ -52,7 +52,11 @@ export function createFollower(o: FollowerOptions): Follower {
         return;
       }
 
-      if (!leader) return;
+      if (!leader) {
+        lastError = undefined;
+
+        return;
+      }
 
       const head = await adapter.finalizedHead();
 

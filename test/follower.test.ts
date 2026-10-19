@@ -18,6 +18,26 @@ test('follower awaits bootstrap instead of initializing a cursor at the head', a
   } finally { await s.close(); }
 });
 
+test('a non-leader clears its bootstrap error once the shared index exists', async () => {
+  const s = await stack(new FakeChain(102n), { initialize: false });
+
+  const follower = createFollower({
+    adapter: s.adapter, store: s.store, pollMs: 1000, maxNoAdvanceMs: 1_800_000,
+    lock: { tryAcquire: async () => false, held: () => false, release: async () => {} },
+  });
+
+  try {
+    await follower.tick();
+    expect(follower.status()).toMatchObject({ ready: false, leader: false, lastError: 'Global index awaits bootstrap initialization' });
+    await s.store.initialize('ethereum', 100n, header(99n), s.clock.at);
+    await s.follower.tick();
+    const calls = s.chain.total;
+    await follower.tick();
+    expect(follower.status()).toMatchObject({ ready: true, stale: false, leader: false, lastError: undefined, unhealthy: undefined });
+    expect(s.chain.total).toBe(calls);
+  } finally { await s.close(); }
+});
+
 test('global ranges index all accounts before their first request; RPC cost is independent of accounts', async () => {
   const chain = new FakeChain(102n);
 
