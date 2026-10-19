@@ -99,6 +99,7 @@ export const config = {
     maxRangesPerTick: int('FOLLOWER_MAX_RANGES_PER_TICK', '8'),
     headerConcurrency: int('FOLLOWER_HEADER_CONCURRENCY', '8'),
   },
+  maxServeLagBlocks: BigInt(int('MAX_SERVE_LAG_BLOCKS', '7200')),
   maxHeadAgeMs: int('MAX_HEAD_OBSERVATION_AGE_MS', '120000'),
   /** Unfinalized journal above the finalized cursor: `finality=latest` (the default) serves the tip. */
   tail: {
@@ -150,7 +151,7 @@ export const config = {
     workMem: env('BOOTSTRAP_WORK_MEM', '64MB'),
     maintenanceWorkMem: env('BOOTSTRAP_MAINTENANCE_WORK_MEM', '1GB'),
   },
-  /** Refuse discovery when the follower has not advanced for longer than this. */
+  /** Mark reads stale when the follower has not advanced for longer than this. */
   maxHeadProgressAgeMs: int('MAX_HEAD_AGE_MS', '1800000'),
 };
 

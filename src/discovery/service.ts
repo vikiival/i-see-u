@@ -1,6 +1,6 @@
 import { addTransfer, emptyAggregate } from '../core/aggregate.ts';
 import { unavailable } from '../core/limiter.ts';
-import type { AccountView, Address, BlockHeader, ChainAdapter, DiscoveryService, IndexState, TailStatus } from '../core/types.ts';
+import type { AccountView, Address, BlockHeader, ChainAdapter, DiscoveryService, IndexSnapshot, IndexState, ServingMetadata, ServingStatus, TailStatus } from '../core/types.ts';
 import type { Store } from '../core/types.ts';
 
 export interface DiscoveryDependencies {
@@ -8,6 +8,8 @@ export interface DiscoveryDependencies {
   store: Store;
   maxHeadAgeMs: number;
   maxNoAdvanceMs: number;
+  /** Hard observed finalized-head distance; an old observation alone remains servable. */
+  maxServeLagBlocks?: bigint;
   /** Per-network tail; without one every read is finalized. */
   tails?: Record<string, { status(): TailStatus }>;
   /**
@@ -70,19 +72,51 @@ export function createDiscoveryService(deps: DiscoveryDependencies): DiscoverySe
     return { adapter, account };
   };
 
-  const requireReady = (state: IndexState | undefined): IndexState => {
+  const statusOf = (snapshot: IndexSnapshot | undefined): ServingStatus => {
+    const state = snapshot?.state;
     let reason: string | undefined;
+
+    if (snapshot?.bootstrap) return { ready: false, serving: 'partial', reason: 'Global index bootstrap is incomplete' };
 
     if (!state?.head || state.checkedAt === undefined) reason = 'Global index awaits bootstrap or finalized head';
     else if (state.pendingRepair) reason = 'Global index has pending repairs';
-    else if (state.cursor.number < state.head.number) reason = 'Global index has not reached the finalized head';
     else if (state.cursor.number === state.head.number && state.cursor.hash !== state.head.hash) reason = 'Global index head hash mismatch';
-    else if (now() - state.checkedAt > deps.maxHeadAgeMs) reason = 'Finalized head observation is too old';
-    else if (now() - state.cursor.updatedAt > deps.maxNoAdvanceMs) reason = 'Global index has not advanced recently enough';
+    else if (state.head.number - state.cursor.number > (deps.maxServeLagBlocks ?? 7200n)) reason = 'Global index has not reached the finalized head';
+    else {
+      if (state.cursor.number < state.head.number) reason = 'Global index has not reached the finalized head';
+      else if (now() - state.checkedAt > deps.maxHeadAgeMs) reason = 'Finalized head observation is too old';
+      else if (now() - state.cursor.updatedAt > deps.maxNoAdvanceMs) reason = 'Global index has not advanced recently enough';
 
-    if (reason) throw Object.assign(unavailable(reason, 5), { serviceStatus: 'not_ready' });
+      return { ready: reason === undefined, serving: reason ? 'stale' : 'full', ...(reason && { reason }) };
+    }
 
-    return state!;
+    return { ready: false, serving: 'unavailable', reason };
+  };
+
+  const requireAvailable = <T extends IndexSnapshot>(snapshot: T | undefined): T => {
+    const status = statusOf(snapshot);
+
+    if (status.serving === 'unavailable') throw Object.assign(unavailable(status.reason!, 5), { serviceStatus: 'not_ready' });
+
+    return snapshot!;
+  };
+
+  const metadata = (snapshot: IndexSnapshot, served?: BlockHeader | IndexState['cursor'], latest?: bigint): ServingMetadata => {
+    if (snapshot.bootstrap) return {
+      ...snapshot.bootstrap, status: 'partial', complete: false,
+      note: 'Applied ranges only. Counts and last seen blocks are lower bounds; first seen blocks may move earlier. NFT owners may be outdated where later ranges are missing.',
+    };
+    const { cursor, head } = snapshot.state;
+    const block = served ?? cursor;
+    const status = statusOf(snapshot);
+
+    return {
+      status: 'ready', complete: true, blockHeight: block.number, blockHash: block.hash, blockTimestamp: block.timestamp, revision: cursor.revision,
+      lastProgressAt: block === cursor ? cursor.updatedAt : Number(block.timestamp) * 1000,
+      stale: status.serving === 'stale', ...(status.reason && { staleReason: status.reason }),
+      lagBlocks: latest !== undefined && latest > block.number ? latest - block.number : 0n,
+      followerLagBlocks: head!.number > cursor.number ? head!.number - cursor.number : 0n,
+    };
   };
 
   const tailOf = (network: string) => deps.tails && Object.hasOwn(deps.tails, network) ? deps.tails[network] : undefined;
@@ -103,57 +137,56 @@ export function createDiscoveryService(deps: DiscoveryDependencies): DiscoverySe
     async status(network) {
       if (!Object.hasOwn(deps.adapters, network)) throw Object.assign(new Error(`Unknown network: ${network}`), { statusCode: 404 });
 
-      try {
-        requireReady(await deps.store.indexState(network));
-
-        return { ready: true };
-      } catch (error) {
-        if (error instanceof Error && 'serviceStatus' in error) return { ready: false, reason: error.message };
-        throw error;
-      }
+      return statusOf(await deps.store.indexSnapshot(network));
     },
     async discover(network, input, options = {}) {
       const { adapter, account } = validate(network, input);
       const tail = options.finality === 'finalized' ? undefined : tailOf(network)?.status();
       const view = await deps.store.readAccount(network, account, { tail: tail !== undefined, balances: options.balances });
-      const { cursor, startBlock, head } = requireReady(view?.state);
-      const tailError = tail && tailProblem(tail, view!.tailTip, cursor.number);
-      const tip = tail && !tailError ? view!.tailTip : undefined;
-      const served = tip ?? cursor;
-      const latest = tail?.latestNumber ?? adapter.cachedLatestBlockNumber?.() ?? served.number;
+      const snapshot = requireAvailable(view);
+
+      if (snapshot.bootstrap) return {
+        ...metadata(snapshot), network, account, fromBlock: snapshot.bootstrap.startBlock, finality: 'finalized',
+        ...(options.finality !== 'finalized' && { tailError: 'Global index bootstrap is incomplete' }),
+        holdings: snapshot.holdings, nftItems: snapshot.nftItems,
+      };
+
+      const { cursor, startBlock } = snapshot.state;
+      const staleReason = statusOf(snapshot).reason;
+      const tailError = options.finality !== 'finalized' ? staleReason ?? (tail && tailProblem(tail, snapshot.tailTip, cursor.number)) : undefined;
+      const tip = tail && !tailError ? snapshot.tailTip : undefined;
+      const latest = tail?.latestNumber ?? adapter.cachedLatestBlockNumber?.() ?? cursor.number;
 
       return {
-        status: 'ready', network, account, fromBlock: startBlock, blockHeight: served.number, blockHash: served.hash,
-        blockTimestamp: served.timestamp, revision: cursor.revision, finality: tip ? 'latest' : 'finalized',
+        ...metadata(snapshot, tip ?? cursor, latest), network, account, fromBlock: startBlock, finality: tip ? 'latest' : 'finalized',
         ...(tip && { finalizedBlockHeight: cursor.number, finalizedBlockHash: cursor.hash }),
         ...(tailError && { tailError }),
-        // The shared tip's block time, not process memory: identical in every process, leader or not.
-        lastProgressAt: tip ? Number(tip.timestamp) * 1000 : cursor.updatedAt,
-        stale: false, lagBlocks: latest > served.number ? latest - served.number : 0n,
-        followerLagBlocks: head!.number > cursor.number ? head!.number - cursor.number : 0n,
-        ...(tip ? overlay(view!, account) : { holdings: view!.holdings, nftItems: view!.nftItems }),
-        ...(view!.balances && { balances: view!.balances }),
+        ...(tip ? overlay(snapshot, account) : { holdings: snapshot.holdings, nftItems: snapshot.nftItems }),
+        ...(snapshot.balances && { balances: snapshot.balances }),
       };
     },
     async history(network, input, limit, before, finality) {
-      const { account } = validate(network, input);
+      const { adapter, account } = validate(network, input);
       const tail = finality === 'finalized' ? undefined : tailOf(network)?.status();
-      let page = await deps.store.transferHistory(network, account, limit, before, tail !== undefined);
-      let { cursor } = requireReady(page?.state);
-      const tailError = tail && tailProblem(tail, page!.tailTip, cursor.number);
+      let page = requireAvailable(await deps.store.transferHistory(network, account, limit, before, tail !== undefined));
 
-      // Rare: the tail was read but cannot be served; read the finalized view (a latest cursor then gets 409).
-      if (tailError && page!.throughBlock > cursor.number) {
-        page = await deps.store.transferHistory(network, account, limit, before);
-        cursor = requireReady(page?.state).cursor;
+      let tailError = finality !== 'finalized'
+        ? statusOf(page).reason ?? (tail && tailProblem(tail, page.tailTip, page.state!.cursor.number)) : undefined;
+
+      // Recheck availability and metadata in the second snapshot; a latest cursor may now get 409.
+      if (tailError && page.state && page.throughBlock > page.state.cursor.number) {
+        page = requireAvailable(await deps.store.transferHistory(network, account, limit, before));
+        tailError = statusOf(page).reason ?? tailError;
       }
 
-      const tip = tail && !tailError ? page!.tailTip : undefined;
-      const served = tip ?? cursor;
+      const cursor = page.state?.cursor;
+      const tip = tail && !tailError ? page.tailTip : undefined;
+      const latest = tail?.latestNumber ?? adapter.cachedLatestBlockNumber?.() ?? cursor?.number;
 
       return {
-        network, account, page: page!, finality: tip ? 'latest' : 'finalized', blockHeight: served.number, blockHash: served.hash,
-        ...(tip && { finalizedBlockHeight: cursor.number, finalizedBlockHash: cursor.hash }),
+        ...metadata(page, tip ?? cursor, latest), network, account, page,
+        fromBlock: page.state?.startBlock ?? page.bootstrap!.startBlock, finality: tip ? 'latest' : 'finalized',
+        ...(tip && cursor && { finalizedBlockHeight: cursor.number, finalizedBlockHash: cursor.hash }),
         ...(tailError && { tailError }),
       };
     },

@@ -2,7 +2,7 @@ import { and, asc, desc, eq, getTableColumns, gt, gte, lte, or, sql } from 'driz
 import type { SQL } from 'drizzle-orm';
 import type { PgDatabase } from 'drizzle-orm/pg-core';
 
-import type { Address, BlockHeader, BlockRange, HistoryTransfer, IndexState, Store, TransferEvent } from '../core/types.ts';
+import type { Address, BlockHeader, BlockRange, BootstrapCoverage, HistoryTransfer, IndexSnapshot, IndexState, Store, TransferEvent } from '../core/types.ts';
 import { ChainGapError, TailConflictError } from '../core/errors.ts';
 import { networkRegistry } from '../networks.ts';
 import * as schema from './schema.ts';
@@ -196,6 +196,39 @@ export function createStore(
     };
   };
 
+  const readIndex = async (tx: Executor, network: number): Promise<IndexSnapshot | undefined> => {
+    const current = await readState(tx, network);
+
+    if (current) return { state: current };
+    const [run] = await tx.select().from(schema.bootstrapRuns).where(eq(schema.bootstrapRuns.network, network));
+
+    if (!run || run.status === 'done') return undefined;
+    const segments = schema.bootstrapSegments;
+    const applied = await tx.select().from(segments).where(and(eq(segments.network, network), eq(segments.applied, true))).orderBy(asc(segments.fromBlock));
+    const coveredRanges: BlockRange[] = [];
+    let coveredBlocks = 0n;
+    let lastAppliedAt = run.startedAt;
+
+    for (const segment of applied) {
+      const previous = coveredRanges.at(-1);
+
+      if (previous && previous.toBlock + 1n >= segment.fromBlock) {
+        if (segment.toBlock > previous.toBlock) previous.toBlock = segment.toBlock;
+      } else coveredRanges.push({ fromBlock: segment.fromBlock, toBlock: segment.toBlock });
+
+      lastAppliedAt = Math.max(lastAppliedAt, segment.updatedAt ?? run.startedAt);
+    }
+
+    for (const range of coveredRanges) coveredBlocks += range.toBlock - range.fromBlock + 1n;
+
+    const bootstrap: BootstrapCoverage = {
+      startBlock: run.startBlock, targetBlock: run.targetBlock, targetHash: run.targetHash, coveredRanges,
+      coveredBlocks, totalBlocks: run.targetBlock - run.startBlock + 1n, lastAppliedAt,
+    };
+
+    return { bootstrap };
+  };
+
   const headerAt = async (tx: Executor, network: number, number: bigint) => {
     const [row] = await tx.select().from(headers).where(and(eq(headers.network, network), eq(headers.number, number)));
 
@@ -296,6 +329,8 @@ export function createStore(
     },
 
     indexState: (network) => db.transaction((tx) => readState(tx, id(network)), { isolationLevel: 'repeatable read', accessMode: 'read only' }),
+
+    indexSnapshot: (network) => db.transaction((tx) => readIndex(tx, id(network)), { isolationLevel: 'repeatable read', accessMode: 'read only' }),
 
     async observeHead(network, head, at) {
       const n = id(network);
@@ -443,19 +478,20 @@ export function createStore(
       const n = id(network);
 
       return db.transaction(async (tx) => {
-        const current = await readState(tx, n);
+        const snapshot = await readIndex(tx, n);
 
-        if (!current) return undefined;
-        const tip = options.tail ? await tailTip(tx, n) : undefined;
+        if (!snapshot) return undefined;
+        const current = snapshot.state;
+        const tip = current && options.tail ? await tailTip(tx, n) : undefined;
 
         const tail = tip ? await tx.select().from(tailRaw).where(and(
-          eq(tailRaw.network, n), gt(tailRaw.blockNumber, current.cursor.number), or(eq(tailRaw.from, account), eq(tailRaw.to, account)),
+          eq(tailRaw.network, n), gt(tailRaw.blockNumber, current!.cursor.number), or(eq(tailRaw.from, account), eq(tailRaw.to, account)),
         )).orderBy(asc(tailRaw.blockNumber), asc(tailRaw.logIndex)) : [];
 
         return {
-          state: current, holdings: await holdings(tx, n, account), nftItems: await nftItems(tx, n, account),
+          ...snapshot, holdings: await holdings(tx, n, account), nftItems: await nftItems(tx, n, account),
           tailTransfers: tail.map(({ network: _network, ...event }) => event), tailTip: tip,
-          ...(options.balances && { balances: await balances(tx, n, account) }),
+          ...(current && options.balances && { balances: await balances(tx, n, account) }),
         };
       }, { isolationLevel: 'repeatable read', accessMode: 'read only' });
     },
@@ -479,15 +515,17 @@ export function createStore(
       const n = id(network);
 
       return db.transaction(async (tx) => {
-        const current = await readState(tx, n);
+        const snapshot = await readIndex(tx, n);
 
-        if (!current) return undefined;
-        const { cursor } = current;
-        const tip = tail ? await tailTip(tx, n) : undefined;
-        const top = tip && tip.number > cursor.number ? tip.number : cursor.number;
+        if (!snapshot) return undefined;
+        const cursor = snapshot.state?.cursor;
+        const revision = cursor?.revision ?? snapshot.bootstrap!.coveredBlocks;
+        const partial = snapshot.bootstrap ? true : undefined;
+        const tip = cursor && tail ? await tailTip(tx, n) : undefined;
+        const top = cursor ? (tip && tip.number > cursor.number ? tip.number : cursor.number) : snapshot.bootstrap!.targetBlock;
 
         // A latest cursor above the finalized cursor stays valid while the tail still reaches its bound.
-        if (before && (before.revision !== cursor.revision || before.throughBlock > top)) {
+        if (before && (before.partial !== partial || before.revision !== revision || before.throughBlock > top)) {
           throw Object.assign(new Error('History changed; restart pagination'), { statusCode: 409 });
         }
 
@@ -499,7 +537,7 @@ export function createStore(
         const received = tx.select().from(raw).where(and(keyset(raw), eq(raw.to, account), notSelf(raw))).orderBy(desc(raw.blockNumber), desc(raw.logIndex)).limit(limit + 1);
         const rows: HistoryTransfer[] = [...await sent, ...await received].map(({ network: _network, ...event }) => event);
 
-        if (tip && through > cursor.number) {
+        if (tip && cursor && through > cursor.number) {
           const above = and(keyset(tailRaw), gt(tailRaw.blockNumber, cursor.number));
           const tailSent = tx.select().from(tailRaw).where(and(above, eq(tailRaw.from, account))).orderBy(desc(tailRaw.blockNumber), desc(tailRaw.logIndex)).limit(limit + 1);
           const tailReceived = tx.select().from(tailRaw).where(and(above, eq(tailRaw.to, account), notSelf(tailRaw))).orderBy(desc(tailRaw.blockNumber), desc(tailRaw.logIndex)).limit(limit + 1);
@@ -511,10 +549,10 @@ export function createStore(
         const last = page.at(-1);
 
         return {
-          state: current,
+          ...snapshot,
           throughBlock: through,
           transfers: page,
-          next: rows.length > limit && last ? { blockNumber: last.blockNumber, logIndex: last.logIndex, throughBlock: through, revision: cursor.revision } : undefined,
+          next: rows.length > limit && last ? { blockNumber: last.blockNumber, logIndex: last.logIndex, throughBlock: through, revision, ...(partial && { partial }) } : undefined,
           tailTip: tip,
         };
       }, { isolationLevel: 'repeatable read', accessMode: 'read only' });

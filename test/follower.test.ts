@@ -189,7 +189,7 @@ test('stale head observations never renew shared freshness and recover after a s
   } finally { await s.close(); }
 });
 
-test('concurrent ticks share work and a request during ingestion sees service-level not-ready', async () => {
+test('concurrent ticks share work and a request during ingestion sees the committed stale snapshot', async () => {
   const s = await stack();
   const pause = gate();
   let entered = false;
@@ -200,7 +200,7 @@ test('concurrent ticks share work and a request during ingestion sees service-le
     const b = s.follower.tick();
 
     while (!entered) await new Promise((resolve) => setImmediate(resolve));
-    await expect(s.discovery.discover('ethereum', account)).rejects.toMatchObject({ serviceStatus: 'not_ready', statusCode: 503 });
+    expect(await s.discovery.discover('ethereum', account)).toMatchObject({ status: 'ready', stale: true, blockHeight: 99n, holdings: [] });
     pause.release();
     await Promise.all([a, b]);
     expect(s.chain.calls.eth_getLogs).toBe(1);

@@ -240,7 +240,7 @@ test('lastProgressAt is the shared tip time, also in a process that loaded but n
     await nonLeader.load(); // loaded like every server process, never ticked
     const result = await ready({ discovery: discoveryFor(s, nonLeader) });
     expect(result).toMatchObject({ finality: 'latest', blockHeight: 102n, lastProgressAt: Number(tip.timestamp) * 1000 });
-    expect((await ready(s)).lastProgressAt).toBe(Number(tip.timestamp) * 1000); // the leader reports the same value
+    expect(await ready(s)).toMatchObject({ lastProgressAt: Number(tip.timestamp) * 1000 }); // the leader reports the same value
   } finally { await s.close(); }
 });
 

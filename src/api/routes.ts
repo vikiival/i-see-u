@@ -10,6 +10,7 @@ import type {
   Address,
   ChainAdapter,
   DiscoveryResult,
+  ServingMetadata,
   DiscoveryService,
   Finality,
   FollowerStatus,
@@ -59,30 +60,35 @@ const finalityJson = (result: { finality: Finality; finalizedBlockHeight?: bigin
 const historyCursor = (value: string | undefined): TransferCursor | undefined => {
   if (value === undefined) return undefined;
 
-  if (!/^\d{1,19}:\d{1,19}:\d{1,19}:\d{1,10}$/.test(value)) throw Object.assign(new Error('Invalid history cursor'), { statusCode: 400 });
-  const [throughBlock, revision, blockNumber, index] = value.split(':').map(BigInt);
+  if (!/^\d{1,19}:\d{1,19}:\d{1,19}:\d{1,10}(:partial)?$/.test(value)) throw Object.assign(new Error('Invalid history cursor'), { statusCode: 400 });
+  const [throughBlock, revision, blockNumber, index] = value.split(':').slice(0, 4).map(BigInt);
 
   if (blockNumber > throughBlock || throughBlock > 9223372036854775807n || revision > 9223372036854775807n || index > 2147483647n) {
     throw Object.assign(new Error('Invalid history cursor'), { statusCode: 400 });
   }
 
-  return { throughBlock, revision, blockNumber, logIndex: Number(index) };
+  return { throughBlock, revision, blockNumber, logIndex: Number(index), ...(value.endsWith(':partial') && { partial: true }) };
 };
 
-const baseJson = (result: DiscoveryResult) => ({
-  status: result.status,
-  network: result.network,
-  account: result.account,
-  fromBlock: result.fromBlock.toString(),
-  blockHeight: result.blockHeight.toString(),
-  blockHash: result.blockHash,
-  ...finalityJson(result),
+const servingJson = (result: ServingMetadata) => result.status === 'partial' ? {
+  status: result.status, complete: false,
+  startBlock: result.startBlock.toString(), targetBlock: result.targetBlock.toString(), targetHash: result.targetHash,
+  coveredRanges: result.coveredRanges.map((range) => ({ fromBlock: range.fromBlock.toString(), toBlock: range.toBlock.toString() })),
+  coveredBlocks: result.coveredBlocks.toString(), totalBlocks: result.totalBlocks.toString(), note: result.note,
+  lastProgressAt: new Date(result.lastAppliedAt).toISOString(),
+} : {
+  status: result.status, complete: true,
+  blockHeight: result.blockHeight.toString(), blockHash: result.blockHash,
   lastProgressAt: new Date(result.lastProgressAt).toISOString(),
   blockTimestamp: new Date(Number(result.blockTimestamp) * 1_000).toISOString(),
   dataAgeS: Math.max(0, Math.floor(Date.now() / 1_000) - Number(result.blockTimestamp)),
-  stale: result.stale,
-  lagBlocks: result.lagBlocks.toString(),
-  followerLagBlocks: result.followerLagBlocks.toString(),
+  stale: result.stale, ...(result.staleReason && { staleReason: result.staleReason }),
+  lagBlocks: result.lagBlocks.toString(), followerLagBlocks: result.followerLagBlocks.toString(),
+};
+
+const baseJson = (result: DiscoveryResult) => ({
+  ...servingJson(result), network: result.network, account: result.account,
+  fromBlock: result.fromBlock.toString(), ...finalityJson(result),
 });
 
 const statusJson = (status: FollowerStatus) => ({
@@ -219,11 +225,10 @@ export function createApp(deps: RouteDeps, opts: { requestLog?: boolean } = {}):
     const result = await deps.discovery.discover(c.req.param('network'), c.req.param('address'), { finality, balances: includeBalances });
 
     const holdings = result.holdings.filter((holding) => holding.standard === 'erc20');
-    const at = { number: result.blockHeight, hash: result.blockHash, timestamp: result.blockTimestamp };
 
     // Pinned to the served block hash: the tail tip for latest, the finalized cursor otherwise.
-    const balances = includeBalances
-      ? await deps.balances[result.network].forAccount(result.account, holdings, at, result.revision, result.balances, c.req.raw.signal)
+    const balances = includeBalances && result.status === 'ready'
+      ? await deps.balances[result.network].forAccount(result.account, holdings, { number: result.blockHeight, hash: result.blockHash, timestamp: result.blockTimestamp }, result.revision, result.balances, c.req.raw.signal)
       : undefined;
 
     const tokens = holdings.map((holding, i) => {
@@ -256,9 +261,10 @@ export function createApp(deps: RouteDeps, opts: { requestLog?: boolean } = {}):
         : { ...token, balanceStatus: balance.status, balanceError: balance.error, ...at };
     });
 
-    const balancesCurrent = balances?.every((snapshot) => snapshot.validAt === result.blockHeight);
+    const balancesCurrent = result.status === 'ready' ? balances?.every((snapshot) => snapshot.validAt === result.blockHeight) : includeBalances ? false : undefined;
 
-    return c.json({ ...baseJson(result), balancesCurrent, tokens });
+    return c.json({ ...baseJson(result), balancesCurrent,
+      ...(includeBalances && result.status === 'partial' && { balancesStatus: 'omitted', balancesReason: 'Balances require a complete snapshot; bootstrap coverage is incomplete' }), tokens });
   });
 
   app.get('/v1/:network/accounts/:address/erc721', async (c) => {
@@ -269,9 +275,9 @@ export function createApp(deps: RouteDeps, opts: { requestLog?: boolean } = {}):
     const heldItems = result.nftItems.filter((item) => item.heldBySeenLogs);
     const adapter = deps.adapters[result.network];
     const cap = deps.maxVerifyOwnershipItems ?? 2000;
-    const skipped = verifyOwnership && heldItems.length > cap;
+    const skipped = verifyOwnership && (result.status === 'partial' || heldItems.length > cap);
 
-    const owners = verifyOwnership && !skipped && heldItems.length > 0
+    const owners = result.status === 'ready' && verifyOwnership && !skipped && heldItems.length > 0
       ? await withDeadline(
         () => ownersFor(`${result.network}:${result.account}:${result.blockHash}:${result.revision}`, adapter, heldItems, result.blockHash),
         deps.requestRpc.deadlineMs,
@@ -328,7 +334,7 @@ export function createApp(deps: RouteDeps, opts: { requestLog?: boolean } = {}):
 
     return c.json({
       ...baseJson(result),
-      ...(skipped && { ownershipError: `Too many held items to verify (${heldItems.length} > ${cap})` }),
+      ...(skipped && { ownershipError: result.status === 'partial' ? 'Ownership verification requires a complete snapshot' : `Too many held items to verify (${heldItems.length} > ${cap})` }),
       collections,
     });
   });
@@ -349,10 +355,10 @@ export function createApp(deps: RouteDeps, opts: { requestLog?: boolean } = {}):
 
     // Rows above finalizedBlockHeight carry `unfinalized: true` and can still be reorged out.
     return c.json({
-      status: 'ready', network, account, ...finalityJson(result), blockHeight: result.blockHeight.toString(), blockHash: result.blockHash,
+      ...servingJson(result), network, account, fromBlock: result.fromBlock.toString(), ...finalityJson(result),
       throughBlock: page.throughBlock.toString(),
       transfers: page.transfers.map((event) => ({ ...event, value: event.value.toString(), blockNumber: event.blockNumber.toString() })),
-      next: next ? `${next.throughBlock}:${next.revision}:${next.blockNumber}:${next.logIndex}` : null,
+      next: next ? `${next.throughBlock}:${next.revision}:${next.blockNumber}:${next.logIndex}${next.partial ? ':partial' : ''}` : null,
     });
   });
 
@@ -362,7 +368,7 @@ export function createApp(deps: RouteDeps, opts: { requestLog?: boolean } = {}):
       try {
         return { network, ...await deps.discovery.status(network) };
       } catch {
-        return { network, ready: false };
+        return { network, ready: false, serving: 'unavailable' };
       }
     }));
 
@@ -374,6 +380,10 @@ export function createApp(deps: RouteDeps, opts: { requestLog?: boolean } = {}):
       return status && status.status !== 'done' ? [[network, bootstrapJson(status)]] : [];
     }))).flat());
 
+    const available = networks.every((network) => network.serving !== 'unavailable');
+
+    if (!available) c.header('Retry-After', '5');
+
     return c.json({
       status: ready ? 'ready' : 'not_ready',
       networks,
@@ -382,7 +392,7 @@ export function createApp(deps: RouteDeps, opts: { requestLog?: boolean } = {}):
       followers: Object.fromEntries(Object.entries(deps.followers).map(([network, f]) => [network, statusJson(f.status())])),
       ...(deps.tails && { tails: Object.fromEntries(Object.entries(deps.tails).map(([network, tail]) => [network, tailJson(tail.status())])) }),
       rpc: deps.rpcStats(),
-    }, ready ? 200 : 503);
+    }, available ? 200 : 503);
   });
 
   return app;

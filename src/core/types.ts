@@ -242,9 +242,21 @@ export interface StoredBalance extends BalanceSnapshot {
   canonical: boolean;
 }
 
+/** Applied segments only; the target is a bound, never a complete account snapshot. */
+export interface BootstrapCoverage {
+  startBlock: bigint;
+  targetBlock: bigint;
+  targetHash: Hex;
+  coveredRanges: BlockRange[];
+  coveredBlocks: bigint;
+  totalBlocks: bigint;
+  lastAppliedAt: number;
+}
+
+export type IndexSnapshot = { state: IndexState; bootstrap?: never } | { state?: never; bootstrap: BootstrapCoverage };
+
 /** Everything one request needs, read in one repeatable-read snapshot. */
-export interface AccountView {
-  state: IndexState;
+export type AccountView = IndexSnapshot & {
   holdings: Holding[];
   nftItems: NftItem[];
   /** With `tail`: the account's tail Transfers strictly above the cursor, ascending, and the tail tip. */
@@ -252,7 +264,7 @@ export interface AccountView {
   tailTip?: BlockHeader;
   /** With `balances`: the account's snapshots. */
   balances?: StoredBalance[];
-}
+};
 
 export type HistoryTransfer = TransferEvent & { unfinalized?: true };
 
@@ -262,16 +274,17 @@ export interface TransferCursor {
   logIndex: number;
   throughBlock: bigint;
   revision: bigint;
+  /** Partial pages restart whenever coverage changes, including publication. */
+  partial?: true;
 }
 
-export interface TransferPage {
-  state: IndexState;
+export type TransferPage = IndexSnapshot & {
   throughBlock: bigint;
   /** Tail rows (above the cursor) are flagged unfinalized; only present when the tail was read. */
   transfers: HistoryTransfer[];
   next?: TransferCursor;
   tailTip?: BlockHeader;
-}
+};
 
 export interface RepairRange extends BlockRange {
   reason: string;
@@ -282,6 +295,7 @@ export interface Store {
   /** Initialize ONLY at startBlock - 1, never at the head. Registry/config owns the start block. */
   initialize(network: string, startBlock: bigint, anchor: BlockHeader, at: number): Promise<IndexState>;
   indexState(network: string): Promise<IndexState | undefined>;
+  indexSnapshot(network: string): Promise<IndexSnapshot | undefined>;
   observeHead(network: string, head: BlockRef, at: number): Promise<void>;
   /** Bulk append for bootstrap and follower. Complete headers include empty blocks. Atomic cursor + raw + derived. */
   appendRange(network: string, range: BlockRange, headers: BlockHeader[], transfers: TransferEvent[], at: number): Promise<boolean>;
@@ -359,46 +373,58 @@ export interface Follower {
   kick(): void;
 }
 
-export interface DiscoveryResult {
+export type ServingMode = 'full' | 'stale' | 'partial' | 'unavailable';
+
+export interface ServingStatus {
+  ready: boolean;
+  serving: ServingMode;
+  reason?: string;
+}
+
+export type ServingMetadata = {
   status: 'ready';
-  network: string;
-  account: Address;
-  fromBlock: bigint;
+  complete: true;
   blockHeight: bigint;
   blockHash: Hex;
   blockTimestamp: bigint;
   revision: bigint;
-  finality: Finality;
-  /** Latest only: the finalized cursor below the served tail tip. */
-  finalizedBlockHeight?: bigint;
-  finalizedBlockHash?: Hex;
-  /** Latest was wanted but the finalized view is served, and why. */
-  tailError?: string;
-  /** Tail tip time (latest) or cursor commit time (finalized), epoch ms. */
   lastProgressAt: number;
   stale: boolean;
+  staleReason?: string;
   lagBlocks: bigint;
   followerLagBlocks: bigint;
-  holdings: Holding[];
-  nftItems: NftItem[];
-  /** Snapshots read in the same database snapshot, when balances were requested. */
-  balances?: StoredBalance[];
-}
+} | (BootstrapCoverage & {
+  status: 'partial';
+  complete: false;
+  note: string;
+});
 
-export interface HistoryResult {
+export type DiscoveryResult = ServingMetadata & {
   network: string;
   account: Address;
-  page: TransferPage;
+  fromBlock: bigint;
   finality: Finality;
-  blockHeight: bigint;
-  blockHash: Hex;
   finalizedBlockHeight?: bigint;
   finalizedBlockHash?: Hex;
   tailError?: string;
-}
+  holdings: Holding[];
+  nftItems: NftItem[];
+  balances?: StoredBalance[];
+};
+
+export type HistoryResult = ServingMetadata & {
+  network: string;
+  account: Address;
+  fromBlock: bigint;
+  page: TransferPage;
+  finality: Finality;
+  finalizedBlockHeight?: bigint;
+  finalizedBlockHash?: Hex;
+  tailError?: string;
+};
 
 export interface DiscoveryService {
-  status(network: string): Promise<{ ready: boolean; reason?: string }>;
+  status(network: string): Promise<ServingStatus>;
   /** Pure DB reads. Readiness is per network, never per account. */
   discover(network: string, account: string, options?: { finality?: Finality; balances?: boolean }): Promise<DiscoveryResult>;
   history(network: string, account: string, limit: number, before?: TransferCursor, finality?: Finality): Promise<HistoryResult>;

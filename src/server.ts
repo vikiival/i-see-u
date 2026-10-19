@@ -50,14 +50,14 @@ const tails = config.tail.enabled ? Object.fromEntries(Object.values(adapters).m
 })])) : undefined;
 
 const discovery = createDiscoveryService({
-  adapters, store, tails, maxTailTipAgeMs: config.tail.maxTipAgeMs, maxHeadAgeMs: config.maxHeadAgeMs, maxNoAdvanceMs: config.maxHeadProgressAgeMs,
+  adapters, store, tails, maxServeLagBlocks: config.maxServeLagBlocks, maxTailTipAgeMs: config.tail.maxTipAgeMs, maxHeadAgeMs: config.maxHeadAgeMs, maxNoAdvanceMs: config.maxHeadProgressAgeMs,
 });
 
 await Promise.all([...Object.values(followers), ...Object.values(tails ?? {})].map((part) => part.load()));
 
 for (const part of [...Object.values(followers), ...Object.values(tails ?? {})]) part.start();
 
-// Optional in-process bootstrap: the service stays not_ready (follower and tail wait) until it publishes the index.
+// Optional in-process bootstrap: account reads serve applied segments; follower and tail wait for publication.
 if (config.bootstrap.onStart) {
   for (const network of Object.values(config.networks)) {
     if (await store.indexState(network.name)) continue;
@@ -83,7 +83,7 @@ const app = createApp({
 }, { requestLog: process.env.LOG_LEVEL !== 'warn' && process.env.LOG_LEVEL !== 'error' });
 
 const server = serve({ fetch: app.fetch, port: config.port, hostname: '0.0.0.0' }, (info) => {
-  console.log(`i-see-u listening on http://localhost:${info.port}; not ready until the bootstrap (npm run bootstrap) has published the index`);
+  console.log(`i-see-u listening on http://localhost:${info.port}; bootstrap (npm run bootstrap) serves partial data until publication`);
 });
 
 let shuttingDown = false;

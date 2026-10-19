@@ -367,9 +367,9 @@ test('/health reports bootstrap progress while not ready, and is ready once the 
   try {
     await expect(runBootstrap(options(f, chain, { rpc: fakeSource('rpc', chain, { crash: (range) => range.fromBlock === 107n }).source }))).rejects.toThrow();
     const pending = await s.app.request('/health');
-    expect(pending.status).toBe(503);
+    expect(pending.status).toBe(200);
     expect(await pending.json()).toMatchObject({
-      status: 'not_ready',
+      status: 'not_ready', networks: [{ network: 'ethereum', ready: false, serving: 'partial' }],
       bootstrap: { ethereum: { status: 'logs', startBlock: '100', targetBlock: '130', headers: '32/32', segmentsDone: 4, segmentsTotal: 5, segmentsFailed: 1 } },
     });
     await runBootstrap(options(f, chain));
