@@ -123,10 +123,12 @@ test.each([false, true])('history fallback uses the second snapshot metadata and
     };
 
     if (pendingRepair) {
-      const error = { message: 'Global index has pending repairs', statusCode: 503, serviceStatus: 'not_ready', retryAfterS: 5 };
-      await expect(s.discovery.history('ethereum', account, 10)).rejects.toMatchObject(error);
+      expect(await s.discovery.history('ethereum', account, 10)).toMatchObject({
+        stale: true, repairPending: true, staleReason: 'Global index has pending repairs', blockHeight: 101n,
+        page: { throughBlock: 101n, transfers: [{ blockNumber: 101n }] },
+      });
       expect(reads).toBe(2);
-      await expect(s.discovery.history('ethereum', account, 10, undefined, 'finalized')).rejects.toMatchObject(error);
+      expect(await s.discovery.history('ethereum', account, 10, undefined, 'finalized')).toMatchObject({ stale: true, repairPending: true });
     } else {
       const result = await s.discovery.history('ethereum', account, 10);
       expect(reads).toBe(2);

@@ -26,7 +26,7 @@ test('one network serving mode applies to all accounts during catch-up', async (
   const s = await stack(new FakeChain(103n), { range: 2n, maxRanges: 1 });
 
   try {
-    for (const who of [account, address(2)]) await expect(s.discovery.discover('ethereum', who)).rejects.toMatchObject({ statusCode: 503, serviceStatus: 'not_ready' });
+    for (const who of [account, address(2)]) expect(await s.discovery.discover('ethereum', who)).toMatchObject({ stale: true, holdings: [] });
     await s.follower.tick();
     expect(await s.discovery.discover('ethereum', account)).toMatchObject({ status: 'ready', stale: true, staleReason: 'Global index has not reached the finalized head' });
     await s.follower.tick();
@@ -34,11 +34,11 @@ test('one network serving mode applies to all accounts during catch-up', async (
   } finally { await s.close(); }
 });
 
-test('unobserved heads are unavailable; expired observations and stalled progress serve stale snapshots', async () => {
+test('unobserved heads, expired observations and stalled progress serve stale snapshots', async () => {
   const s = await stack();
 
   try {
-    await expect(s.discovery.discover('ethereum', account)).rejects.toThrow('finalized head');
+    expect(await s.discovery.discover('ethereum', account)).toMatchObject({ stale: true, staleReason: 'Global index awaits finalized head observation' });
     await s.follower.tick();
     s.clock.at += 120_001;
     expect(await s.discovery.discover('ethereum', account)).toMatchObject({ stale: true, staleReason: 'Finalized head observation is too old' });
@@ -50,13 +50,13 @@ test('unobserved heads are unavailable; expired observations and stalled progres
   } finally { await s.close(); }
 });
 
-test('pending repairs block discovery until replacement resolves the suspect range', async () => {
+test('pending repairs mark discovery stale until replacement resolves the suspect range', async () => {
   const s = await stack();
 
   try {
     await s.follower.tick();
     await s.store.enqueueRepair('ethereum', blockRange(101n), 'suspect', s.clock.at);
-    await expect(s.discovery.discover('ethereum', account)).rejects.toThrow('pending repairs');
+    expect(await s.discovery.discover('ethereum', account)).toMatchObject({ stale: true, repairPending: true });
     await s.store.replaceRange('ethereum', blockRange(101n), headersFor(101n), []);
     expect(await s.discovery.discover('ethereum', account)).toMatchObject({ revision: 1n });
   } finally { await s.close(); }

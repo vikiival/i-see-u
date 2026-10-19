@@ -42,18 +42,20 @@ test('discovery serializes exact quantities and on-request balances are pinned a
   } finally { await s.close(); }
 });
 
-test('not-ready is a service-level 503, never an account 202; health uses the same readiness', async () => {
+test('not-ready serves stale account snapshots and health readiness is informational', async () => {
   const s = await stack();
 
   try {
     for (const suffix of ['erc20', 'erc721', 'transfers']) {
       const response = await s.app.request(`${path}/${suffix}`);
-      expect(response.status).toBe(503);
-      expect(response.headers.get('retry-after')).toBe('5');
-      expect(await response.json()).toMatchObject({ status: 'not_ready' });
+      expect(response.status).toBe(200);
+      expect(response.headers.get('retry-after')).toBeNull();
+      expect(await response.json()).toMatchObject({ status: 'ready', stale: true });
     }
 
-    expect((await s.app.request('/health')).status).toBe(503);
+    const health = await s.app.request('/health');
+    expect(health.status).toBe(200);
+    expect(await health.json()).toMatchObject({ status: 'not_ready', networks: [{ ready: false, serving: 'stale' }] });
     await s.follower.tick();
     expect((await s.app.request('/health')).status).toBe(200);
   } finally { await s.close(); }

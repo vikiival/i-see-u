@@ -15,7 +15,7 @@ export const blockRange = (fromBlock: bigint, toBlock = fromBlock): BlockRange =
 export const headersFor = (from: bigint, to = from): BlockHeader[] => Array.from({ length: Number(to - from + 1n) }, (_, i) => header(from + BigInt(i)));
 
 export async function stack(chain = new FakeChain(102n), options: {
-  initialize?: boolean; maxServeLagBlocks?: bigint; maxRanges?: number; range?: bigint; deadlineMs?: number;
+  initialize?: boolean; maxRanges?: number; range?: bigint; deadlineMs?: number;
   balances?: Partial<{ batchSize: number; windowMs: number; alwaysRefresh: Address[]; concurrency: number; queue: number }>;
   /** Wire a tail (latest view) into discovery and the API. */
   tail?: Partial<Omit<TailOptions, 'adapter' | 'store' | 'follower'>> & { maxTipAgeMs?: number };
@@ -31,7 +31,7 @@ export async function stack(chain = new FakeChain(102n), options: {
   const tails = tail && { ethereum: tail };
 
   const discovery = createDiscoveryService({
-    adapters: { ethereum: adapter }, store, tails, maxServeLagBlocks: options.maxServeLagBlocks, maxTailTipAgeMs: maxTipAgeMs, maxHeadAgeMs: 120_000, maxNoAdvanceMs: 1_800_000, now: () => clock.at,
+    adapters: { ethereum: adapter }, store, tails, maxTailTipAgeMs: maxTipAgeMs, maxHeadAgeMs: 120_000, maxNoAdvanceMs: 1_800_000, now: () => clock.at,
   });
 
   const b = options.balances ?? {};

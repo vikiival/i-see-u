@@ -242,15 +242,15 @@ export interface StoredBalance extends BalanceSnapshot {
   canonical: boolean;
 }
 
-/** Applied segments only; the target is a bound, never a complete account snapshot. */
+/** Applied segments only; target/progress are unknown before a bootstrap run exists. */
 export interface BootstrapCoverage {
   startBlock: bigint;
-  targetBlock: bigint;
-  targetHash: Hex;
+  targetBlock?: bigint;
+  targetHash?: Hex;
   coveredRanges: BlockRange[];
   coveredBlocks: bigint;
-  totalBlocks: bigint;
-  lastAppliedAt: number;
+  totalBlocks?: bigint;
+  lastAppliedAt?: number;
 }
 
 export type IndexSnapshot = { state: IndexState; bootstrap?: never } | { state?: never; bootstrap: BootstrapCoverage };
@@ -373,7 +373,7 @@ export interface Follower {
   kick(): void;
 }
 
-export type ServingMode = 'full' | 'stale' | 'partial' | 'unavailable';
+export type ServingMode = 'full' | 'stale' | 'partial';
 
 export interface ServingStatus {
   ready: boolean;
@@ -391,6 +391,9 @@ export type ServingMetadata = {
   lastProgressAt: number;
   stale: boolean;
   staleReason?: string;
+  repairPending?: true;
+  headHashMismatch?: true;
+  note?: string;
   lagBlocks: bigint;
   followerLagBlocks: bigint;
 } | (BootstrapCoverage & {

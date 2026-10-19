@@ -10,12 +10,12 @@ const [account, peer, token, missingToken, nft] = [1, 2, 3, 4, 5].map(address);
 const path = `/v1/ethereum/accounts/${account}`;
 const behind = 'Global index has not reached the finalized head';
 
-async function lagging(maxServeLagBlocks = 7200n) {
+async function lagging() {
   const chain = new FakeChain(100n);
   chain.latest = 102n;
   chain.addTransfer({ token, from: peer, to: account, value: 1n, blockNumber: 100n });
   chain.addTransfer({ token: missingToken, from: peer, to: account, value: 2n, blockNumber: 102n });
-  const s = await stack(chain, { maxServeLagBlocks, tail: {} });
+  const s = await stack(chain, { tail: {} });
   await s.follower.tick();
   await s.tail!.tick();
   await s.store.observeHead('ethereum', header(101n), s.clock.at);
@@ -52,42 +52,64 @@ test('lagging discovery and history return 200 at the cursor, excluding a health
   } finally { await s.close(); }
 });
 
-test('the configured lag limit is inclusive; beyond it every read is unavailable with Retry-After', async () => {
-  const s = await lagging(2n);
-
-  try {
-    await s.store.observeHead('ethereum', header(102n), s.clock.at);
-    expect((await s.app.request(`${path}/erc20`)).status).toBe(200);
-    await s.store.observeHead('ethereum', header(103n), s.clock.at);
-
-    for (const url of [`${path}/erc20`, `${path}/erc721`, `${path}/transfers`, '/health']) {
-      const response = await s.app.request(url);
-      expect(response.status).toBe(503);
-      expect(response.headers.get('retry-after')).toBe('5');
-      expect(await response.json()).toMatchObject({ status: 'not_ready' });
-    }
-
-    expect(await s.discovery.status('ethereum')).toMatchObject({ serving: 'unavailable' });
-  } finally { await s.close(); }
-});
-
-test.each(['repair', 'hash'])('%s inconsistency remains unavailable even with an expired observation', async (problem) => {
+test('arbitrarily large observed lag serves the cursor and health stays 200', async () => {
   const s = await lagging();
 
   try {
-    if (problem === 'repair') await s.store.enqueueRepair('ethereum', blockRange(100n), 'suspect', s.clock.at);
-    else {
+    await s.store.observeHead('ethereum', header(100_000n), s.clock.at);
+
+    for (const suffix of ['erc20', 'erc721', 'transfers']) {
+      const response = await s.app.request(`${path}/${suffix}`);
+      expect(response.status).toBe(200);
+      expect(response.headers.get('retry-after')).toBeNull();
+      expect(await response.json()).toMatchObject({ complete: true, stale: true, staleReason: behind, blockHeight: '100', followerLagBlocks: '99900' });
+    }
+
+    const health = await s.app.request('/health');
+    expect(health.status).toBe(200);
+    expect(health.headers.get('retry-after')).toBeNull();
+    expect(await health.json()).toMatchObject({ status: 'not_ready', networks: [{ serving: 'stale', reason: behind }] });
+  } finally { await s.close(); }
+});
+
+test.each(['repair', 'hash', 'both'])('%s inconsistency serves stale with an explicit flag even with an expired observation', async (problem) => {
+  const s = await lagging();
+
+  try {
+    const repair = problem !== 'hash';
+
+    if (repair) await s.store.enqueueRepair('ethereum', blockRange(100n), 'suspect', s.clock.at);
+
+    if (problem !== 'repair') {
       // Same-height mismatch without a repair queue entry, as seen before the follower queues it.
       await s.db.execute(sql`UPDATE ingestion_state SET head_number = 100, head_hash = decode(${blockHash(999n).slice(2)}, 'hex')`);
     }
 
     s.clock.at += 2_000_000;
 
-    for (const suffix of ['erc20', 'transfers']) {
+    for (const suffix of ['erc20', 'erc721', 'transfers']) {
       const response = await s.app.request(`${path}/${suffix}`);
-      expect(response.status).toBe(503);
-      expect(await response.json()).toMatchObject({ status: 'not_ready', error: expect.stringMatching(problem === 'repair' ? /pending repairs/ : /hash mismatch/) });
+      expect(response.status).toBe(200);
+      expect(response.headers.get('retry-after')).toBeNull();
+      expect(await response.json()).toMatchObject({ status: 'ready', complete: true, stale: true, blockHeight: '100', finality: 'finalized',
+        staleReason: expect.stringMatching(repair ? /pending repairs/ : /hash mismatch/),
+        ...(repair && { repairPending: true, note: expect.stringContaining('may change') }),
+        ...(problem !== 'repair' && { headHashMismatch: true }) });
     }
+
+    expect(await s.discovery.discover('ethereum', account)).toMatchObject({ holdings: [{ token, receivedCount: 1n }] });
+
+    if (problem === 'repair') {
+      await s.store.replaceRange('ethereum', blockRange(100n), headersFor(100n), []);
+      const repaired = await s.discovery.discover('ethereum', account);
+      expect(repaired).toMatchObject({ holdings: [], revision: 1n });
+      expect(repaired).not.toHaveProperty('repairPending');
+      expect((await s.app.request(`${path}/transfers?before=100:0:100:0`)).status).toBe(409);
+    }
+
+    const health = await s.app.request('/health');
+    expect(health.status).toBe(200);
+    expect(await health.json()).toMatchObject({ status: 'not_ready', networks: [{ serving: 'stale' }] });
   } finally { await s.close(); }
 });
 
@@ -179,17 +201,37 @@ test('out-of-order applied segments serve partial holdings, NFTs and paged histo
   } finally { await s.close(); }
 });
 
-test('a created run with zero applied blocks serves empty partial data; no run remains unavailable', async () => {
+test('no run and a created run with zero applied blocks both serve empty partial data', async () => {
   const s = await stack(new FakeChain(102n), { initialize: false });
 
   try {
-    for (const url of [`${path}/erc20`, `${path}/transfers`, '/health']) {
-      const response = await s.app.request(url);
-      expect(response.status).toBe(503);
-      expect(response.headers.get('retry-after')).toBe('5');
+    const calls = s.chain.total;
+
+    for (const suffix of ['erc20?balances=true', 'erc721?verifyOwnership=true', 'transfers']) {
+      const response = await s.app.request(`${path}/${suffix}`);
+      expect(response.status).toBe(200);
+      expect(response.headers.get('retry-after')).toBeNull();
+      const body = await response.json();
+      expect(body).toMatchObject({ status: 'partial', complete: false, startBlock: '100', coveredRanges: [], coveredBlocks: '0' });
+      expect(body.targetBlock).toBeUndefined();
+      expect(body.targetHash).toBeUndefined();
+      expect(body.totalBlocks).toBeUndefined();
+      expect(body.lastProgressAt).toBeUndefined();
+
+      if (suffix.startsWith('erc20')) expect(body).toMatchObject({ tokens: [], balancesStatus: 'omitted' });
+
+      if (suffix.startsWith('erc721')) expect(body).toMatchObject({ collections: [], ownershipError: expect.stringContaining('complete snapshot') });
+
+      if (suffix === 'transfers') expect(body).toMatchObject({ transfers: [], next: null, throughBlock: '0' });
     }
 
-    expect(await s.discovery.status('ethereum')).toMatchObject({ serving: 'unavailable' });
+    expect(await s.discovery.discover('ethereum', account)).toMatchObject({ holdings: [], nftItems: [] });
+    expect(s.chain.total).toBe(calls);
+    const emptyHealth = await s.app.request('/health');
+    expect(emptyHealth.status).toBe(200);
+    expect(await emptyHealth.json()).toMatchObject({ status: 'not_ready', networks: [{ ready: false, serving: 'partial' }] });
+    expect(await s.discovery.status('ethereum')).toMatchObject({ serving: 'partial' });
+    expect((await s.app.request(`${path}/transfers?before=100:0:100:0:partial`)).status).toBe(409);
     await createBootstrapStore(s.db).createRun('ethereum', { startBlock: 100n, target: header(102n), anchor: header(99n), segmentBlocks: 2n }, s.clock.at);
 
     for (const suffix of ['erc20', 'transfers']) {
@@ -219,6 +261,46 @@ test('publication switches partial to full atomically and invalidates partial pa
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ status: 'ready', complete: true, stale: false, blockHeight: '111', tokens: [expect.any(Object), expect.any(Object)] });
     expect(await s.discovery.status('ethereum')).toEqual({ ready: true, serving: 'full' });
+    const health = await s.app.request('/health');
+    expect(health.status).toBe(200);
+    expect(health.headers.get('retry-after')).toBeNull();
+    expect(await health.json()).toMatchObject({ status: 'ready', networks: [{ ready: true, serving: 'full' }] });
     expect(await s.store.nftItems('ethereum', account)).toEqual([]);
+  } finally { await s.close(); }
+});
+
+test('published index without a head observation serves stale at the cursor', async () => {
+  const s = await stack();
+
+  try {
+    await s.follower.tick();
+    await s.db.execute(sql`UPDATE ingestion_state SET head_number = NULL, head_hash = NULL, head_timestamp = NULL, checked_at = NULL`);
+
+    for (const suffix of ['erc20', 'erc721', 'transfers']) {
+      const response = await s.app.request(`${path}/${suffix}`);
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ stale: true, staleReason: 'Global index awaits finalized head observation', blockHeight: '102', followerLagBlocks: '0' });
+    }
+
+    const health = await s.app.request('/health');
+    expect(health.status).toBe(200);
+    expect(await health.json()).toMatchObject({ status: 'not_ready', networks: [{ serving: 'stale' }] });
+  } finally { await s.close(); }
+});
+
+test('database acquisition failures still return 503 with Retry-After for accounts and health', async () => {
+  const s = await stack();
+  const fail = async () => { throw new Error('timeout exceeded when trying to connect'); };
+
+  s.store.readAccount = fail;
+  s.store.transferHistory = fail;
+  s.store.indexSnapshot = fail;
+
+  try {
+    for (const url of [`${path}/erc20`, `${path}/erc721`, `${path}/transfers`, '/health']) {
+      const response = await s.app.request(url);
+      expect(response.status).toBe(503);
+      expect(response.headers.get('retry-after')).not.toBeNull();
+    }
   } finally { await s.close(); }
 });

@@ -522,7 +522,7 @@ export function createStore(
         const revision = cursor?.revision ?? snapshot.bootstrap!.coveredBlocks;
         const partial = snapshot.bootstrap ? true : undefined;
         const tip = cursor && tail ? await tailTip(tx, n) : undefined;
-        const top = cursor ? (tip && tip.number > cursor.number ? tip.number : cursor.number) : snapshot.bootstrap!.targetBlock;
+        const top = cursor ? (tip && tip.number > cursor.number ? tip.number : cursor.number) : (snapshot.bootstrap!.targetBlock ?? 0n);
 
         // A latest cursor above the finalized cursor stays valid while the tail still reaches its bound.
         if (before && (before.partial !== partial || before.revision !== revision || before.throughBlock > top)) {

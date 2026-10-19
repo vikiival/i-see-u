@@ -50,7 +50,7 @@ const tails = config.tail.enabled ? Object.fromEntries(Object.values(adapters).m
 })])) : undefined;
 
 const discovery = createDiscoveryService({
-  adapters, store, tails, maxServeLagBlocks: config.maxServeLagBlocks, maxTailTipAgeMs: config.tail.maxTipAgeMs, maxHeadAgeMs: config.maxHeadAgeMs, maxNoAdvanceMs: config.maxHeadProgressAgeMs,
+  adapters, store, tails, maxTailTipAgeMs: config.tail.maxTipAgeMs, maxHeadAgeMs: config.maxHeadAgeMs, maxNoAdvanceMs: config.maxHeadProgressAgeMs,
 });
 
 await Promise.all([...Object.values(followers), ...Object.values(tails ?? {})].map((part) => part.load()));

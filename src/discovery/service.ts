@@ -1,5 +1,4 @@
 import { addTransfer, emptyAggregate } from '../core/aggregate.ts';
-import { unavailable } from '../core/limiter.ts';
 import type { AccountView, Address, BlockHeader, ChainAdapter, DiscoveryService, IndexSnapshot, IndexState, ServingMetadata, ServingStatus, TailStatus } from '../core/types.ts';
 import type { Store } from '../core/types.ts';
 
@@ -8,8 +7,6 @@ export interface DiscoveryDependencies {
   store: Store;
   maxHeadAgeMs: number;
   maxNoAdvanceMs: number;
-  /** Hard observed finalized-head distance; an old observation alone remains servable. */
-  maxServeLagBlocks?: bigint;
   /** Per-network tail; without one every read is finalized. */
   tails?: Record<string, { status(): TailStatus }>;
   /**
@@ -76,30 +73,21 @@ export function createDiscoveryService(deps: DiscoveryDependencies): DiscoverySe
     const state = snapshot?.state;
     let reason: string | undefined;
 
-    if (snapshot?.bootstrap) return { ready: false, serving: 'partial', reason: 'Global index bootstrap is incomplete' };
+    if (!state) return { ready: false, serving: 'partial', reason: 'Global index bootstrap is incomplete' };
 
-    if (!state?.head || state.checkedAt === undefined) reason = 'Global index awaits bootstrap or finalized head';
-    else if (state.pendingRepair) reason = 'Global index has pending repairs';
-    else if (state.cursor.number === state.head.number && state.cursor.hash !== state.head.hash) reason = 'Global index head hash mismatch';
-    else if (state.head.number - state.cursor.number > (deps.maxServeLagBlocks ?? 7200n)) reason = 'Global index has not reached the finalized head';
-    else {
-      if (state.cursor.number < state.head.number) reason = 'Global index has not reached the finalized head';
-      else if (now() - state.checkedAt > deps.maxHeadAgeMs) reason = 'Finalized head observation is too old';
-      else if (now() - state.cursor.updatedAt > deps.maxNoAdvanceMs) reason = 'Global index has not advanced recently enough';
+    if (state.pendingRepair) reason = 'Global index has pending repairs';
+    else if (state.head && state.cursor.number === state.head.number && state.cursor.hash !== state.head.hash) reason = 'Global index head hash mismatch';
+    else if (!state.head || state.checkedAt === undefined) reason = 'Global index awaits finalized head observation';
+    else if (state.cursor.number < state.head.number) reason = 'Global index has not reached the finalized head';
+    else if (now() - state.checkedAt > deps.maxHeadAgeMs) reason = 'Finalized head observation is too old';
+    else if (now() - state.cursor.updatedAt > deps.maxNoAdvanceMs) reason = 'Global index has not advanced recently enough';
 
-      return { ready: reason === undefined, serving: reason ? 'stale' : 'full', ...(reason && { reason }) };
-    }
-
-    return { ready: false, serving: 'unavailable', reason };
+    return { ready: reason === undefined, serving: reason ? 'stale' : 'full', ...(reason && { reason }) };
   };
 
-  const requireAvailable = <T extends IndexSnapshot>(snapshot: T | undefined): T => {
-    const status = statusOf(snapshot);
-
-    if (status.serving === 'unavailable') throw Object.assign(unavailable(status.reason!, 5), { serviceStatus: 'not_ready' });
-
-    return snapshot!;
-  };
+  const emptyIndex = (network: string): IndexSnapshot => ({ bootstrap: {
+    startBlock: deps.adapters[network].startBlock, coveredRanges: [], coveredBlocks: 0n,
+  } });
 
   const metadata = (snapshot: IndexSnapshot, served?: BlockHeader | IndexState['cursor'], latest?: bigint): ServingMetadata => {
     if (snapshot.bootstrap) return {
@@ -114,8 +102,11 @@ export function createDiscoveryService(deps: DiscoveryDependencies): DiscoverySe
       status: 'ready', complete: true, blockHeight: block.number, blockHash: block.hash, blockTimestamp: block.timestamp, revision: cursor.revision,
       lastProgressAt: block === cursor ? cursor.updatedAt : Number(block.timestamp) * 1000,
       stale: status.serving === 'stale', ...(status.reason && { staleReason: status.reason }),
+      ...(snapshot.state.pendingRepair && { repairPending: true as const,
+        note: 'Rows in the repaired range and derived counts/ownership may change when repair commits.' }),
+      ...(head && cursor.number === head.number && cursor.hash !== head.hash && { headHashMismatch: true as const }),
       lagBlocks: latest !== undefined && latest > block.number ? latest - block.number : 0n,
-      followerLagBlocks: head!.number > cursor.number ? head!.number - cursor.number : 0n,
+      followerLagBlocks: head && head.number > cursor.number ? head.number - cursor.number : 0n,
     };
   };
 
@@ -143,7 +134,7 @@ export function createDiscoveryService(deps: DiscoveryDependencies): DiscoverySe
       const { adapter, account } = validate(network, input);
       const tail = options.finality === 'finalized' ? undefined : tailOf(network)?.status();
       const view = await deps.store.readAccount(network, account, { tail: tail !== undefined, balances: options.balances });
-      const snapshot = requireAvailable(view);
+      const snapshot: AccountView = view ?? { ...emptyIndex(network), holdings: [], nftItems: [], tailTransfers: [] };
 
       if (snapshot.bootstrap) return {
         ...metadata(snapshot), network, account, fromBlock: snapshot.bootstrap.startBlock, finality: 'finalized',
@@ -168,14 +159,17 @@ export function createDiscoveryService(deps: DiscoveryDependencies): DiscoverySe
     async history(network, input, limit, before, finality) {
       const { adapter, account } = validate(network, input);
       const tail = finality === 'finalized' ? undefined : tailOf(network)?.status();
-      let page = requireAvailable(await deps.store.transferHistory(network, account, limit, before, tail !== undefined));
+      let page = await deps.store.transferHistory(network, account, limit, before, tail !== undefined);
+
+      if (!page && before) throw Object.assign(new Error('History changed; restart pagination'), { statusCode: 409 });
+      page ??= { ...emptyIndex(network), throughBlock: 0n, transfers: [] };
 
       let tailError = finality !== 'finalized'
         ? statusOf(page).reason ?? (tail && tailProblem(tail, page.tailTip, page.state!.cursor.number)) : undefined;
 
-      // Recheck availability and metadata in the second snapshot; a latest cursor may now get 409.
+      // Recheck metadata in the second snapshot; a latest cursor may now get 409.
       if (tailError && page.state && page.throughBlock > page.state.cursor.number) {
-        page = requireAvailable(await deps.store.transferHistory(network, account, limit, before));
+        page = await deps.store.transferHistory(network, account, limit, before) ?? { ...emptyIndex(network), throughBlock: 0n, transfers: [] };
         tailError = statusOf(page).reason ?? tailError;
       }
 

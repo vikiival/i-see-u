@@ -72,10 +72,10 @@ const historyCursor = (value: string | undefined): TransferCursor | undefined =>
 
 const servingJson = (result: ServingMetadata) => result.status === 'partial' ? {
   status: result.status, complete: false,
-  startBlock: result.startBlock.toString(), targetBlock: result.targetBlock.toString(), targetHash: result.targetHash,
+  startBlock: result.startBlock.toString(), targetBlock: result.targetBlock?.toString(), targetHash: result.targetHash,
   coveredRanges: result.coveredRanges.map((range) => ({ fromBlock: range.fromBlock.toString(), toBlock: range.toBlock.toString() })),
-  coveredBlocks: result.coveredBlocks.toString(), totalBlocks: result.totalBlocks.toString(), note: result.note,
-  lastProgressAt: new Date(result.lastAppliedAt).toISOString(),
+  coveredBlocks: result.coveredBlocks.toString(), totalBlocks: result.totalBlocks?.toString(), note: result.note,
+  ...(result.lastAppliedAt !== undefined && { lastProgressAt: new Date(result.lastAppliedAt).toISOString() }),
 } : {
   status: result.status, complete: true,
   blockHeight: result.blockHeight.toString(), blockHash: result.blockHash,
@@ -83,6 +83,8 @@ const servingJson = (result: ServingMetadata) => result.status === 'partial' ? {
   blockTimestamp: new Date(Number(result.blockTimestamp) * 1_000).toISOString(),
   dataAgeS: Math.max(0, Math.floor(Date.now() / 1_000) - Number(result.blockTimestamp)),
   stale: result.stale, ...(result.staleReason && { staleReason: result.staleReason }),
+  ...(result.repairPending && { repairPending: true, note: result.note }),
+  ...(result.headHashMismatch && { headHashMismatch: true }),
   lagBlocks: result.lagBlocks.toString(), followerLagBlocks: result.followerLagBlocks.toString(),
 };
 
@@ -363,12 +365,16 @@ export function createApp(deps: RouteDeps, opts: { requestLog?: boolean } = {}):
   });
 
   app.get('/health', async (c) => {
-    // Probe the same DB readiness rules as account reads; no RPC and no account-specific state.
+    // Readiness is informational; only a failed database probe makes health unavailable.
+    let available = true;
+
     const networks = await Promise.all(Object.keys(deps.adapters).map(async (network) => {
       try {
         return { network, ...await deps.discovery.status(network) };
       } catch {
-        return { network, ready: false, serving: 'unavailable' };
+        available = false;
+
+        return { network, ready: false, reason: 'Database status read failed' };
       }
     }));
 
@@ -379,8 +385,6 @@ export function createApp(deps: RouteDeps, opts: { requestLog?: boolean } = {}):
 
       return status && status.status !== 'done' ? [[network, bootstrapJson(status)]] : [];
     }))).flat());
-
-    const available = networks.every((network) => network.serving !== 'unavailable');
 
     if (!available) c.header('Retry-After', '5');
 
