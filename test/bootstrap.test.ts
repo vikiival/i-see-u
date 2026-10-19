@@ -4,9 +4,13 @@ import { expect, test, vi } from 'vitest';
 import { assertStartBlock, runBootstrap, StartBlockMismatchError } from '../src/bootstrap/bootstrap.ts';
 import type { BootstrapOptions } from '../src/bootstrap/bootstrap.ts';
 import { createBootstrapStore } from '../src/bootstrap/store.ts';
+import { runConfiguredBootstrap } from '../src/bootstrap/wire.ts';
 import type { BootstrapHeader, BootstrapSource } from '../src/bootstrap/sources.ts';
-import type { BlockRange, TransferEvent } from '../src/core/types.ts';
+import type { BlockRange, RpcClient, RpcRequestOptions, TransferEvent } from '../src/core/types.ts';
 import { createFollower } from '../src/follower/follower.ts';
+import { networkRegistry } from '../src/networks.ts';
+import * as rpcClient from '../src/rpc/client.ts';
+import { advisoryKey, singleConnectionLeaderLock } from '../src/store/advisory-lock.ts';
 import { address, blockHash, FakeChain } from './fake-chain.ts';
 import { headersFor, stack } from './stack.ts';
 import { createTestStore } from './store-fixture.ts';
@@ -198,6 +202,72 @@ test('a crash mid-segment leaves no rows; the rerun loads only that segment, a f
   } finally { await f.store.close(); }
 });
 
+test('stopping a configured bootstrap aborts a waiting source, rolls back the segment and releases its lock before resuming', async () => {
+  const chain = populated(113n);
+  const f = await fixture();
+  const waiting = Promise.withResolvers<void>();
+  const lock = singleConnectionLeaderLock(f.db, advisoryKey('bootstrap:ethereum'));
+  let stoppedSignal: AbortSignal | undefined;
+  let requests = 0;
+
+  const rpc: RpcClient = {
+    request<T>(method: string, params: unknown[], options?: RpcRequestOptions) {
+      if (method === 'eth_getLogs' && ++requests === 2) {
+        stoppedSignal = options?.signal;
+        waiting.resolve();
+
+        return new Promise<T>((_resolve, reject) => {
+          options?.signal?.addEventListener('abort', () => reject(options.signal?.reason), { once: true });
+        });
+      }
+
+      return chain.rpc.request<T>(method, params, options);
+    },
+    stats: chain.rpc.stats,
+  };
+
+  const mockedRpc = vi.spyOn(rpcClient, 'createRpcClient').mockReturnValue(rpc);
+
+  const config: Parameters<typeof runConfiguredBootstrap>[0] = {
+    rpc: { urls: ['https://rpc.invalid'], timeoutMs: 60_000, maxAttempts: 1, maxRps: 20 },
+    bootstrap: {
+      onStart: true, segmentBlocks: 7n, headerChunkBlocks: 10n, rpcWorkers: 2, rpcLogRange: 3n, rpcTimeoutMs: 60_000,
+      hypersyncApiKey: undefined, hypersyncUrl: 'https://hypersync.invalid', hypersyncIdleMs: 120_000, workMem: '64MB', maintenanceWorkMem: '1GB',
+    },
+  };
+
+  const network = { ...networkRegistry.ethereum, startBlock: 100n, finalizedMaxNoProgressMs: 1_800_000, followerMaxRange: 500n, multicallBatch: 1000 };
+  let run: ReturnType<typeof runConfiguredBootstrap> | undefined;
+
+  try {
+    expect(await lock.tryAcquire()).toBe(true);
+    run = runConfiguredBootstrap(config, network, { store: f.store, bootstrap: f.bootstrap, log: () => {}, lock });
+    const settled = expect(run.done).rejects.toThrow('Bootstrap stopped');
+    await waiting.promise; // one page was inserted inside the open segment transaction
+    expect(lock.held()).toBe(true);
+    await run.stop();
+    await settled;
+    expect(stoppedSignal?.aborted).toBe(true);
+    expect(lock.held()).toBe(false);
+    expect(requests).toBe(2); // no next page, fallback or next segment after stop
+    expect(await f.store.indexState('ethereum')).toBeUndefined();
+    expect(await dump(f)).toEqual({ holdings: [], nfts: [], transfers: [], headers: [] });
+    expect(await f.bootstrap.status('ethereum', Date.now())).toMatchObject({ segmentsDone: 0, segmentsApplied: 0 });
+
+    expect(await lock.tryAcquire()).toBe(true);
+    const resumed = fakeSource('rpc', chain);
+    await runBootstrap(options(f, chain, { rpc: resumed.source, rpcWorkers: 1 }));
+    expect(resumed.calls.headers).toEqual([]);
+    expect(resumed.calls.transfers).toHaveLength(2);
+    expect(await dump(f)).toEqual(await followerDump(chain));
+  } finally {
+    await run?.stop();
+    mockedRpc.mockRestore();
+    await lock.release();
+    await f.store.close();
+  }
+});
+
 test('loss of old UNLOGGED staging leaves newly committed segments intact', async () => {
   const chain = populated();
   const f = await fixture();
@@ -341,6 +411,29 @@ test('a block whose bloom has Transfer but returned no logs is re-asked on the o
     expect(rpc.calls.blocks).toEqual([105n]);
     expect(rpc.calls.transfers).toContainEqual({ fromBlock: 100n, toBlock: 106n });
     expect(await dump(f)).toEqual(await followerDump(populated()));
+  } finally { await f.store.close(); }
+});
+
+test.each([
+  { identity: 'hash', wrongBlock: { blockHash: blockHash(9_999n) } },
+  { identity: 'number', wrongBlock: { blockNumber: 106n } },
+  { identity: 'hash and number', wrongBlock: { blockHash: blockHash(9_999n), blockNumber: 106n } },
+])('a nonempty zero-log cross-check with mismatched $identity rejects the segment before fallback', async ({ wrongBlock }) => {
+  const chain = populated(106n);
+  const f = await fixture();
+  const hypersync = fakeSource('hypersync', chain, { events: (events) => events.filter((event) => event.blockNumber !== 105n) });
+  const rpc = fakeSource('rpc', chain);
+  const messages: string[] = [];
+
+  rpc.source.blockTransfers = async () => chain.transfers.filter((event) => event.blockNumber === 105n).map((event) => ({ ...event, ...wrongBlock }));
+
+  try {
+    expect(await runBootstrap(options(f, chain, { hypersync: hypersync.source, rpc: rpc.source, rpcWorkers: 1, log: (message) => { messages.push(message); } })))
+      .toMatchObject({ status: 'done', failedAttempts: 1 });
+    expect(messages).toContainEqual(expect.stringContaining('cross-check returned logs with a different block hash or number'));
+    expect(rpc.calls.transfers).toEqual([{ fromBlock: 100n, toBlock: 106n }]);
+    expect((await f.db.execute(sql`SELECT source FROM bootstrap_segments`)).rows).toEqual([{ source: 'rpc' }]);
+    expect(await dump(f)).toEqual(await followerDump(chain));
   } finally { await f.store.close(); }
 });
 

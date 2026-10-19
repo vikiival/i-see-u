@@ -72,11 +72,10 @@ await startBackground(config.serveOnly, [...Object.values(followers), ...Object.
     }
 
     const log = (message: string) => console.log(`[bootstrap ${network.name}] ${message}`);
-    const run = runConfiguredBootstrap(config, network, { store, bootstrap, log });
+    const run = runConfiguredBootstrap(config, network, { store, bootstrap, log, lock });
     bootstrapRuns.set(network.name, run);
     run.done
-      .then(() => followers[network.name].kick(), (error) => console.error(`[bootstrap ${network.name}] failed: ${error instanceof Error ? error.message : String(error)}`))
-      .finally(() => lock.release());
+      .then(() => followers[network.name].kick(), (error) => console.error(`[bootstrap ${network.name}] failed: ${error instanceof Error ? error.message : String(error)}`));
   }
 });
 
@@ -100,7 +99,9 @@ let shuttingDown = false;
 const shutdown = () => {
   if (shuttingDown) return;
   shuttingDown = true;
+  const bootstrapsStopped = Promise.all([...bootstrapRuns.values()].map((run) => run.stop()));
   server.close(async (error) => {
+    await bootstrapsStopped;
     await Promise.all(Object.values(tails ?? {}).map((tail) => tail.stop()));
     await Promise.all(Object.values(followers).map((follower) => follower.stop()));
     await store.close();

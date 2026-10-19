@@ -1,5 +1,8 @@
+import { setTimeout as delay } from 'node:timers/promises';
+
 import type { Query, QueryResponse, QueryResponseWithRateLimit } from '@envio-dev/hypersync-client';
 
+import { abortable } from '../core/abort.ts';
 import { isNumber } from '../core/parse.ts';
 
 /** The one HypersyncClient method the repo uses. Never `stream()` (see README): it burns the free-tier quota. */
@@ -17,9 +20,9 @@ export interface PageOptions {
   sleep?: (ms: number) => Promise<void>;
   /** Stop paginating early (e.g. shutdown); the generator then throws. */
   aborted?: () => boolean;
+  signal?: AbortSignal;
 }
 
-const defaultSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 const integer = (value: unknown): value is number => isNumber(value) && Number.isSafeInteger(value) && value >= 0;
 
 /**
@@ -29,13 +32,15 @@ const integer = (value: unknown): value is number => isNumber(value) && Number.i
  * end can never look complete.
  */
 export async function* hypersyncPages(client: HypersyncPager, query: Query, o: PageOptions): AsyncGenerator<QueryResponse> {
-  const sleep = o.sleep ?? defaultSleep;
+  const sleep = (ms: number) => o.sleep ? abortable(o.sleep(ms), o.signal) : delay(ms, undefined, { signal: o.signal });
   const end = query.toBlock;
 
   if (end === undefined || !integer(query.fromBlock) || !integer(end) || end <= query.fromBlock) throw new Error('HyperSync query needs a bounded block range');
   let next = query.fromBlock;
 
   while (next < end) {
+    o.signal?.throwIfAborted();
+
     if (o.aborted?.()) throw new Error('HyperSync pagination aborted');
     let timer: ReturnType<typeof setTimeout> | undefined;
     const request = client.getWithRateLimit({ ...query, fromBlock: next });
@@ -49,7 +54,7 @@ export async function* hypersyncPages(client: HypersyncPager, query: Query, o: P
     let result: QueryResponseWithRateLimit;
 
     try {
-      result = await Promise.race([request, timeout]);
+      result = await abortable(Promise.race([request, timeout]), o.signal);
     } finally {
       clearTimeout(timer);
     }

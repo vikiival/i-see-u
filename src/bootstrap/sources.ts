@@ -3,6 +3,7 @@ import { hexToBytes, keccak256 } from 'viem';
 
 import { decodeTransferLogFast, scanAllTransfers, transfersInBlock, TRANSFER_TOPIC } from '../chains/evm/logs.ts';
 import { createLimiter } from '../core/limiter.ts';
+import { abortable } from '../core/abort.ts';
 import { isObject, isString, thrownMessage, toLowerHex } from '../core/parse.ts';
 import type { BlockHeader, BlockRange, Hex, RpcClient, RpcRequestOptions, TransferEvent } from '../core/types.ts';
 import { hypersyncPages, redactSecrets } from '../sources/hypersync-pages.ts';
@@ -145,6 +146,7 @@ export interface HypersyncBootstrapOptions {
   clientFactory: () => Promise<HypersyncFactoryResult>;
   sleep?: (ms: number) => Promise<void>;
   onRateLimit?: (waitMs: number) => void;
+  signal?: AbortSignal;
 }
 
 /**
@@ -161,17 +163,18 @@ export function createHypersyncBootstrapSource(o: HypersyncBootstrapOptions): Bo
     try {
       client ??= o.clientFactory();
 
-      return await work(await client);
+      return await work(await abortable(client, o.signal));
     } catch (error) {
       state.failures += 1;
       state.lastError = redactSecrets(thrownMessage(error), secrets);
       throw new Error(state.lastError);
     }
-  });
+  }, { signal: o.signal });
 
   const pages = (hs: HypersyncFactoryResult, query: Query, requests: { n: number }) => hypersyncPages(hs.client, query, {
     idleMs: o.idleMs,
     sleep: o.sleep,
+    signal: o.signal,
     onRequest: () => { requests.n += 1; state.requests += 1; },
     onRateLimit: (waitMs) => { state.rateLimitWaits += 1; o.onRateLimit?.(waitMs); },
   });

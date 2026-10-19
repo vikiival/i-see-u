@@ -130,3 +130,45 @@ test('the HyperSync source pages headers and topic0-only logs, and waits out a 4
   expect(seen.at(-2)?.logs).toEqual([{ include: { topics: [[TRANSFER_TOPIC]] } }]);
   expect(source.stats()).toMatchObject({ requests: 5, logs: 3, rateLimitWaits: 1, failures: 0 });
 });
+
+test.each(['request', 'rate-limit', 'quota'])('the HyperSync bootstrap source cancels a waiting %s and queued work', async (wait) => {
+  const controller = new AbortController();
+  const waiting = Promise.withResolvers<void>();
+  let requests = 0;
+  let pages = 0;
+
+  const source = createHypersyncBootstrapSource({
+    url: 'https://hypersync.invalid', apiToken: 'token', idleMs: 120_000, concurrency: 1, signal: controller.signal,
+    onRateLimit: () => waiting.resolve(),
+    clientFactory: async () => ({
+      joinNothing: 2,
+      client: {
+        getWithRateLimit() {
+          requests += 1;
+
+          if (wait === 'request') {
+            waiting.resolve();
+
+            return new Promise(() => {});
+          }
+
+          const response: QueryResponse = {
+            archiveHeight: 1000, nextBlock: 11, totalExecutionTime: 1,
+            data: { blocks: [], logs: [], transactions: [], traces: [] },
+          };
+
+          return Promise.resolve({ ...(wait === 'quota' && { response }), rateLimit: { resetSecs: 120, remaining: 0, cost: 1 } });
+        },
+      },
+    }),
+  });
+
+  const running = source.transfers({ fromBlock: 10n, toBlock: 12n }, async () => { pages += 1; });
+  const queued = source.headers({ fromBlock: 10n, toBlock: 12n });
+  const settled = Promise.allSettled([running, queued]);
+  await waiting.promise;
+  controller.abort(new Error('Bootstrap stopped'));
+  expect((await settled).map((result) => result.status)).toEqual(['rejected', 'rejected']);
+  expect(requests).toBe(1);
+  expect(pages).toBe(wait === 'quota' ? 1 : 0);
+});

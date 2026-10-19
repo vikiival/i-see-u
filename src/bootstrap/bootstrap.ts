@@ -29,6 +29,7 @@ export interface BootstrapOptions {
   progressMs?: number;
   now?: () => number;
   log?: (message: string) => void;
+  signal?: AbortSignal;
 }
 
 export type BootstrapResult =
@@ -82,11 +83,13 @@ const describe = (status: BootstrapStatus): string => {
  * a short transaction publishes headers and ingestion_state at B. The follower continues at B + 1.
  */
 export async function runBootstrap(o: BootstrapOptions): Promise<BootstrapResult> {
+  o.signal?.throwIfAborted();
   const now = o.now ?? Date.now;
   const log = o.log ?? (() => {});
   const { network, store } = o;
   const started = now();
   const state = await o.index.indexState(network);
+  o.signal?.throwIfAborted();
 
   if (state) {
     if (state.startBlock !== o.startBlock) throw mismatch(state.startBlock, o.startBlock, `${network} index`);
@@ -101,11 +104,13 @@ export async function runBootstrap(o: BootstrapOptions): Promise<BootstrapResult
 
   if (!run) {
     const head = await o.adapter.finalizedHead();
+    o.signal?.throwIfAborted();
 
     if (head.stale || head.refreshFailed) throw new Error('Finalized head observation is stale');
 
     if (head.block.number < o.startBlock) throw new Error(`START_BLOCK ${o.startBlock} is above the finalized head ${head.block.number}`);
     const [target, anchor] = await Promise.all([o.adapter.headerByNumber(head.block.number), o.adapter.headerByNumber(o.startBlock - 1n)]);
+    o.signal?.throwIfAborted();
 
     if (target.hash !== head.block.hash) throw new Error('Finalized header changed while pinning the target');
     run = await store.createRun(network, { startBlock: o.startBlock, target, anchor, segmentBlocks: o.segmentBlocks ?? 1_000n }, now());
@@ -130,6 +135,7 @@ export async function runBootstrap(o: BootstrapOptions): Promise<BootstrapResult
     const chunk = o.headerChunkBlocks ?? 5_000n;
 
     for (let from = run.startBlock; from <= target; from += chunk) {
+      o.signal?.throwIfAborted();
       const range = { fromBlock: from, toBlock: from + chunk - 1n < target ? from + chunk - 1n : target };
 
       if (await store.headerCount(network, range) === Number(range.toBlock - range.fromBlock + 1n)) continue;
@@ -142,11 +148,13 @@ export async function runBootstrap(o: BootstrapOptions): Promise<BootstrapResult
       for (const source of sources) {
         try {
           const headers = await source.headers(range);
+          o.signal?.throwIfAborted();
           verifyHeaders(range, headers, parent.hash, range.toBlock === target ? run.targetHash : undefined);
           await store.saveHeaders(network, range, headers);
           saved = true;
           break;
         } catch (error) {
+          o.signal?.throwIfAborted();
           errors.push(`${source.name}: ${thrownMessage(error)}`);
           log(`headers ${range.fromBlock}-${range.toBlock} from ${source.name} rejected: ${thrownMessage(error)}`);
         }
@@ -170,13 +178,18 @@ export async function runBootstrap(o: BootstrapOptions): Promise<BootstrapResult
       let lastError = '';
 
       for (const source of order) {
+        o.signal?.throwIfAborted();
+
         try {
           await store.commitSegment(network, segment, source.name, async (insert) => {
+            o.signal?.throwIfAborted();
             const counts = new Map<bigint, number>();
             let previous = { block: -1n, index: -1 };
             let logs = 0;
 
             const { requests } = await source.transfers({ fromBlock: segment.fromBlock, toBlock: segment.toBlock }, async (events) => {
+              o.signal?.throwIfAborted();
+
               for (const event of events) {
                 const header = byNumber.get(event.blockNumber);
 
@@ -194,7 +207,10 @@ export async function runBootstrap(o: BootstrapOptions): Promise<BootstrapResult
 
               logs += events.length;
               await insert(events);
+              o.signal?.throwIfAborted();
             });
+
+            o.signal?.throwIfAborted();
 
             // A block without decoded Transfers whose bloom may contain the topic is re-asked (other source first).
             const probe = other(source) ?? source;
@@ -202,17 +218,25 @@ export async function runBootstrap(o: BootstrapOptions): Promise<BootstrapResult
             for (const header of headers) {
               if (counts.has(header.number) || !header.transferBloom) continue;
               const again = await probe.blockTransfers(header);
+              o.signal?.throwIfAborted();
 
-              if (again.some((event) => event.blockHash === header.hash)) {
+              if (again.some((event) => event.blockHash !== header.hash || event.blockNumber !== header.number)) {
+                throw new VerificationError(`Block ${header.number}: ${probe.name} cross-check returned logs with a different block hash or number`);
+              }
+
+              if (again.length > 0) {
                 throw new VerificationError(`Block ${header.number}: logsBloom has Transfer and ${probe.name} returned ${again.length} logs, ${source.name} none`);
               }
             }
+
+            o.signal?.throwIfAborted();
 
             return { logs, requests };
           }, now());
 
           return;
         } catch (error) {
+          o.signal?.throwIfAborted();
           failedAttempts += 1;
           lastError = `${source.name}: ${thrownMessage(error)}`;
           log(`segment ${segment.fromBlock}-${segment.toBlock} from ${source.name} rejected: ${thrownMessage(error)}`);
@@ -224,15 +248,23 @@ export async function runBootstrap(o: BootstrapOptions): Promise<BootstrapResult
     };
 
     const worker = async (source: BootstrapSource, fromLowEnd: boolean) => {
-      for (let segment = fromLowEnd ? queue.shift() : queue.pop(); segment; segment = fromLowEnd ? queue.shift() : queue.pop()) {
+      while (!o.signal?.aborted) {
+        const segment = fromLowEnd ? queue.shift() : queue.pop();
+
+        if (!segment) return;
         await load(segment, source);
       }
     };
 
-    await Promise.all([
+    const workers = await Promise.allSettled([
       ...(o.hypersync ? [worker(o.hypersync, true)] : []),
       ...Array.from({ length: o.rpcWorkers ?? 4 }, () => worker(o.rpc, false)),
     ]);
+
+    const failed = workers.find((worker) => worker.status === 'rejected');
+
+    if (failed) throw failed.reason;
+    o.signal?.throwIfAborted();
 
     if (failedSegments > 0) throw new Error(`${failedSegments} segments failed on every source; rerun to resume the remaining segments`);
 
