@@ -53,6 +53,7 @@ export function createFollower(o: FollowerOptions): Follower {
       }
 
       if (!leader) return;
+
       const head = await adapter.finalizedHead();
 
       if (head.stale || head.refreshFailed) throw new Error('Finalized head observation is stale');
@@ -150,7 +151,7 @@ export function createFollower(o: FollowerOptions): Follower {
         : lagBlocks > 0n ? `Global index is ${lagBlocks} blocks behind finalized`
         : lastError ?? (now() - lastAdvanceAt > o.maxNoAdvanceMs ? 'Global index has not advanced recently enough' : undefined);
 
-      return { ready: unhealthy === undefined, leader: leader && (o.lock?.held() ?? true), cursor, headNumber, lagBlocks, lastAdvanceAt, lastError, stale: unhealthy !== undefined, unhealthy };
+      return { headStalled: adapter.headStalled?.() ?? false, ready: unhealthy === undefined, leader: leader && (o.lock?.held() ?? true), cursor, headNumber, lagBlocks, lastAdvanceAt, lastError, stale: unhealthy !== undefined, unhealthy };
     },
   };
 }

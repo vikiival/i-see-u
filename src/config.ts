@@ -1,5 +1,6 @@
 import type { Address } from './core/types.ts';
 import { networkRegistry } from './networks.ts';
+import { readyMode } from './api/ops.ts';
 
 try {
   process.loadEnvFile(new URL('../.env', import.meta.url));
@@ -81,6 +82,9 @@ const networks = Object.fromEntries(Object.values(networkRegistry).map((network)
 const ethereum = networks.ethereum;
 
 export const config = {
+  serveOnly: bool('SERVE_ONLY', false),
+  readyzAllow: readyMode(process.env.READYZ_ALLOW),
+  headStallMs: int('HEAD_STALL_MS', '60000'),
   port: int('PORT', '3000'),
   databaseUrl: env('DATABASE_URL', 'postgresql://iseeu:iseeu@localhost:5432/iseeu'),
   rpc: {

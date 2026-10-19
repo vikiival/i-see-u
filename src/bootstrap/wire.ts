@@ -1,6 +1,6 @@
 import { createEvmAdapter } from '../chains/evm/adapter.ts';
 import type { config as appConfig } from '../config.ts';
-import type { Store } from '../core/types.ts';
+import type { RpcStats, Store } from '../core/types.ts';
 import { createRpcClient } from '../rpc/client.ts';
 import { nativeHypersyncClient } from '../sources/hypersync-wire.ts';
 import type { BootstrapStore } from './store.ts';
@@ -14,6 +14,7 @@ type AppConfig = typeof appConfig;
 /** Production wiring shared by `npm run bootstrap` and BOOTSTRAP_ON_START: its own RPC client with a bulk timeout. */
 export interface ConfiguredBootstrap {
   done: Promise<BootstrapResult>;
+  rpcStats: () => RpcStats;
   stats: () => { rpc: BootstrapSourceStats; hypersync?: BootstrapSourceStats; rpcMethods: Record<string, number> };
 }
 
@@ -39,6 +40,7 @@ export function runConfiguredBootstrap(config: AppConfig, network: AppConfig['et
 
   return {
     done,
+    rpcStats: rpcClient.stats,
     stats: () => ({ rpc: rpc.stats(), ...(hypersync && { hypersync: hypersync.stats() }), rpcMethods: rpcClient.stats().byMethod }),
   };
 }

@@ -7,6 +7,8 @@ import { runConfiguredBootstrap } from './bootstrap/wire.ts';
 import { createEvmAdapter } from './chains/evm/adapter.ts';
 import { config } from './config.ts';
 import { createLimiter } from './core/limiter.ts';
+import { startBackground } from './core/runtime.ts';
+import type { ConfiguredBootstrap } from './bootstrap/wire.ts';
 import { createDiscoveryService } from './discovery/service.ts';
 import { createFollower } from './follower/follower.ts';
 import { createRpcClient } from './rpc/client.ts';
@@ -16,7 +18,7 @@ import { createTail } from './tail/tail.ts';
 const rpc = createRpcClient(config.rpc);
 
 const adapters = Object.fromEntries(Object.values(config.networks).map((network) =>
-  [network.name, createEvmAdapter(rpc, { ...network, network: network.name })]));
+  [network.name, createEvmAdapter(rpc, { ...network, network: network.name, headStallMs: config.headStallMs })]));
 
 const { store, bootstrap, followerLock, bootstrapLock } = await openPostgresStore(config.databaseUrl, { max: config.db.poolMax, connectionTimeoutMillis: config.db.connectTimeoutMs });
 
@@ -36,7 +38,7 @@ const balances = Object.fromEntries(Object.values(config.networks).map((network)
 })]));
 
 const followers = Object.fromEntries(Object.values(adapters).map((adapter) => [adapter.network, createFollower({
-  adapter, store, lock: followerLock(adapter.network), ...config.follower,
+  adapter, store, lock: config.serveOnly ? undefined : followerLock(adapter.network), ...config.follower,
   maxNoAdvanceMs: config.maxHeadProgressAgeMs,
   onError: (message) => console.warn('Follower failed:', message),
 })]));
@@ -53,12 +55,13 @@ const discovery = createDiscoveryService({
   adapters, store, tails, maxTailTipAgeMs: config.tail.maxTipAgeMs, maxHeadAgeMs: config.maxHeadAgeMs, maxNoAdvanceMs: config.maxHeadProgressAgeMs,
 });
 
-await Promise.all([...Object.values(followers), ...Object.values(tails ?? {})].map((part) => part.load()));
+const bootstrapRuns = new Map<string, ConfiguredBootstrap>();
 
-for (const part of [...Object.values(followers), ...Object.values(tails ?? {})]) part.start();
+console.log(`i-see-u mode: ${config.serveOnly ? 'serve-only' : 'indexer + API'}`);
 
-// Optional in-process bootstrap: account reads serve applied segments; follower and tail wait for publication.
-if (config.bootstrap.onStart) {
+await startBackground(config.serveOnly, [...Object.values(followers), ...Object.values(tails ?? {})], async () => {
+  if (!config.bootstrap.onStart) return;
+
   for (const network of Object.values(config.networks)) {
     if (await store.indexState(network.name)) continue;
     const lock = bootstrapLock(network.name);
@@ -69,17 +72,23 @@ if (config.bootstrap.onStart) {
     }
 
     const log = (message: string) => console.log(`[bootstrap ${network.name}] ${message}`);
-    runConfiguredBootstrap(config, network, { store, bootstrap, log }).done
+    const run = runConfiguredBootstrap(config, network, { store, bootstrap, log });
+    bootstrapRuns.set(network.name, run);
+    run.done
       .then(() => followers[network.name].kick(), (error) => console.error(`[bootstrap ${network.name}] failed: ${error instanceof Error ? error.message : String(error)}`))
       .finally(() => lock.release());
   }
-}
+});
 
 const app = createApp({
   discovery, adapters, balances, followers, tails, requestRpc,
   maxVerifyOwnershipItems: config.request.maxVerifyOwnershipItems,
   rpcStats: () => rpc.stats(), startedAt: Date.now(),
   bootstrap: (network) => bootstrap.status(network, Date.now()),
+  opsSnapshot: (network) => store.opsSnapshot(network),
+  hypersyncStats: (network) => bootstrapRuns.get(network)?.stats().hypersync,
+  bootstrapRpcStats: () => Object.fromEntries([...bootstrapRuns].map(([network, run]) => [`bootstrap:${network}`, run.rpcStats()])),
+  readyzAllow: config.readyzAllow,
 }, { requestLog: process.env.LOG_LEVEL !== 'warn' && process.env.LOG_LEVEL !== 'error' });
 
 const server = serve({ fetch: app.fetch, port: config.port, hostname: '0.0.0.0' }, (info) => {

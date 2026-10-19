@@ -119,6 +119,7 @@ export interface ChainAdapter {
   cachedLatestBlockNumber?(): bigint | undefined;
   /** Uncached `latest` header, for the tail. */
   latestHeader(): Promise<BlockHeader>;
+  headStalled?(): boolean;
   headerByNumber(number: bigint): Promise<BlockHeader>;
   /** EIP-234 block-hash query: the logs of exactly this block, never a same-height block of another fork. */
   transfersInBlock(blockHash: Hex): Promise<TransferEvent[]>;
@@ -148,6 +149,8 @@ export interface RpcClient {
 }
 
 export interface RpcRequestOptions {
+  /** Successful endpoint's breaker handle; lets the leader penalize a stalled latest head precisely. */
+  onEndpoint?: (penalize: () => void) => void;
   /** Treat a syntactically successful but unusable result as a transient endpoint failure. */
   // oxlint-disable-next-line anti-slop/no-unknown-parameters -- boundary parser: validate inspects the raw JSON-RPC result before it is typed
   validate?: (result: unknown) => boolean;
@@ -171,6 +174,9 @@ export interface RpcStats {
   byMethod: Record<string, number>; // attempts per method
   errors: Record<string, number>; // by error class
   endpoints: { url: string; state: 'closed' | 'open' | 'half-open'; failures: number }[];
+  outcomes?: { endpoint: string; method: string; outcome: string; count: number }[];
+  retries?: number;
+  rateLimited?: number;
 }
 
 /** Error classes the RPC layer distinguishes. */
@@ -291,7 +297,15 @@ export interface RepairRange extends BlockRange {
   createdAt: number;
 }
 
+export interface OpsSnapshot {
+  state?: IndexState;
+  tipNumber?: bigint;
+  tipTimestamp?: bigint;
+  bootstrap?: { status: string; startBlock: bigint; targetBlock: bigint; segmentsDone: number; segmentsApplied: number; segmentsTotal: number };
+}
+
 export interface Store {
+  opsSnapshot(network: string): Promise<OpsSnapshot>;
   /** Initialize ONLY at startBlock - 1, never at the head. Registry/config owns the start block. */
   initialize(network: string, startBlock: bigint, anchor: BlockHeader, at: number): Promise<IndexState>;
   indexState(network: string): Promise<IndexState | undefined>;
@@ -329,6 +343,7 @@ export interface Store {
 }
 
 export interface FollowerStatus {
+  headStalled?: boolean;
   ready: boolean;
   leader: boolean;
   cursor?: FollowerCursor;
@@ -341,6 +356,8 @@ export interface FollowerStatus {
 }
 
 export interface TailStatus {
+  headStalled?: boolean;
+  wipes?: number;
   enabled: boolean;
   tipNumber?: bigint;
   tipHash?: Hex;
@@ -427,7 +444,7 @@ export type HistoryResult = ServingMetadata & {
 };
 
 export interface DiscoveryService {
-  status(network: string): Promise<ServingStatus>;
+  status(network: string, snapshot?: { state?: IndexState }): Promise<ServingStatus>;
   /** Pure DB reads. Readiness is per network, never per account. */
   discover(network: string, account: string, options?: { finality?: Finality; balances?: boolean }): Promise<DiscoveryResult>;
   history(network: string, account: string, limit: number, before?: TransferCursor, finality?: Finality): Promise<HistoryResult>;

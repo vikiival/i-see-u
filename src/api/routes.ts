@@ -21,8 +21,14 @@ import type {
   TailStatus,
 } from '../core/types.ts';
 import { rpcErrorOf } from '../rpc/errors.ts';
+import { installOps } from './ops.ts';
+import type { ReadyMode } from './ops.ts';
+import type { OpsSnapshot } from '../core/types.ts';
 
 export interface RouteDeps {
+  opsSnapshot?: (network: string) => Promise<OpsSnapshot>;
+  hypersyncStats?: (network: string) => { requests: number; rateLimitWaits: number } | undefined;
+  readyzAllow?: ReadyMode;
   discovery: DiscoveryService;
   adapters: Record<string, ChainAdapter>;
   balances: Record<string, BalanceReader>;
@@ -33,6 +39,7 @@ export interface RouteDeps {
   /** Held-item cap for verifyOwnership (default 2000). */
   maxVerifyOwnershipItems?: number;
   rpcStats: () => RpcStats;
+  bootstrapRpcStats?: () => Record<string, RpcStats>;
   startedAt: number;
   /** Shared bootstrap progress per network, read from the database (any process may be running the loader). */
   bootstrap?: (network: string) => Promise<BootstrapStatus | undefined>;
@@ -94,6 +101,7 @@ const baseJson = (result: DiscoveryResult) => ({
 });
 
 const statusJson = (status: FollowerStatus) => ({
+  headStalled: status.headStalled ?? false,
   ready: status.ready,
   leader: status.leader,
   cursor: status.cursor && { number: status.cursor.number.toString(), hash: status.cursor.hash },
@@ -124,6 +132,8 @@ const bootstrapJson = (status: BootstrapStatus) => ({
 });
 
 const tailJson = (status: TailStatus) => ({
+  headStalled: status.headStalled ?? false,
+  wipes: status.wipes ?? 0,
   enabled: status.enabled,
   tip: status.tipNumber === undefined ? undefined : { number: status.tipNumber.toString(), hash: status.tipHash },
   latestNumber: status.latestNumber?.toString(),
@@ -155,6 +165,7 @@ export function createApp(deps: RouteDeps, opts: { requestLog?: boolean } = {}):
 
   // Middleware lives on this app (not a parent) so its notFound/onError handlers stay in effect.
   if (opts.requestLog) app.use('*', logger());
+  installOps(app, deps);
 
   // Single-flight + short cache per account and block, so polling clients share one ownerOf sweep.
   const ownerCache = new Map<string, Promise<OwnerResult[]>>();

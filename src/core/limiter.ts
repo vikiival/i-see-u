@@ -17,10 +17,12 @@ export interface Limiter {
   run<T>(fn: (signal: AbortSignal) => Promise<T>, opts?: RunOptions): Promise<T>;
   readonly active: number;
   readonly queued: number;
+  readonly rejections: number;
 }
 
 export function createLimiter(maxActive: number, maxQueued: number, retryAfterS = 5): Limiter {
   let active = 0;
+  let rejections = 0;
   const queue: (() => void)[] = [];
 
   const release = (): void => {
@@ -52,7 +54,10 @@ export function createLimiter(maxActive: number, maxQueued: number, retryAfterS 
       const signal = AbortSignal.any(signals);
 
       if (active >= maxActive) {
-        if (queue.length >= maxQueued) throw unavailable('Server busy: too many RPC-bound requests in flight', retryAfterS);
+        if (queue.length >= maxQueued) {
+          rejections += 1;
+          throw unavailable('Server busy: too many RPC-bound requests in flight', retryAfterS);
+        }
 
         await new Promise<void>((resolve, reject) => {
           const leave = (): void => {
@@ -83,6 +88,7 @@ export function createLimiter(maxActive: number, maxQueued: number, retryAfterS 
     },
     get active() { return active; },
     get queued() { return queue.length; },
+    get rejections() { return rejections; },
   };
 }
 

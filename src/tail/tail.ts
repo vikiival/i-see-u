@@ -71,6 +71,7 @@ export function createTail(o: TailOptions): Tail {
   let tip: BlockHeader | undefined;
   let latestNumber: bigint | undefined;
   let reorgs = 0;
+  let wipes = 0;
   let lastReorgDepth: bigint | undefined;
   let lastAdvanceAt = 0;
   let lastError: string | undefined;
@@ -172,6 +173,7 @@ export function createTail(o: TailOptions): Tail {
 
     if (!ancestor) {
       await store.wipeTail(network, oldTip.hash);
+      wipes += 1;
       tip = undefined;
       tailError = `Tail reorg has no common ancestor within ${maxDepth} blocks above the finalized cursor`;
       lastError = tailError;
@@ -213,6 +215,9 @@ export function createTail(o: TailOptions): Tail {
       }
 
       const anchor: BlockHeader = { number: cursor.number, hash: cursor.hash, timestamp: cursor.timestamp, parentHash: cursor.hash };
+      const head = await adapter.latestHeader();
+
+      if (latestNumber === undefined || head.number > latestNumber) latestNumber = head.number;
       tip = await store.tailTip(network);
       const ahead = (tip?.number ?? cursor.number) - cursor.number;
 
@@ -223,10 +228,6 @@ export function createTail(o: TailOptions): Tail {
 
         return;
       }
-
-      const head = await adapter.latestHeader();
-
-      if (latestNumber === undefined || head.number > latestNumber) latestNumber = head.number;
 
       if (head.number <= cursor.number) return; // lagging fallback endpoint
 
@@ -298,10 +299,13 @@ export function createTail(o: TailOptions): Tail {
     status(): TailStatus {
       const lagBlocks = tip && latestNumber && latestNumber > tip.number ? latestNumber - tip.number : 0n;
       const stale = lagBlocks > 0n && lastAdvanceAt > 0 && now() - lastAdvanceAt > staleAfterMs;
-      const healthy = tailError === undefined && consecutiveErrors < errorThreshold && !stale;
+      const headStalled = adapter.headStalled?.() ?? false;
+      const healthy = tailError === undefined && consecutiveErrors < errorThreshold && !stale && !headStalled;
 
       return {
         enabled: true,
+        headStalled,
+        wipes,
         tipNumber: tip?.number,
         tipHash: tip?.hash,
         latestNumber,
@@ -311,7 +315,7 @@ export function createTail(o: TailOptions): Tail {
         lastAdvanceAt,
         lastError,
         healthy,
-        tailError: healthy ? undefined : tailError ?? lastError ?? 'Tail has not advanced recently enough',
+        tailError: healthy ? undefined : tailError ?? lastError ?? (headStalled ? 'Latest head is stalled' : 'Tail has not advanced recently enough'),
       };
     },
   };

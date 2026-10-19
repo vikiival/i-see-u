@@ -332,6 +332,39 @@ export function createStore(
 
     indexSnapshot: (network) => db.transaction((tx) => readIndex(tx, id(network)), { isolationLevel: 'repeatable read', accessMode: 'read only' }),
 
+    async opsSnapshot(network) {
+      const n = id(network);
+      const runs = schema.bootstrapRuns;
+      const segments = schema.bootstrapSegments;
+
+      // One statement: PK lookups, bounded tail-tip lookup, segment counters; never scan headers or transfers.
+      const [row] = await db.select({
+        current: getTableColumns(state),
+        pendingRepair: sql<boolean>`EXISTS (SELECT 1 FROM repair_queue WHERE network = ${n})`.mapWith(Boolean),
+        tipNumber: sql<bigint | null>`(SELECT number FROM tail_blocks WHERE network = ${n} ORDER BY number DESC LIMIT 1)`.mapWith((v: string | null) => v === null ? null : BigInt(v)),
+        tipTimestamp: sql<bigint | null>`(SELECT timestamp FROM tail_blocks WHERE network = ${n} ORDER BY number DESC LIMIT 1)`.mapWith((v: string | null) => v === null ? null : BigInt(v)),
+        phase: runs.status,
+        runStart: runs.startBlock, runTarget: runs.targetBlock,
+        done: sql<number>`(SELECT count(*) FROM ${segments} WHERE network = ${n} AND done)`.mapWith(Number),
+        applied: sql<number>`(SELECT count(*) FROM ${segments} WHERE network = ${n} AND applied)`.mapWith(Number),
+        total: sql<number>`(SELECT count(*) FROM ${segments} WHERE network = ${n})`.mapWith(Number),
+      }).from(sql`(SELECT ${n}::smallint AS network) AS requested`)
+        .leftJoin(state, sql`${state.network} = requested.network`).leftJoin(runs, sql`${runs.network} = requested.network`);
+
+      const s = row.current;
+
+      return {
+        state: s ? {
+          startBlock: s.startBlock,
+          cursor: { number: s.blockNumber, hash: s.blockHash, timestamp: s.blockTimestamp, updatedAt: s.updatedAt, revision: s.revision },
+          head: s.headNumber === null ? undefined : { number: s.headNumber, hash: s.headHash!, timestamp: s.headTimestamp! },
+          checkedAt: s.checkedAt ?? undefined, pendingRepair: row.pendingRepair,
+        } : undefined,
+        tipNumber: row.tipNumber ?? undefined, tipTimestamp: row.tipTimestamp ?? undefined,
+        bootstrap: row.phase === null ? undefined : { status: row.phase, startBlock: row.runStart!, targetBlock: row.runTarget!, segmentsDone: row.done, segmentsApplied: row.applied, segmentsTotal: row.total },
+      };
+    },
+
     async observeHead(network, head, at) {
       const n = id(network);
       await db.transaction(async (tx) => {

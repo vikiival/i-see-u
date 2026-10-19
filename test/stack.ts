@@ -42,10 +42,11 @@ export async function stack(chain = new FakeChain(102n), options: {
     discovery, adapters: { ethereum: adapter }, balances: { ethereum: balances }, followers: { ethereum: follower }, tails, requestRpc,
     rpcStats: () => chain.rpc.stats(), startedAt: clock.at,
     bootstrap: (network) => createBootstrapStore(db).status(network, clock.at),
+    opsSnapshot: (network) => store.opsSnapshot(network),
   });
 
   return {
-    store, db, chain, adapter, follower, tail, discovery, app, balances, clock,
+    store, db, chain, adapter, follower, tail, discovery, app, balances, requestRpc, clock,
     close: async () => { await tail?.stop(); await follower.stop(); await store.close(); },
   };
 }

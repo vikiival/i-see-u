@@ -2,19 +2,20 @@ import { createPublicClient, custom } from 'viem';
 import type { Chain } from 'viem';
 
 import { isObject, isString, toLowerHex } from '../../core/parse.ts';
-import type { BlockHeader, HeadObservation, RpcClient } from '../../core/types.ts';
+import { createHeadWatchdog } from '../../core/head-watchdog.ts';
+import type { BlockHeader, HeadObservation, Hex, RpcClient } from '../../core/types.ts';
 
 const hexPattern = /^0x[0-9a-f]+$/i;
 
 /** The header fields of an eth_getBlockByNumber result that viem's formatter needs, before formatting. */
 interface WireBlockHeader {
-  number: string;
-  hash: string;
-  parentHash: string;
-  timestamp: string;
+  number: Hex;
+  hash: Hex;
+  parentHash: Hex;
+  timestamp: Hex;
 }
 
-const isHexString = (value: unknown): value is string => isString(value) && hexPattern.test(value);
+const isHexString = (value: unknown): value is Hex => isString(value) && hexPattern.test(value);
 
 const validBlock = (value: unknown): value is WireBlockHeader =>
   isObject(value)
@@ -30,13 +31,14 @@ export interface HeadTracker {
   latestBlockNumber(): bigint | undefined;
   /** Uncached `latest` header (the tail polls it). */
   latestHeader(): Promise<BlockHeader>;
+  headStalled(): boolean;
   /** Uncached header of one block by number. */
   blockByNumber(number: bigint): Promise<BlockHeader>;
 }
 
 export function createHeadTracker(
   rpc: RpcClient,
-  opts: { cacheMs: number; maxNoProgressMs: number; chain: Chain },
+  opts: { cacheMs: number; maxNoProgressMs: number; chain: Chain; headStallMs?: number },
 ): HeadTracker {
   // viem's getBlock formats the block; RpcClient owns retries, failover and billing. getBlock cannot pass
   // RpcClient options, so the transport injects block validation (a null block fails over).
@@ -52,6 +54,7 @@ export function createHeadTracker(
   let checkedAt = 0;
   let inFlight: Promise<HeadObservation> | undefined;
   let latest: bigint | undefined;
+  const watchdog = createHeadWatchdog(opts.headStallMs ?? 60_000);
 
   const fetchBlock = async (at: 'finalized' | 'latest' | bigint): Promise<BlockHeader> => {
     const block = await client.getBlock(at === 'finalized' || at === 'latest' ? { blockTag: at } : { blockNumber: at });
@@ -64,12 +67,30 @@ export function createHeadTracker(
     };
   };
 
+  const fetchLatest = async (): Promise<BlockHeader> => {
+    let penalize: (() => void) | undefined;
+
+    try {
+      const block = await rpc.request<WireBlockHeader>('eth_getBlockByNumber', ['latest', false], {
+        validate: validBlock, onEndpoint: (trip) => { penalize = trip; },
+      });
+
+      const number = BigInt(block.number);
+      watchdog.observe(number, penalize);
+
+      if (latest === undefined || number > latest) latest = number;
+
+      return { number, hash: toLowerHex(block.hash), parentHash: toLowerHex(block.parentHash), timestamp: BigInt(block.timestamp) };
+    } catch (error) {
+      watchdog.observe(undefined);
+      throw error;
+    }
+  };
+
   const refresh = async (): Promise<HeadObservation> => {
     // Also refresh the latest head so responses can report real lag behind the tip.
-    // One extra call per cache window, shared by all requests; failures only cost the lag figure.
-    fetchBlock('latest').then((block) => {
-      if (latest === undefined || block.number > latest) latest = block.number;
-    }, () => {});
+    // One extra call per cache window; also feeds the leader watchdog while the tail is disabled/catching up.
+    fetchLatest().catch(() => {});
 
     try {
       const block = await fetchBlock('finalized');
@@ -99,7 +120,8 @@ export function createHeadTracker(
       return inFlight;
     },
     latestBlockNumber: () => latest,
-    latestHeader: () => fetchBlock('latest'),
+    latestHeader: fetchLatest,
+    headStalled: watchdog.stalled,
     blockByNumber: (number) => fetchBlock(number),
   };
 }

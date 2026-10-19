@@ -18,6 +18,7 @@ interface Endpoint {
   displayUrl: string;
   failures: number;
   openUntil: number;
+  penalizedUntil: number;
   probeInFlight: boolean;
   unsupportedUntil: Map<string, number>;
 }
@@ -151,6 +152,7 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
       displayUrl: redactedUrl(url),
       failures: 0,
       openUntil: 0,
+      penalizedUntil: 0,
       probeInFlight: false,
       unsupportedUntil: new Map(),
     };
@@ -164,6 +166,9 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
   };
 
   const bucketCapacity = Math.max(1, options.maxRps);
+  const outcomes = new Map<string, { endpoint: string; method: string; outcome: string; count: number }>();
+  let retries = 0;
+  let rateLimited = 0;
   let tokens = bucketCapacity;
   let refilledAt = performance.now();
 
@@ -228,9 +233,13 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
   };
 
   const recordSuccess = (endpoint: Endpoint): void => {
+    endpoint.probeInFlight = false;
+
+    // A response already in flight (e.g. finalized alongside latest) cannot undo a watchdog penalty.
+    if (endpoint.penalizedUntil > Date.now()) return;
+    endpoint.penalizedUntil = 0;
     endpoint.failures = 0;
     endpoint.openUntil = 0;
-    endpoint.probeInFlight = false;
   };
 
   const request = async <T>(method: string, params: unknown[], requestOptions: RpcRequestOptions = {}): Promise<T> => {
@@ -259,9 +268,18 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
         requestOptions.onAttempt({ ok, durationMs: performance.now() - startedAt, bytes: Number.isFinite(length) ? length : undefined });
       };
 
+      const countOutcome = (outcome: string): void => {
+        const key = `${endpoints.indexOf(endpoint)}:${method}:${outcome}`;
+        const row = outcomes.get(key) ?? { endpoint: `${endpoints.indexOf(endpoint)}:${endpoint.displayUrl}`, method, outcome, count: 0 };
+        row.count += 1;
+        outcomes.set(key, row);
+      };
+
       try {
         await takeToken(signal);
         counters.attempts += 1;
+
+        if (attempt > 0) retries += 1;
         counters.byMethod[method] = (counters.byMethod[method] ?? 0) + 1;
         startedAt = performance.now();
 
@@ -277,6 +295,21 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
         }
 
         recordSuccess(endpoint);
+        countOutcome('success');
+        requestOptions.onEndpoint?.(() => {
+          const now = Date.now();
+
+          const canFailOver = endpoints.some(other => other !== endpoint
+            && (other.unsupportedUntil.get(method) ?? 0) <= now
+            && stateOf(other, now) !== 'open'
+            && !(stateOf(other, now) === 'half-open' && other.probeInFlight));
+
+          if (endpoint.penalizedUntil > now || !canFailOver) return;
+          endpoint.failures = Math.max(endpoint.failures, BREAKER_FAILURES);
+          endpoint.openUntil = now + OPEN_MS;
+          endpoint.penalizedUntil = endpoint.openUntil;
+          endpoint.probeInFlight = false;
+        });
         report(true);
 
         // SAFETY: T is the caller's declared result type for `method`: the transport returns the JSON-RPC `result`
@@ -290,6 +323,9 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
         }
 
         const error = failureOf(cause, response);
+        countOutcome(error.kind);
+
+        if (response?.status === 429) rateLimited += 1;
         lastError = error;
         report(false);
 
@@ -328,6 +364,9 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
       attempts: counters.attempts,
       byMethod: { ...counters.byMethod },
       errors: { ...counters.errors },
+      outcomes: [...outcomes.values()].map((row) => ({ ...row })),
+      retries,
+      rateLimited,
       endpoints: endpoints.map(endpoint => ({
         url: endpoint.displayUrl,
         state: stateOf(endpoint),

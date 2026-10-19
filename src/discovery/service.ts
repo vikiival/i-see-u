@@ -2,6 +2,8 @@ import { addTransfer, emptyAggregate } from '../core/aggregate.ts';
 import type { AccountView, Address, BlockHeader, ChainAdapter, DiscoveryService, IndexSnapshot, IndexState, ServingMetadata, ServingStatus, TailStatus } from '../core/types.ts';
 import type { Store } from '../core/types.ts';
 
+const ZERO: Address = `0x${'0'.repeat(40)}`;
+
 export interface DiscoveryDependencies {
   adapters: Record<string, ChainAdapter>;
   store: Store;
@@ -50,7 +52,7 @@ function overlay(view: AccountView, account: Address): Pick<AccountView, 'holdin
 
   return {
     holdings: [...byToken.values()].sort((a, b) => newestFirst(a, b, a.token.localeCompare(b.token))),
-    nftItems: [...byItem.values()].sort((a, b) => a.token === b.token ? (a.tokenId < b.tokenId ? -1 : 1) : a.token.localeCompare(b.token)),
+    nftItems: account === ZERO ? [] : [...byItem.values()].sort((a, b) => a.token === b.token ? (a.tokenId < b.tokenId ? -1 : 1) : a.token.localeCompare(b.token)),
   };
 }
 
@@ -69,7 +71,7 @@ export function createDiscoveryService(deps: DiscoveryDependencies): DiscoverySe
     return { adapter, account };
   };
 
-  const statusOf = (snapshot: IndexSnapshot | undefined): ServingStatus => {
+  const statusOf = (snapshot: { state?: IndexState } | undefined): ServingStatus => {
     const state = snapshot?.state;
     let reason: string | undefined;
 
@@ -125,10 +127,10 @@ export function createDiscoveryService(deps: DiscoveryDependencies): DiscoverySe
   };
 
   return {
-    async status(network) {
+    async status(network, snapshot) {
       if (!Object.hasOwn(deps.adapters, network)) throw Object.assign(new Error(`Unknown network: ${network}`), { statusCode: 404 });
 
-      return statusOf(await deps.store.indexSnapshot(network));
+      return statusOf(snapshot ?? await deps.store.indexSnapshot(network));
     },
     async discover(network, input, options = {}) {
       const { adapter, account } = validate(network, input);

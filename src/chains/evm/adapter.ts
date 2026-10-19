@@ -21,11 +21,12 @@ export interface EvmAdapterOptions {
   multicallBatch: number;
   multicall3: Address;
   headCacheMs?: number;
+  headStallMs?: number;
 }
 
 /** Any EVM chain with a plain JSON-RPC endpoint: differs only by options. */
 export function createEvmAdapter(rpc: RpcClient, o: EvmAdapterOptions): ChainAdapter {
-  const head = createHeadTracker(rpc, { cacheMs: o.headCacheMs ?? HEAD_CACHE_MS, maxNoProgressMs: o.finalizedMaxNoProgressMs, chain: o.chain });
+  const head = createHeadTracker(rpc, { cacheMs: o.headCacheMs ?? HEAD_CACHE_MS, maxNoProgressMs: o.finalizedMaxNoProgressMs, chain: o.chain, headStallMs: o.headStallMs });
 
   return {
     network: o.network,
@@ -35,6 +36,7 @@ export function createEvmAdapter(rpc: RpcClient, o: EvmAdapterOptions): ChainAda
     finalizedHead: head.finalizedHead,
     cachedLatestBlockNumber: head.latestBlockNumber,
     latestHeader: head.latestHeader,
+    headStalled: head.headStalled,
     headerByNumber: head.blockByNumber,
     transfersInBlock: (blockHash) => transfersInBlock(rpc, blockHash),
     transfersInRange: (range, headers) => transfersInRange(rpc, range, headers),
