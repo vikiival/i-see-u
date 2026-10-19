@@ -6,6 +6,8 @@
   "description": "Token discovery PoC over plain JSON-RPC",
   "scripts": {
     "start": "node src/server.ts",
+    "dev": "node --watch src/server.ts",
+    "status": "node scripts/status.ts",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "node src/store/migrate.ts",
     "bootstrap": "node src/bootstrap/main.ts",
