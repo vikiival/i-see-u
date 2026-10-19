@@ -139,11 +139,15 @@ export function createDiscoveryService(deps: DiscoveryDependencies): DiscoverySe
       const { account } = validate(network, input);
       const tail = finality === 'finalized' ? undefined : tailOf(network)?.status();
       let page = await deps.store.transferHistory(network, account, limit, before, tail !== undefined);
-      const { cursor } = requireReady(page?.state);
+      let { cursor } = requireReady(page?.state);
       const tailError = tail && tailProblem(tail, page!.tailTip, cursor.number);
 
       // Rare: the tail was read but cannot be served; read the finalized view (a latest cursor then gets 409).
-      if (tailError && page!.throughBlock > cursor.number) page = await deps.store.transferHistory(network, account, limit, before);
+      if (tailError && page!.throughBlock > cursor.number) {
+        page = await deps.store.transferHistory(network, account, limit, before);
+        cursor = requireReady(page?.state).cursor;
+      }
+
       const tip = tail && !tailError ? page!.tailTip : undefined;
       const served = tip ?? cursor;
 

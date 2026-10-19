@@ -100,6 +100,46 @@ test('an unhealthy or stale tail serves every endpoint finalized with tailError'
   } finally { await s.close(); }
 });
 
+test.each([false, true])('history fallback uses the second snapshot metadata and readiness (pending repair: %s)', async (pendingRepair) => {
+  const chain = new FakeChain(100n);
+  chain.latest = 102n;
+  chain.addTransfer({ token: tokenA, from: peer, to: account, value: 1n, blockNumber: 101n });
+  const s = await latestStack(chain, 60_000);
+  const transferHistory = s.store.transferHistory;
+  let reads = 0;
+
+  try {
+    s.store.transferHistory = async (...args) => {
+      const page = await transferHistory(...args);
+
+      if (++reads === 1) {
+        chain.finalized = 101n;
+        await s.follower.tick();
+
+        if (pendingRepair) await s.store.enqueueRepair('ethereum', { fromBlock: 101n, toBlock: 101n }, 'suspect', s.clock.at);
+      }
+
+      return page;
+    };
+
+    if (pendingRepair) {
+      const error = { message: 'Global index has pending repairs', statusCode: 503, serviceStatus: 'not_ready', retryAfterS: 5 };
+      await expect(s.discovery.history('ethereum', account, 10)).rejects.toMatchObject(error);
+      expect(reads).toBe(2);
+      await expect(s.discovery.history('ethereum', account, 10, undefined, 'finalized')).rejects.toMatchObject(error);
+    } else {
+      const result = await s.discovery.history('ethereum', account, 10);
+      expect(reads).toBe(2);
+      expect(result).toMatchObject({
+        finality: 'finalized', blockHeight: 101n, blockHash: blockHash(101n), tailError: expect.stringMatching(/Tail tip is \d+ s old/),
+        page: { state: { cursor: { number: 101n, hash: blockHash(101n) } }, throughBlock: 101n, transfers: [{ blockNumber: 101n }] },
+      });
+      expect(result.finalizedBlockHeight).toBeUndefined();
+      expect(result.finalizedBlockHash).toBeUndefined();
+    }
+  } finally { await s.close(); }
+});
+
 test('a tail Transfer above the snapshot block invalidates reuse of only that token', async () => {
   const chain = new FakeChain(100n);
   chain.latest = 101n;
