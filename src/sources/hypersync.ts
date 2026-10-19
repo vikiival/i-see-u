@@ -62,9 +62,10 @@ export function createHypersyncLogSource(options: HypersyncSourceOptions): Accou
         };
 
         const aggregate = emptyAggregate();
+        let calls = 0;
 
         const pages = hypersyncPages(hs, query, {
-          idleMs: options.timeoutMs, sleep: options.sleep, aborted: () => closed, onRequest: () => { state.requests += 1; },
+          idleMs: options.timeoutMs, sleep: options.sleep, aborted: () => closed, onRequest: () => { calls += 1; state.requests += 1; },
         });
 
         for await (const response of pages) {
@@ -76,7 +77,7 @@ export function createHypersyncLogSource(options: HypersyncSourceOptions): Accou
           }
         }
 
-        const result = { aggregate, calls: 1, logs: aggregateLogCount(aggregate), heavy: false };
+        const result = { aggregate, calls, logs: aggregateLogCount(aggregate), heavy: false };
         state.logs += result.logs;
 
         return result;

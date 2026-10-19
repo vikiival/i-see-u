@@ -147,6 +147,7 @@ test('HyperSync multi-page streaming exactly matches RPC aggregation, including 
     const [fromHs, fromRpc] = await Promise.all([hs.scanAccount(ACCOUNT, range), rpcSource.scanAccount(ACCOUNT, range)]);
     expect(canonical(fromHs.aggregate)).toEqual(canonical(fromRpc.aggregate));
     expect(fromHs.logs).toBe(4);
+    expect(fromHs.calls).toBe(3);
     // Page two continues at nextBlock; the 429 sleeps for the quota window and repeats the same request.
     expect(hsClient.seen.map((query) => [query.fromBlock, query.toBlock])).toEqual([[10, 21], [12, 21], [12, 21]]);
     expect(waits).toEqual([1_000]);
