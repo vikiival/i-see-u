@@ -1,612 +1,1162 @@
-import { and, asc, desc, eq, gt, inArray, lt, lte, or, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, getTableColumns, gt, gte, lte, or, sql } from 'drizzle-orm';
+import type { SQL } from 'drizzle-orm';
 import type { PgDatabase } from 'drizzle-orm/pg-core';
 
 import type {
-  AccountView,
   Address,
-  ChunkAggregate,
-  Erc20RefreshState,
-  FollowerCursor,
-  Store,
   BlockHeader,
+  BlockRange,
+  BootstrapCoverage,
+  HistoryTransfer,
+  IndexSnapshot,
+  IndexState,
+  Store,
   TransferEvent,
-  Tracking,
 } from '../core/types.ts';
-import { unavailable } from '../core/limiter.ts';
+import { ChainGapError, TailConflictError } from '../core/errors.ts';
+import { networkRegistry } from '../networks.ts';
 import * as schema from './schema.ts';
 
 export type StoreDatabase = PgDatabase<any, typeof schema>;
 
-type Executor = Pick<StoreDatabase, 'select' | 'insert' | 'update' | 'delete' | 'execute'>;
+export type Executor = Pick<StoreDatabase, 'select' | 'insert' | 'update' | 'delete' | 'execute'>;
 
-/** Rows per multi-row INSERT, far below PostgreSQL's 65,535 bind-parameter limit. */
+const {
+  ingestionState: state,
+  blockHeaders: headers,
+  transfers: raw,
+  holdings: h,
+  nftOwnership: nft,
+  balanceSnapshots: cache,
+  repairQueue: repairs,
+  tailBlocks: tailHeaders,
+  tailTransfers: tailRaw,
+} = schema;
+
 const INSERT_BATCH = 1_000;
+const ZERO: Address = `0x${'0'.repeat(40)}`;
 
-const inBatches = async <T, R>(rows: T[], fn: (batch: T[]) => Promise<R>): Promise<void> => {
-  for (let i = 0; i < rows.length; i += INSERT_BATCH) await fn(rows.slice(i, i + INSERT_BATCH));
-};
-
-const cursorColumns = {
-  number: schema.followerCursor.blockNumber,
-  hash: schema.followerCursor.blockHash,
-  timestamp: schema.followerCursor.blockTimestamp,
-  updatedAt: schema.followerCursor.updatedAt,
-};
-
-const tailColumns = {
-  number: schema.tailBlocks.number,
-  hash: schema.tailBlocks.hash,
-  parentHash: schema.tailBlocks.parentHash,
-  timestamp: schema.tailBlocks.timestamp,
-};
-
-export class TailConflictError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'TailConflictError';
+const batches = async <T, R>(rows: T[], insert: (batch: T[]) => PromiseLike<R>): Promise<void> => {
+  for (let i = 0; i < rows.length; i += INSERT_BATCH) {
+    await insert(rows.slice(i, i + INSERT_BATCH));
   }
-}
+};
 
-/** Fold per-account aggregates into holdings and NFT items: counts add, bounds widen, the newest NFT transfer wins. */
-async function upsertAggregates(tx: Executor, network: string, aggregates: Iterable<[Address, ChunkAggregate]>): Promise<void> {
-  const holdingValues = [];
-  const nftValues = [];
-
-  for (const [account, chunk] of aggregates) {
-    for (const [token, value] of chunk.tokens) {
-      holdingValues.push({
-        network,
-        holder: account,
-        token,
-        standard: value.standard,
-        firstBlock: value.firstBlock,
-        lastBlock: value.lastBlock,
-        sentCount: value.sentCount,
-        receivedCount: value.receivedCount,
-      });
-    }
-
-    for (const value of chunk.nfts.values()) {
-      nftValues.push({
-        network,
-        holder: account,
-        token: value.token,
-        tokenId: value.tokenId.toString(),
-        held: value.held,
-        lastBlock: value.block,
-        lastLogIndex: value.logIndex,
-      });
-    }
+/** Checks the complete range even when it contains no transfers. Duplicate identities must carry identical data. */
+function validateRange(range: BlockRange, blocks: BlockHeader[], events: TransferEvent[]): TransferEvent[] {
+  if (
+    range.fromBlock < 0n ||
+    range.toBlock < range.fromBlock ||
+    BigInt(blocks.length) !== range.toBlock - range.fromBlock + 1n
+  ) {
+    throw new ChainGapError('Range must contain every block header');
   }
 
-  await inBatches(holdingValues, (values) => tx.insert(schema.holdings).values(values).onConflictDoUpdate({
-    target: [schema.holdings.network, schema.holdings.holder, schema.holdings.token],
-    set: {
-      standard: sql`excluded.standard`,
-      firstBlock: sql`LEAST(${schema.holdings.firstBlock}, excluded.first_block)`,
-      lastBlock: sql`GREATEST(${schema.holdings.lastBlock}, excluded.last_block)`,
-      sentCount: sql`${schema.holdings.sentCount} + excluded.sent_count`,
-      receivedCount: sql`${schema.holdings.receivedCount} + excluded.received_count`,
-    },
-  }));
-  await inBatches(nftValues, (values) => tx.insert(schema.nftItems).values(values).onConflictDoUpdate({
-    target: [schema.nftItems.network, schema.nftItems.holder, schema.nftItems.token, schema.nftItems.tokenId],
-    set: {
-      held: sql`excluded.held`,
-      lastBlock: sql`excluded.last_block`,
-      lastLogIndex: sql`excluded.last_log_index`,
-    },
-    setWhere: sql`excluded.last_block > ${schema.nftItems.lastBlock}
-      OR (excluded.last_block = ${schema.nftItems.lastBlock}
-        AND excluded.last_log_index > ${schema.nftItems.lastLogIndex})`,
-  }));
+  const byBlock = new Map<bigint, BlockHeader>();
+
+  for (const [i, block] of blocks.entries()) {
+    if (block.number !== range.fromBlock + BigInt(i) || (i > 0 && block.parentHash !== blocks[i - 1].hash)) {
+      throw new ChainGapError(`Header chain gap at ${block.number}`);
+    }
+
+    byBlock.set(block.number, block);
+  }
+
+  const unique = new Map<string, TransferEvent>();
+
+  for (const event of events) {
+    if (byBlock.get(event.blockNumber)?.hash !== event.blockHash) {
+      throw new ChainGapError('Transfer does not match range header');
+    }
+
+    const key = `${event.blockNumber}:${event.logIndex}`;
+    const previous = unique.get(key);
+
+    if (
+      previous &&
+      (previous.blockHash !== event.blockHash ||
+        previous.transactionHash !== event.transactionHash ||
+        previous.token !== event.token ||
+        previous.from !== event.from ||
+        previous.to !== event.to ||
+        previous.standard !== event.standard ||
+        previous.value !== event.value)
+    ) {
+      throw new Error(`Conflicting transfer ${key}`);
+    }
+
+    unique.set(key, event);
+  }
+
+  return [...unique.values()];
 }
 
-export function createStore(db: StoreDatabase, close: () => Promise<void> = async () => {}): Store {
-  const getProgress = async (tx: Executor, network: string, account: Address): Promise<bigint | undefined> => {
-    const [row] = await tx.select({ progressTo: schema.accountScanProgress.progressTo })
-      .from(schema.accountScanProgress).where(and(
-        eq(schema.accountScanProgress.network, network),
-        eq(schema.accountScanProgress.account, account),
-      )).limit(1);
+const newestFirst = (a: TransferEvent, b: TransferEvent) =>
+  a.blockNumber === b.blockNumber ? b.logIndex - a.logIndex : a.blockNumber > b.blockNumber ? -1 : 1;
 
-    return row?.progressTo;
+/** A snapshot's block is canonical while it is the finalized header or the current tail block at its height. */
+const canonicalSnapshot = sql`(EXISTS (SELECT 1 FROM block_headers c WHERE c.network = ${cache.network} AND c.number = ${cache.blockNumber} AND c.hash = ${cache.blockHash})
+  OR EXISTS (SELECT 1 FROM tail_blocks c WHERE c.network = ${cache.network} AND c.number = ${cache.blockNumber} AND c.hash = ${cache.blockHash}))`;
+
+const summarySelect = (source: SQL) => sql`
+  SELECT network, holder, token, max(standard), min(block_number), max(block_number),
+    sum(sent)::bigint, sum(received)::bigint
+  FROM (${source}) movements GROUP BY network, holder, token`;
+
+const summaryMerge = sql`ON CONFLICT (network, holder, token) DO UPDATE SET
+  standard = greatest(holdings.standard, excluded.standard),
+  first_block = least(holdings.first_block, excluded.first_block),
+  last_block = greatest(holdings.last_block, excluded.last_block),
+  sent_count = holdings.sent_count + excluded.sent_count,
+  received_count = holdings.received_count + excluded.received_count`;
+
+const nftMerge = sql`ON CONFLICT (network, token, token_id) DO UPDATE SET
+  owner = excluded.owner, last_block = excluded.last_block, last_log_index = excluded.last_log_index
+  WHERE (excluded.last_block, excluded.last_log_index) > (nft_ownership.last_block, nft_ownership.last_log_index)`;
+
+export const applySummaries = (tx: Executor, source: SQL) =>
+  tx.execute(sql`
+  INSERT INTO holdings (network, holder, token, standard, first_block, last_block, sent_count, received_count)
+  ${summarySelect(source)}
+  ${summaryMerge}`);
+
+export const applyNfts = (tx: Executor, source: SQL) =>
+  tx.execute(sql`
+  INSERT INTO nft_ownership (network, token, token_id, owner, last_block, last_log_index)
+  SELECT DISTINCT ON (network, token, value) network, token, value, "to", block_number, log_index
+  FROM (${source}) events ORDER BY network, token, value, block_number DESC, log_index DESC
+  ${nftMerge}`);
+
+/** Fold one bootstrap segment before writing. Each key is unique in each batch, so
+ * PostgreSQL can merge concurrently committed segments in any order. */
+export function createSegmentAggregate() {
+  type Summary = {
+    holder: Address;
+    token: Address;
+    standard: number;
+    first: bigint;
+    last: bigint;
+    sent: bigint;
+    received: bigint;
   };
 
-  const getTarget = async (tx: Executor, network: string, account: Address): Promise<bigint | undefined> => {
-    const [row] = await tx.select({ target: schema.trackedAccounts.backfillTarget })
-      .from(schema.trackedAccounts).where(and(
-        eq(schema.trackedAccounts.network, network),
-        eq(schema.trackedAccounts.account, account),
-      )).limit(1);
+  type Winner = { token: Address; value: bigint; owner: Address; block: bigint; index: number };
 
-    return row?.target;
+  const summaries = new Map<string, Summary>();
+
+  const winners = new Map<string, Winner>();
+
+  const add = (events: TransferEvent[]): void => {
+    for (const event of events) {
+      for (const [holder, sent] of [
+        [event.from, true],
+        [event.to, false],
+      ] as const) {
+        const key = `${holder}:${event.token}`;
+        let row = summaries.get(key);
+
+        if (!row) {
+          row = {
+            holder,
+            token: event.token,
+            standard: event.standard === 'erc20' ? 20 : 721,
+            first: event.blockNumber,
+            last: event.blockNumber,
+            sent: 0n,
+            received: 0n,
+          };
+          summaries.set(key, row);
+        }
+
+        row.standard = Math.max(row.standard, event.standard === 'erc20' ? 20 : 721);
+
+        if (event.blockNumber < row.first) {
+          row.first = event.blockNumber;
+        }
+
+        if (event.blockNumber > row.last) {
+          row.last = event.blockNumber;
+        }
+
+        if (sent) {
+          row.sent += 1n;
+        } else {
+          row.received += 1n;
+        }
+      }
+
+      if (event.standard === 'erc721') {
+        const key = `${event.token}:${event.value}`;
+        const old = winners.get(key);
+
+        if (!old || event.blockNumber > old.block || (event.blockNumber === old.block && event.logIndex > old.index)) {
+          winners.set(key, {
+            token: event.token,
+            value: event.value,
+            owner: event.to,
+            block: event.blockNumber,
+            index: event.logIndex,
+          });
+        }
+      }
+    }
   };
 
-  const holdings = async (tx: Executor, network: string, account: Address) => {
-    const rows = await tx.select({
-      token: schema.holdings.token,
-      standard: schema.holdings.standard,
-      firstBlock: schema.holdings.firstBlock,
-      lastBlock: schema.holdings.lastBlock,
-      sentCount: schema.holdings.sentCount,
-      receivedCount: schema.holdings.receivedCount,
-    }).from(schema.holdings).where(and(
-      eq(schema.holdings.network, network),
-      eq(schema.holdings.holder, account),
-    )).orderBy(desc(schema.holdings.lastBlock), asc(schema.holdings.token));
+  const flush = async (tx: Executor, network: number): Promise<void> => {
+    const column = <T>(rows: T[], pick: (row: T) => string): SQL => sql`${sql.param(rows.map(pick))}::text[]`;
+    const bytes = <T>(rows: T[], pick: (row: T) => Address): SQL => column(rows, (row) => pick(row).slice(2));
 
-    return rows;
+    const ordered = [...summaries.values()].sort(
+      (a, b) => a.holder.localeCompare(b.holder) || a.token.localeCompare(b.token),
+    );
+
+    for (let i = 0; i < ordered.length; i += 2_000) {
+      const rows = ordered.slice(i, i + 2_000);
+      await tx.execute(sql`INSERT INTO holdings (network, holder, token, standard, first_block, last_block, sent_count, received_count)
+        SELECT ${network}::smallint, decode(h, 'hex'), decode(t, 'hex'), s::smallint, f::bigint, l::bigint, sc::bigint, rc::bigint
+        FROM unnest(${bytes(rows, (r) => r.holder)}, ${bytes(rows, (r) => r.token)}, ${column(rows, (r) => String(r.standard))},
+          ${column(rows, (r) => String(r.first))}, ${column(rows, (r) => String(r.last))},
+          ${column(rows, (r) => String(r.sent))}, ${column(rows, (r) => String(r.received))}) AS u(h, t, s, f, l, sc, rc)
+        ORDER BY h, t
+        ${summaryMerge}`);
+    }
+
+    const nftRows = [...winners.values()].sort(
+      (a, b) => a.token.localeCompare(b.token) || (a.value < b.value ? -1 : a.value > b.value ? 1 : 0),
+    );
+
+    for (let i = 0; i < nftRows.length; i += 2_000) {
+      const rows = nftRows.slice(i, i + 2_000);
+      await tx.execute(sql`INSERT INTO nft_ownership (network, token, token_id, owner, last_block, last_log_index)
+        SELECT ${network}::smallint, decode(t, 'hex'), v::numeric, decode(o, 'hex'), b::bigint, i::integer
+        FROM unnest(${bytes(rows, (r) => r.token)}, ${column(rows, (r) => String(r.value))}, ${bytes(rows, (r) => r.owner)},
+          ${column(rows, (r) => String(r.block))}, ${column(rows, (r) => String(r.index))}) AS u(t, v, o, b, i)
+        ORDER BY t, v::numeric
+        ${nftMerge}`);
+    }
   };
 
-  const nftItems = async (tx: Executor, network: string, account: Address) => {
-    const rows = await tx.select({
-      token: schema.nftItems.token,
-      tokenId: schema.nftItems.tokenId,
-      held: schema.nftItems.held,
-      lastBlock: schema.nftItems.lastBlock,
-    }).from(schema.nftItems).where(and(
-      eq(schema.nftItems.network, network),
-      eq(schema.nftItems.holder, account),
-    )).orderBy(desc(schema.nftItems.lastBlock), asc(schema.nftItems.token), asc(schema.nftItems.tokenId));
+  return { add, flush };
+}
+
+/** Registry names are converted once here; every SQL key uses a stable smallint, never the EVM chain ID. */
+export function createStore(
+  db: StoreDatabase,
+  close: () => Promise<void> = async () => {},
+  networks: ReadonlyMap<string, number> = new Map(Object.values(networkRegistry).map((n) => [n.name, n.id])),
+): Store {
+  const id = (network: string): number => {
+    const value = networks.get(network);
+
+    if (value === undefined || !Number.isInteger(value) || value < 1 || value > 32767) {
+      throw new Error(`Unknown database network: ${network}`);
+    }
+
+    return value;
+  };
+
+  if (new Set(networks.values()).size !== networks.size) {
+    throw new Error('Database network IDs must be unique');
+  }
+
+  const readState = async (
+    tx: Executor,
+    network: number,
+    lock?: 'update' | 'share',
+  ): Promise<IndexState | undefined> => {
+    const query = tx.select().from(state).where(eq(state.network, network));
+    const [row] = await (lock ? query.for(lock) : query);
+
+    if (!row) {
+      return undefined;
+    }
+
+    const [repair] = await tx
+      .select({ from: repairs.fromBlock })
+      .from(repairs)
+      .where(eq(repairs.network, network))
+      .limit(1);
+
+    return {
+      startBlock: row.startBlock,
+      cursor: {
+        number: row.blockNumber,
+        hash: row.blockHash,
+        timestamp: row.blockTimestamp,
+        updatedAt: row.updatedAt,
+        revision: row.revision,
+      },
+      head:
+        row.headNumber === null
+          ? undefined
+          : { number: row.headNumber, hash: row.headHash!, timestamp: row.headTimestamp! },
+      checkedAt: row.checkedAt ?? undefined,
+      pendingRepair: repair !== undefined,
+    };
+  };
+
+  const readIndex = async (tx: Executor, network: number): Promise<IndexSnapshot | undefined> => {
+    const current = await readState(tx, network);
+
+    if (current) {
+      return { state: current };
+    }
+
+    const [run] = await tx.select().from(schema.bootstrapRuns).where(eq(schema.bootstrapRuns.network, network));
+
+    if (!run || run.status === 'done') {
+      return undefined;
+    }
+
+    const segments = schema.bootstrapSegments;
+
+    const applied = await tx
+      .select()
+      .from(segments)
+      .where(and(eq(segments.network, network), eq(segments.applied, true)))
+      .orderBy(asc(segments.fromBlock));
+
+    const coveredRanges: BlockRange[] = [];
+    let coveredBlocks = 0n;
+    let lastAppliedAt = run.startedAt;
+
+    for (const segment of applied) {
+      const previous = coveredRanges.at(-1);
+
+      if (previous && previous.toBlock + 1n >= segment.fromBlock) {
+        if (segment.toBlock > previous.toBlock) {
+          previous.toBlock = segment.toBlock;
+        }
+      } else {
+        coveredRanges.push({ fromBlock: segment.fromBlock, toBlock: segment.toBlock });
+      }
+
+      lastAppliedAt = Math.max(lastAppliedAt, segment.updatedAt ?? run.startedAt);
+    }
+
+    for (const range of coveredRanges) {
+      coveredBlocks += range.toBlock - range.fromBlock + 1n;
+    }
+
+    const bootstrap: BootstrapCoverage = {
+      startBlock: run.startBlock,
+      targetBlock: run.targetBlock,
+      targetHash: run.targetHash,
+      coveredRanges,
+      coveredBlocks,
+      totalBlocks: run.targetBlock - run.startBlock + 1n,
+      lastAppliedAt,
+    };
+
+    return { bootstrap };
+  };
+
+  const headerAt = async (tx: Executor, network: number, number: bigint) => {
+    const [row] = await tx
+      .select()
+      .from(headers)
+      .where(and(eq(headers.network, network), eq(headers.number, number)));
+
+    return row;
+  };
+
+  const holdings = (tx: Executor, network: number, account: Address) =>
+    tx
+      .select({
+        token: h.token,
+        standard: h.standard,
+        firstBlock: h.firstBlock,
+        lastBlock: h.lastBlock,
+        sentCount: h.sentCount,
+        receivedCount: h.receivedCount,
+      })
+      .from(h)
+      .where(and(eq(h.network, network), eq(h.holder, account)))
+      .orderBy(desc(h.lastBlock), asc(h.token));
+
+  const nftItems = async (tx: Executor, network: number, account: Address) => {
+    if (account === ZERO) {
+      return [];
+    }
+
+    const rows = await tx
+      .select({ token: nft.token, tokenId: nft.tokenId, lastBlock: nft.lastBlock })
+      .from(nft)
+      .where(and(eq(nft.network, network), eq(nft.owner, account)))
+      .orderBy(asc(nft.token), asc(nft.tokenId));
+
+    return rows.map((row) => ({ ...row, heldBySeenLogs: true }));
+  };
+
+  const balances = async (tx: Executor, network: number, account: Address) => {
+    const rows = await tx
+      .select({ ...getTableColumns(cache), canonical: canonicalSnapshot.mapWith(Boolean) })
+      .from(cache)
+      .where(and(eq(cache.network, network), eq(cache.account, account)));
 
     return rows.map((row) => ({
       token: row.token,
-      tokenId: BigInt(row.tokenId),
-      heldBySeenLogs: row.held,
-      lastBlock: row.lastBlock,
+      result:
+        row.balance === null
+          ? { status: 'error' as const, error: row.error! }
+          : { status: 'ok' as const, balance: row.balance },
+      blockNumber: row.blockNumber,
+      blockHash: row.blockHash,
+      readAt: row.readAt,
+      revision: row.revision,
+      canonical: row.canonical,
     }));
   };
 
-  const getFollowerCursor = async (tx: Executor, network: string, lock?: 'share' | 'update'): Promise<FollowerCursor | undefined> => {
-    const query = tx.select(cursorColumns).from(schema.followerCursor).where(eq(schema.followerCursor.network, network));
-    const [row] = await (lock === 'update' ? query.for('update') : lock === 'share' ? query.for('share') : query);
+  const tailTip = async (tx: Executor, network: number, lock?: 'update'): Promise<BlockHeader | undefined> => {
+    const query = tx
+      .select({
+        number: tailHeaders.number,
+        hash: tailHeaders.hash,
+        parentHash: tailHeaders.parentHash,
+        timestamp: tailHeaders.timestamp,
+      })
+      .from(tailHeaders)
+      .where(eq(tailHeaders.network, network))
+      .orderBy(desc(tailHeaders.number))
+      .limit(1);
+
+    const [row] = await (lock ? query.for(lock) : query);
 
     return row;
   };
 
-  const getTailTip = async (tx: Executor, network: string, lock?: 'update'): Promise<BlockHeader | undefined> => {
-    const query = tx.select(tailColumns).from(schema.tailBlocks)
-      .where(eq(schema.tailBlocks.network, network)).orderBy(desc(schema.tailBlocks.number)).limit(1);
-
-    const [row] = await (lock === 'update' ? query.for('update') : query);
-
-    return row;
+  const wipeTail = async (tx: Executor, network: number) => {
+    await tx.delete(tailRaw).where(eq(tailRaw.network, network));
+    await tx.delete(tailHeaders).where(eq(tailHeaders.network, network));
   };
 
-  const wipeTail = async (tx: Executor, network: string): Promise<void> => {
-    await tx.delete(schema.tailTransfers).where(eq(schema.tailTransfers.network, network));
-    await tx.delete(schema.tailBlocks).where(eq(schema.tailBlocks.network, network));
+  /** Fence a tail rewind/wipe on the tip the caller observed: a concurrent writer (failover) must not lose rows. */
+  const fenceTip = async (tx: Executor, network: number, expected: string | undefined) => {
+    const tip = await tailTip(tx, network, 'update');
+
+    if (expected !== undefined && tip?.hash !== expected) {
+      throw new TailConflictError(`Tail tip changed from ${expected} to ${tip?.hash}`);
+    }
   };
 
-  const erc20RefreshState = async (network: string, accounts: Address[]): Promise<Erc20RefreshState[]> => {
-    const states: Erc20RefreshState[] = [];
-    const cursor = await getFollowerCursor(db, network);
-    await inBatches(accounts, async (batch) => {
-      const members = new Set<string>(batch);
-      const byPair = new Map<string, Erc20RefreshState>();
+  const insertRange = async (tx: Executor, network: number, blocks: BlockHeader[], events: TransferEvent[]) => {
+    await batches(blocks, (batch) => tx.insert(headers).values(batch.map((block) => ({ network, ...block }))));
+    await batches(events, (batch) => tx.insert(raw).values(batch.map((event) => ({ network, ...event }))));
+  };
 
-      const touch = (account: Address, token: Address, block: bigint) => {
-        const key = `${account}:${token}`;
-        const state = byPair.get(key);
+  const rangeCondition = (network: number, range: BlockRange) =>
+    and(eq(raw.network, network), gte(raw.blockNumber, range.fromBlock), lte(raw.blockNumber, range.toBlock))!;
 
-        if (!state) byPair.set(key, { account, token, lastTransferBlock: block });
-        else if (block > state.lastTransferBlock) state.lastTransferBlock = block;
-      };
+  const rangeSql = (network: number, range: BlockRange) =>
+    sql`network = ${network} AND block_number BETWEEN ${range.fromBlock} AND ${range.toBlock}`;
 
-      const rows = await db.select({
-        account: schema.holdings.holder, token: schema.holdings.token, lastBlock: schema.holdings.lastBlock,
-      }).from(schema.holdings).where(and(
-        eq(schema.holdings.network, network),
-        eq(schema.holdings.standard, 'erc20'),
-        inArray(schema.holdings.holder, batch),
-      )).orderBy(asc(schema.holdings.holder), asc(schema.holdings.token));
+  const checkLimit = (limit: number) => {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 200) {
+      throw new Error('Limit must be between 1 and 200');
+    }
+  };
 
-      for (const row of rows) touch(row.account, row.token, row.lastBlock);
-
-      // Tail rows above the cursor are newer than any finalized Transfer folded into holdings.
-      const tail = await db.select({
-        from: schema.tailTransfers.from,
-        to: schema.tailTransfers.to,
-        token: schema.tailTransfers.token,
-        block: sql<string>`max(${schema.tailTransfers.blockNumber})`,
-      }).from(schema.tailTransfers).where(and(
-        eq(schema.tailTransfers.network, network),
-        eq(schema.tailTransfers.standard, 'erc20'),
-        or(inArray(schema.tailTransfers.from, batch), inArray(schema.tailTransfers.to, batch)),
-      )).groupBy(schema.tailTransfers.from, schema.tailTransfers.to, schema.tailTransfers.token);
-
-      for (const row of tail) for (const account of [row.from, row.to]) {
-        if (members.has(account)) touch(account, row.token, BigInt(row.block));
-      }
-
-      const snapshots = await db.select({
-        account: schema.balanceSnapshots.account,
-        token: schema.balanceSnapshots.token,
-        balance: schema.balanceSnapshots.balance,
-        blockNumber: schema.balanceSnapshots.blockNumber,
-        blockHash: schema.balanceSnapshots.blockHash,
-      }).from(schema.balanceSnapshots).where(and(
-        eq(schema.balanceSnapshots.network, network),
-        inArray(schema.balanceSnapshots.account, batch),
-      ));
-
-      // A snapshot above the cursor is canonical only while the tail still holds its hash at that height: a reorg
-      // seen by another process's tail never kicks this worker, so the Transfer test alone would trust an orphan.
-      const above = [...new Set(snapshots.map((row) => row.blockNumber).filter((n) => !cursor || n > cursor.number))];
-      const tailHashes = new Map<bigint, string>();
-
-      if (above.length > 0) {
-        const rows = await db.select({ number: schema.tailBlocks.number, hash: schema.tailBlocks.hash })
-          .from(schema.tailBlocks).where(and(
-            eq(schema.tailBlocks.network, network), inArray(schema.tailBlocks.number, above),
-          ));
-
-        for (const row of rows) tailHashes.set(row.number, row.hash);
-      }
-
-      for (const row of snapshots) {
-        const state = byPair.get(`${row.account}:${row.token}`);
-
-        if (!state) continue;
-        const ok = row.balance !== null;
-
-        const canonical = (cursor !== undefined && row.blockNumber <= cursor.number)
-          || tailHashes.get(row.blockNumber) === row.blockHash;
-
-        state.snapshot = { blockNumber: row.blockNumber, ok, zero: ok && BigInt(row.balance!) === 0n, canonical };
-      }
-
-      states.push(...byPair.values());
-    });
-
-    return states;
+  // Every affected account is scanned once per direction, not once per (account, token) pair.
+  const rebuildTouched = async (tx: Executor, n: number) => {
+    await tx.execute(
+      sql`DELETE FROM holdings h USING repair_accounts a WHERE h.network = ${n} AND h.holder = a.holder`,
+    );
+    // Indexed lateral lookups avoid scanning the global history for a small repair.
+    await applySummaries(
+      tx,
+      sql`
+      SELECT t.network, p.holder, t.token, t.standard, t.block_number, 1 AS sent, 0 AS received
+      FROM repair_accounts p CROSS JOIN LATERAL (SELECT * FROM transfers WHERE network = ${n} AND "from" = p.holder) t
+      UNION ALL
+      SELECT t.network, p.holder, t.token, t.standard, t.block_number, 0 AS sent, 1 AS received
+      FROM repair_accounts p CROSS JOIN LATERAL (SELECT * FROM transfers WHERE network = ${n} AND "to" = p.holder) t`,
+    );
+    await tx.execute(
+      sql`DELETE FROM nft_ownership o USING repair_nfts p WHERE o.network = ${n} AND o.token = p.token AND o.token_id = p.token_id`,
+    );
+    await applyNfts(
+      tx,
+      sql`SELECT t.* FROM repair_nfts p CROSS JOIN LATERAL (
+      SELECT * FROM transfers WHERE network = ${n} AND standard = 721 AND token = p.token AND value = p.token_id
+      ORDER BY block_number DESC, log_index DESC LIMIT 1) t`,
+    );
+    await tx.execute(
+      sql`DELETE FROM balance_snapshots b USING repair_accounts p WHERE b.network = ${n} AND b.account = p.holder`,
+    );
   };
 
   return {
-    getFollowerCursor: (network) => getFollowerCursor(db, network),
+    async initialize(network, startBlock, anchor, at) {
+      if (anchor.number !== startBlock - 1n) {
+        throw new Error('Anchor must be immediately before startBlock');
+      }
 
-    async initFollowerCursor(network, block, at) {
-      await db.insert(schema.followerCursor).values({
-        network,
-        blockNumber: block.number,
-        blockHash: block.hash,
-        blockTimestamp: block.timestamp,
-        updatedAt: at,
-      }).onConflictDoNothing();
+      const n = id(network);
 
-      return (await getFollowerCursor(db, network))!;
-    },
-
-    async trackAccount(network, account, at) {
-      return db.transaction(async (tx): Promise<Tracking> => {
-        // FOR SHARE conflicts with the follower's FOR UPDATE: its commit is entirely before or after this one.
-        const cursor = await getFollowerCursor(tx, network, 'share');
-
-        if (!cursor) throw Object.assign(new Error('Follower has no cursor yet'), { statusCode: 503, retryAfterS: 5 });
-        const existing = await getTarget(tx, network, account);
-
-        if (existing !== undefined) return { target: existing, progress: await getProgress(tx, network, account) };
-
-        let progress = await getProgress(tx, network, account);
-
-        if (progress !== undefined && progress > cursor.number) {
-          // Legacy scan data above the cursor would overlap the follower's blocks: rebuild the account from scratch.
-          const { holdings: h, nftItems: n, accountScanProgress: p } = schema;
-          await tx.delete(h).where(and(eq(h.network, network), eq(h.holder, account)));
-          await tx.delete(n).where(and(eq(n.network, network), eq(n.holder, account)));
-          await tx.delete(p).where(and(eq(p.network, network), eq(p.account, account)));
-          progress = undefined;
-        }
-
-        const inserted = await tx.insert(schema.trackedAccounts)
-          .values({ network, account, backfillTarget: cursor.number, trackedAt: at })
-          .onConflictDoNothing().returning({ target: schema.trackedAccounts.backfillTarget });
-
-        if (inserted.length > 0) return { target: cursor.number, progress };
-        // A concurrent first request won the insert: serve its target.
-        const winner = await getTarget(tx, network, account);
-
-        if (winner === undefined) throw unavailable('Account tracking raced; retry', 1);
-
-        return { target: winner, progress: await getProgress(tx, network, account) };
-      });
-    },
-
-    async getTracking(network, account) {
-      const target = await getTarget(db, network, account);
-
-      return target === undefined ? undefined : { target, progress: await getProgress(db, network, account) };
-    },
-
-    async trackedAccounts(network) {
-      const rows = await db.select({ account: schema.trackedAccounts.account })
-        .from(schema.trackedAccounts).where(eq(schema.trackedAccounts.network, network))
-        .orderBy(asc(schema.trackedAccounts.account));
-
-      return rows.map((row) => row.account);
-    },
-
-    async applyFollowerRange(network, range, to, at, aggregates, known) {
       return db.transaction(async (tx) => {
-        const cursor = await getFollowerCursor(tx, network, 'update');
+        await tx
+          .insert(state)
+          .values({
+            network: n,
+            startBlock,
+            blockNumber: anchor.number,
+            blockHash: anchor.hash,
+            blockTimestamp: anchor.timestamp,
+            updatedAt: at,
+          })
+          .onConflictDoNothing();
+        const current = (await readState(tx, n, 'update'))!;
 
-        if (cursor?.number !== range.fromBlock - 1n || to.number !== range.toBlock) {
-          throw new Error(`Follower range ${range.fromBlock}-${range.toBlock} does not continue cursor ${cursor?.number}`);
+        if (current.startBlock !== startBlock) {
+          throw new Error('Network start block changed');
         }
 
-        // Accounts tracked while the range was being decoded are not in `known`: the follower re-folds its retained logs for them and retries.
-        const tracked = await tx.select({ account: schema.trackedAccounts.account })
-          .from(schema.trackedAccounts).where(eq(schema.trackedAccounts.network, network));
+        const existing = await headerAt(tx, n, anchor.number);
 
-        const missing = tracked.map((row) => row.account).filter((account) => !known.has(account));
-
-        if (missing.length > 0) return { applied: false as const, missing };
-
-        await upsertAggregates(tx, network, aggregates);
-
-        const [overlap] = await tx.select({ hash: schema.tailBlocks.hash }).from(schema.tailBlocks).where(and(
-          eq(schema.tailBlocks.network, network), eq(schema.tailBlocks.number, to.number),
-        )).limit(1);
-
-        if (overlap && overlap.hash !== to.hash) await wipeTail(tx, network);
-        else {
-          await tx.delete(schema.tailTransfers).where(and(
-            eq(schema.tailTransfers.network, network), lte(schema.tailTransfers.blockNumber, to.number),
-          ));
-          await tx.delete(schema.tailBlocks).where(and(
-            eq(schema.tailBlocks.network, network), lte(schema.tailBlocks.number, to.number),
-          ));
+        if (existing && existing.hash !== anchor.hash) {
+          throw new ChainGapError('Anchor hash changed');
         }
 
-        await tx.update(schema.followerCursor).set({
-          blockNumber: to.number,
-          blockHash: to.hash,
-          blockTimestamp: to.timestamp,
-          updatedAt: at,
-        }).where(eq(schema.followerCursor.network, network));
+        await tx
+          .insert(headers)
+          .values({ network: n, ...anchor })
+          .onConflictDoNothing();
 
-        return { applied: true as const };
+        return current;
       });
     },
 
-    async getTailBlocks(network) {
-      const rows = await db.select(tailColumns).from(schema.tailBlocks)
-        .where(eq(schema.tailBlocks.network, network)).orderBy(asc(schema.tailBlocks.number));
+    indexState: (network) =>
+      db.transaction((tx) => readState(tx, id(network)), {
+        isolationLevel: 'repeatable read',
+        accessMode: 'read only',
+      }),
 
-      return rows;
+    indexSnapshot: (network) =>
+      db.transaction((tx) => readIndex(tx, id(network)), {
+        isolationLevel: 'repeatable read',
+        accessMode: 'read only',
+      }),
+
+    async opsSnapshot(network) {
+      const n = id(network);
+      const runs = schema.bootstrapRuns;
+      const segments = schema.bootstrapSegments;
+
+      // One statement: PK lookups, bounded tail-tip lookup, segment counters; never scan headers or transfers.
+      const [row] = await db
+        .select({
+          current: getTableColumns(state),
+          pendingRepair: sql<boolean>`EXISTS (SELECT 1 FROM repair_queue WHERE network = ${n})`.mapWith(Boolean),
+          tipNumber: sql<
+            bigint | null
+          >`(SELECT number FROM tail_blocks WHERE network = ${n} ORDER BY number DESC LIMIT 1)`.mapWith(
+            (v: string | null) => (v === null ? null : BigInt(v)),
+          ),
+          tipTimestamp: sql<
+            bigint | null
+          >`(SELECT timestamp FROM tail_blocks WHERE network = ${n} ORDER BY number DESC LIMIT 1)`.mapWith(
+            (v: string | null) => (v === null ? null : BigInt(v)),
+          ),
+          phase: runs.status,
+          runStart: runs.startBlock,
+          runTarget: runs.targetBlock,
+          done: sql<number>`(SELECT count(*) FROM ${segments} WHERE network = ${n} AND done)`.mapWith(Number),
+          applied: sql<number>`(SELECT count(*) FROM ${segments} WHERE network = ${n} AND applied)`.mapWith(Number),
+          total: sql<number>`(SELECT count(*) FROM ${segments} WHERE network = ${n})`.mapWith(Number),
+        })
+        .from(sql`(SELECT ${n}::smallint AS network) AS requested`)
+        .leftJoin(state, sql`${state.network} = requested.network`)
+        .leftJoin(runs, sql`${runs.network} = requested.network`);
+
+      const s = row.current;
+
+      return {
+        state: s
+          ? {
+              startBlock: s.startBlock,
+              cursor: {
+                number: s.blockNumber,
+                hash: s.blockHash,
+                timestamp: s.blockTimestamp,
+                updatedAt: s.updatedAt,
+                revision: s.revision,
+              },
+              head:
+                s.headNumber === null
+                  ? undefined
+                  : { number: s.headNumber, hash: s.headHash!, timestamp: s.headTimestamp! },
+              checkedAt: s.checkedAt ?? undefined,
+              pendingRepair: row.pendingRepair,
+            }
+          : undefined,
+        tipNumber: row.tipNumber ?? undefined,
+        tipTimestamp: row.tipTimestamp ?? undefined,
+        bootstrap:
+          row.phase === null
+            ? undefined
+            : {
+                status: row.phase,
+                startBlock: row.runStart!,
+                targetBlock: row.runTarget!,
+                segmentsDone: row.done,
+                segmentsApplied: row.applied,
+                segmentsTotal: row.total,
+              },
+      };
     },
 
-    getTailTip: (network) => getTailTip(db, network),
+    async observeHead(network, head, at) {
+      const n = id(network);
+      await db.transaction(async (tx) => {
+        const current = await readState(tx, n, 'update');
+
+        if (!current) {
+          throw new Error('Index is not initialized');
+        }
+
+        const previous = current.head;
+
+        if (previous && head.number < previous.number) {
+          return;
+        }
+
+        await tx
+          .update(state)
+          .set({ headNumber: head.number, headHash: head.hash, headTimestamp: head.timestamp, checkedAt: at })
+          .where(eq(state.network, n));
+      });
+    },
+
+    async appendRange(network, range, blocks, events, at) {
+      const unique = validateRange(range, blocks, events);
+      const n = id(network);
+
+      return db.transaction(async (tx) => {
+        const current = await readState(tx, n, 'update');
+
+        if (!current) {
+          throw new Error('Index is not initialized');
+        }
+
+        if (range.toBlock <= current.cursor.number) {
+          const stored = await tx
+            .select()
+            .from(headers)
+            .where(
+              and(eq(headers.network, n), gte(headers.number, range.fromBlock), lte(headers.number, range.toBlock)),
+            )
+            .orderBy(asc(headers.number));
+
+          if (
+            stored.length !== blocks.length ||
+            stored.some((block, i) => block.hash !== blocks[i].hash || block.parentHash !== blocks[i].parentHash)
+          ) {
+            throw new ChainGapError('Committed range differs; use replaceRange');
+          }
+
+          return false;
+        }
+
+        if (range.fromBlock !== current.cursor.number + 1n) {
+          throw new ChainGapError('Range does not continue cursor');
+        }
+
+        if (blocks[0].parentHash !== current.cursor.hash) {
+          throw new ChainGapError('Next range parent hash does not match cursor');
+        }
+
+        if (!current.head || range.toBlock > current.head.number) {
+          throw new Error('Range exceeds observed finalized head');
+        }
+
+        const last = blocks.at(-1)!;
+
+        if (last.number === current.head.number && last.hash !== current.head.hash) {
+          throw new ChainGapError('Range does not match finalized head');
+        }
+
+        await insertRange(tx, n, blocks, unique);
+        const condition = rangeSql(n, range);
+        await applySummaries(
+          tx,
+          sql`
+          SELECT network, "from" AS holder, token, standard, block_number, 1 AS sent, 0 AS received FROM transfers WHERE ${condition}
+          UNION ALL
+          SELECT network, "to" AS holder, token, standard, block_number, 0 AS sent, 1 AS received FROM transfers WHERE ${condition}`,
+        );
+        await applyNfts(tx, sql`SELECT * FROM transfers WHERE ${condition} AND standard = 721`);
+        await tx
+          .update(state)
+          .set({ blockNumber: last.number, blockHash: last.hash, blockTimestamp: last.timestamp, updatedAt: at })
+          .where(eq(state.network, n));
+
+        // Finalized rows leave the tail in the same transaction; a different tail hash at the new cursor was a fork.
+        const [overlap] = await tx
+          .select({ hash: tailHeaders.hash })
+          .from(tailHeaders)
+          .where(and(eq(tailHeaders.network, n), eq(tailHeaders.number, last.number)));
+
+        if (overlap && overlap.hash !== last.hash) {
+          await wipeTail(tx, n);
+        } else {
+          await tx.delete(tailRaw).where(and(eq(tailRaw.network, n), lte(tailRaw.blockNumber, last.number)));
+          await tx.delete(tailHeaders).where(and(eq(tailHeaders.network, n), lte(tailHeaders.number, last.number)));
+        }
+
+        await tx
+          .delete(repairs)
+          .where(
+            and(eq(repairs.network, n), gte(repairs.fromBlock, range.fromBlock), lte(repairs.toBlock, range.toBlock)),
+          );
+
+        return true;
+      });
+    },
+
+    async replaceRange(network, range, blocks, events) {
+      const unique = validateRange(range, blocks, events);
+      const n = id(network);
+      await db.transaction(async (tx) => {
+        const current = await readState(tx, n, 'update');
+
+        if (!current || range.fromBlock < current.startBlock || range.toBlock > current.cursor.number) {
+          throw new Error('Repair must be inside the committed index');
+        }
+
+        const previous = await headerAt(tx, n, range.fromBlock - 1n);
+        const next = await headerAt(tx, n, range.toBlock + 1n);
+        const last = blocks.at(-1)!;
+
+        if (previous?.hash !== blocks[0].parentHash || (next && next.parentHash !== last.hash)) {
+          throw new ChainGapError('Repair does not join surrounding header chain');
+        }
+
+        if (last.number === current.head?.number && last.hash !== current.head.hash) {
+          throw new ChainGapError('Repair does not match finalized head');
+        }
+
+        // Capture both removed and replacement endpoints. An account/token that disappears must also be rebuilt.
+        await tx.execute(
+          sql`CREATE TEMP TABLE repair_pairs (holder bytea, token bytea, PRIMARY KEY(holder, token)) ON COMMIT DROP`,
+        );
+        await tx.execute(
+          sql`CREATE TEMP TABLE repair_nfts (token bytea, token_id numeric(78,0), PRIMARY KEY(token, token_id)) ON COMMIT DROP`,
+        );
+        const condition = rangeSql(n, range);
+
+        const touch = async () => {
+          await tx.execute(sql`INSERT INTO repair_pairs
+            SELECT "from", token FROM transfers WHERE ${condition} UNION SELECT "to", token FROM transfers WHERE ${condition}
+            ON CONFLICT DO NOTHING`);
+          await tx.execute(
+            sql`INSERT INTO repair_nfts SELECT DISTINCT token, value FROM transfers WHERE ${condition} AND standard = 721 ON CONFLICT DO NOTHING`,
+          );
+        };
+
+        await touch();
+        await tx.delete(raw).where(rangeCondition(n, range));
+        await tx
+          .delete(headers)
+          .where(and(eq(headers.network, n), gte(headers.number, range.fromBlock), lte(headers.number, range.toBlock)));
+        await insertRange(tx, n, blocks, unique);
+        await touch();
+        await tx.execute(
+          sql`CREATE TEMP TABLE repair_accounts ON COMMIT DROP AS SELECT DISTINCT holder FROM repair_pairs`,
+        );
+        await rebuildTouched(tx, n);
+        await tx
+          .delete(cache)
+          .where(
+            and(eq(cache.network, n), gte(cache.blockNumber, range.fromBlock), lte(cache.blockNumber, range.toBlock)),
+          );
+        await tx
+          .update(state)
+          .set({
+            revision: sql`${state.revision} + 1`,
+            ...(range.toBlock === current.cursor.number && { blockHash: last.hash, blockTimestamp: last.timestamp }),
+          })
+          .where(eq(state.network, n));
+
+        // The tail was anchored on the replaced cursor hash; the tail rebuilds from the new one.
+        if (range.toBlock === current.cursor.number && last.hash !== current.cursor.hash) {
+          await wipeTail(tx, n);
+        }
+
+        await tx
+          .delete(repairs)
+          .where(
+            and(eq(repairs.network, n), gte(repairs.fromBlock, range.fromBlock), lte(repairs.toBlock, range.toBlock)),
+          );
+      });
+    },
+
+    async rebuildRange(network, range) {
+      const n = id(network);
+      await db.transaction(async (tx) => {
+        const current = await readState(tx, n, 'update');
+
+        if (
+          !current ||
+          range.fromBlock < current.startBlock ||
+          range.toBlock > current.cursor.number ||
+          range.toBlock < range.fromBlock
+        ) {
+          throw new Error('Rebuild must be inside the committed index');
+        }
+
+        const condition = rangeSql(n, range);
+        await tx.execute(sql`CREATE TEMP TABLE repair_accounts ON COMMIT DROP AS
+          SELECT "from" AS holder FROM transfers WHERE ${condition} UNION SELECT "to" FROM transfers WHERE ${condition}`);
+        await tx.execute(sql`CREATE TEMP TABLE repair_nfts ON COMMIT DROP AS
+          SELECT DISTINCT token, value AS token_id FROM transfers WHERE ${condition} AND standard = 721`);
+        await rebuildTouched(tx, n);
+        await tx
+          .update(state)
+          .set({ revision: sql`${state.revision} + 1` })
+          .where(eq(state.network, n));
+        // Rebuilding derived state does not certify suspect raw data, so repair queue entries remain pending.
+      });
+    },
+
+    async enqueueRepair(network, range, reason, at) {
+      const n = id(network);
+      await db.transaction(async (tx) => {
+        if (!(await readState(tx, n, 'update'))) {
+          throw new Error('Index is not initialized');
+        }
+
+        await tx
+          .insert(repairs)
+          .values({ network: n, ...range, reason, createdAt: at })
+          .onConflictDoNothing();
+      });
+    },
+
+    async repairs(network) {
+      return db
+        .select({
+          fromBlock: repairs.fromBlock,
+          toBlock: repairs.toBlock,
+          reason: repairs.reason,
+          createdAt: repairs.createdAt,
+        })
+        .from(repairs)
+        .where(eq(repairs.network, id(network)))
+        .orderBy(asc(repairs.fromBlock));
+    },
+
+    async readAccount(network, account, options = {}) {
+      const n = id(network);
+
+      return db.transaction(
+        async (tx) => {
+          const snapshot = await readIndex(tx, n);
+
+          if (!snapshot) {
+            return undefined;
+          }
+
+          const current = snapshot.state;
+          const tip = current && options.tail ? await tailTip(tx, n) : undefined;
+
+          const tail = tip
+            ? await tx
+                .select()
+                .from(tailRaw)
+                .where(
+                  and(
+                    eq(tailRaw.network, n),
+                    gt(tailRaw.blockNumber, current!.cursor.number),
+                    or(eq(tailRaw.from, account), eq(tailRaw.to, account)),
+                  ),
+                )
+                .orderBy(asc(tailRaw.blockNumber), asc(tailRaw.logIndex))
+            : [];
+
+          return {
+            ...snapshot,
+            holdings: await holdings(tx, n, account),
+            nftItems: await nftItems(tx, n, account),
+            tailTransfers: tail.map(({ network: _network, ...event }) => event),
+            tailTip: tip,
+            ...(current && options.balances && { balances: await balances(tx, n, account) }),
+          };
+        },
+        { isolationLevel: 'repeatable read', accessMode: 'read only' },
+      );
+    },
+
+    holdings: (network, account) => holdings(db, id(network), account),
+    nftItems: (network, account) => nftItems(db, id(network), account),
+    balances: (network, account) => balances(db, id(network), account),
+
+    async tokenHolders(network, token, limit, after) {
+      checkLimit(limit);
+
+      const rows = await db
+        .select({ holder: h.holder })
+        .from(h)
+        .where(
+          and(eq(h.network, id(network)), eq(h.token, token), after === undefined ? undefined : gt(h.holder, after)),
+        )
+        .orderBy(asc(h.holder))
+        .limit(limit);
+
+      return rows.map((row) => row.holder);
+    },
+
+    async transferHistory(network, account, limit, before, tail = false) {
+      checkLimit(limit);
+      const n = id(network);
+
+      return db.transaction(
+        async (tx) => {
+          const snapshot = await readIndex(tx, n);
+
+          if (!snapshot) {
+            return undefined;
+          }
+
+          const cursor = snapshot.state?.cursor;
+          const revision = cursor?.revision ?? snapshot.bootstrap!.coveredBlocks;
+          const partial = snapshot.bootstrap ? true : undefined;
+          const tip = cursor && tail ? await tailTip(tx, n) : undefined;
+
+          const top = cursor
+            ? tip && tip.number > cursor.number
+              ? tip.number
+              : cursor.number
+            : (snapshot.bootstrap!.targetBlock ?? 0n);
+
+          // A latest cursor above the finalized cursor stays valid while the tail still reaches its bound.
+          if (before && (before.partial !== partial || before.revision !== revision || before.throughBlock > top)) {
+            throw Object.assign(new Error('History changed; restart pagination'), { statusCode: 409 });
+          }
+
+          const through = before?.throughBlock ?? top;
+
+          const keyset = (t: typeof raw | typeof tailRaw) =>
+            and(
+              eq(t.network, n),
+              lte(t.blockNumber, through),
+              before && sql`(${t.blockNumber}, ${t.logIndex}) < (${before.blockNumber}, ${before.logIndex})`,
+            );
+
+          const notSelf = (t: typeof raw | typeof tailRaw) => sql`${t.from} <> ${sql.param(account, t.from)}`;
+
+          // Two ordered index scans per table with bounded output; exclude the self-transfer from the received branch.
+          const sent = tx
+            .select()
+            .from(raw)
+            .where(and(keyset(raw), eq(raw.from, account)))
+            .orderBy(desc(raw.blockNumber), desc(raw.logIndex))
+            .limit(limit + 1);
+
+          const received = tx
+            .select()
+            .from(raw)
+            .where(and(keyset(raw), eq(raw.to, account), notSelf(raw)))
+            .orderBy(desc(raw.blockNumber), desc(raw.logIndex))
+            .limit(limit + 1);
+
+          const rows: HistoryTransfer[] = [...(await sent), ...(await received)].map(
+            ({ network: _network, ...event }) => event,
+          );
+
+          if (tip && cursor && through > cursor.number) {
+            const above = and(keyset(tailRaw), gt(tailRaw.blockNumber, cursor.number));
+
+            const tailSent = tx
+              .select()
+              .from(tailRaw)
+              .where(and(above, eq(tailRaw.from, account)))
+              .orderBy(desc(tailRaw.blockNumber), desc(tailRaw.logIndex))
+              .limit(limit + 1);
+
+            const tailReceived = tx
+              .select()
+              .from(tailRaw)
+              .where(and(above, eq(tailRaw.to, account), notSelf(tailRaw)))
+              .orderBy(desc(tailRaw.blockNumber), desc(tailRaw.logIndex))
+              .limit(limit + 1);
+
+            rows.push(
+              ...[...(await tailSent), ...(await tailReceived)].map(({ network: _network, ...event }) => ({
+                ...event,
+                unfinalized: true as const,
+              })),
+            );
+          }
+
+          rows.sort(newestFirst);
+          const page = rows.slice(0, limit);
+          const last = page.at(-1);
+
+          return {
+            ...snapshot,
+            throughBlock: through,
+            transfers: page,
+            next:
+              rows.length > limit && last
+                ? {
+                    blockNumber: last.blockNumber,
+                    logIndex: last.logIndex,
+                    throughBlock: through,
+                    revision,
+                    ...(partial && { partial }),
+                  }
+                : undefined,
+            tailTip: tip,
+          };
+        },
+        { isolationLevel: 'repeatable read', accessMode: 'read only' },
+      );
+    },
+
+    async saveBalances(network, block, rows, readAt, revision) {
+      const n = id(network);
+
+      return db.transaction(async (tx) => {
+        const current = await readState(tx, n, 'share');
+
+        if (!current || current.cursor.revision !== revision) {
+          return false;
+        }
+
+        const [canonical] =
+          block.number > current.cursor.number
+            ? await tx
+                .select({ hash: tailHeaders.hash })
+                .from(tailHeaders)
+                .where(and(eq(tailHeaders.network, n), eq(tailHeaders.number, block.number)))
+            : [await headerAt(tx, n, block.number)];
+
+        if (canonical?.hash !== block.hash) {
+          return false;
+        }
+
+        await batches(rows, (batch) =>
+          tx
+            .insert(cache)
+            .values(
+              batch.map((row) => ({
+                network: n,
+                account: row.account,
+                token: row.token,
+                balance: row.result.status === 'ok' ? row.result.balance : null,
+                error: row.result.status === 'error' ? row.result.error : null,
+                blockNumber: block.number,
+                blockHash: block.hash,
+                readAt,
+                revision,
+              })),
+            )
+            .onConflictDoUpdate({
+              target: [cache.network, cache.account, cache.token],
+              set: {
+                balance: sql`excluded.balance`,
+                error: sql`excluded.error`,
+                blockNumber: sql`excluded.block_number`,
+                blockHash: sql`excluded.block_hash`,
+                readAt: sql`excluded.read_at`,
+                revision: sql`excluded.revision`,
+              },
+              // A newer read never loses to an older one, unless the newer one's block was reorged out.
+              setWhere: sql`excluded.block_number > ${cache.blockNumber} OR
+            (excluded.block_number = ${cache.blockNumber} AND excluded.block_hash = ${cache.blockHash} AND excluded.read_at >= ${cache.readAt})
+            OR NOT ${canonicalSnapshot}`,
+            }),
+        );
+
+        return true;
+      });
+    },
+
+    tailTip: (network) => tailTip(db, id(network)),
+
+    async tailBlocks(network) {
+      return db
+        .select({
+          number: tailHeaders.number,
+          hash: tailHeaders.hash,
+          parentHash: tailHeaders.parentHash,
+          timestamp: tailHeaders.timestamp,
+        })
+        .from(tailHeaders)
+        .where(eq(tailHeaders.network, id(network)))
+        .orderBy(asc(tailHeaders.number));
+    },
 
     async appendTailBlocks(network, expectedParentHash, blocks) {
-      if (blocks.length === 0) return;
+      if (blocks.length === 0) {
+        return;
+      }
+
+      const n = id(network);
       await db.transaction(async (tx) => {
-        // The cursor lock serializes an empty-tail anchor against finalization/pruning.
-        const cursor = await getFollowerCursor(tx, network, 'share');
+        // The cursor share lock serializes an empty-tail anchor against finalization and pruning.
+        const current = await readState(tx, n, 'share');
 
-        if (!cursor) throw new TailConflictError('Follower has no cursor for tail anchor');
-        const tip = await getTailTip(tx, network, 'update');
-        const anchorHash = tip?.hash ?? cursor.hash;
-        const anchorNumber = tip?.number ?? cursor.number;
-
-        if (anchorHash !== expectedParentHash) {
-          throw new TailConflictError(`Tail parent changed from ${expectedParentHash} to ${anchorHash}`);
+        if (!current) {
+          throw new TailConflictError('Index is not initialized');
         }
 
-        let parentHash = anchorHash;
-        let number = anchorNumber + 1n;
+        const tip = await tailTip(tx, n, 'update');
+        const anchor = tip ?? current.cursor;
+
+        if (anchor.hash !== expectedParentHash) {
+          throw new TailConflictError(`Tail parent changed from ${expectedParentHash} to ${anchor.hash}`);
+        }
+
+        let parent = anchor.hash;
+        let number = anchor.number + 1n;
 
         for (const block of blocks) {
-          if (block.header.number !== number || block.header.parentHash !== parentHash) {
+          if (block.header.number !== number || block.header.parentHash !== parent) {
             throw new TailConflictError(`Non-contiguous tail block ${block.header.number}`);
           }
 
-          for (const transfer of block.transfers) {
-            if (transfer.blockNumber !== block.header.number || transfer.blockHash !== block.header.hash) {
-              throw new TailConflictError(`Transfer does not belong to tail block ${block.header.number}`);
-            }
+          if (block.transfers.some((event) => event.blockNumber !== number || event.blockHash !== block.header.hash)) {
+            throw new TailConflictError(`Transfer does not belong to tail block ${number}`);
           }
 
-          parentHash = block.header.hash;
+          parent = block.header.hash;
           number += 1n;
         }
 
-        await inBatches(blocks, (values) => tx.insert(schema.tailBlocks).values(values.map(({ header }) => ({
-          network,
-          number: header.number,
-          hash: header.hash,
-          parentHash: header.parentHash,
-          timestamp: header.timestamp,
-        }))));
+        await batches(blocks, (batch) =>
+          tx.insert(tailHeaders).values(batch.map(({ header }) => ({ network: n, ...header }))),
+        );
 
-        const transfers = blocks.flatMap((block) => block.transfers.map((event) => ({
-          network,
-          blockNumber: event.blockNumber,
-          logIndex: event.logIndex,
-          blockHash: event.blockHash,
-          token: event.token,
-          standard: event.standard,
-          from: event.from,
-          to: event.to,
-          value: event.value.toString(),
-          tokenId: event.standard === 'erc721' ? event.value.toString() : null,
-          txHash: event.transactionHash,
-        })));
+        const events = [
+          ...new Map(
+            blocks
+              .flatMap((block) => block.transfers)
+              .map((event) => [`${event.blockNumber}:${event.logIndex}`, event]),
+          ).values(),
+        ];
 
-        await inBatches(transfers, (values) => tx.insert(schema.tailTransfers).values(values));
+        await batches(events, (batch) => tx.insert(tailRaw).values(batch.map((event) => ({ network: n, ...event }))));
       });
     },
 
     async rewindTail(network, aboveNumber, expectedTipHash) {
+      const n = id(network);
       await db.transaction(async (tx) => {
-        // Fenced like appendTailBlocks: a concurrent tail writer (failover) must not lose rows it just appended.
-        const tip = await getTailTip(tx, network, 'update');
-
-        if (tip?.hash !== expectedTipHash) {
-          throw new TailConflictError(`Tail tip changed from ${expectedTipHash} to ${tip?.hash}`);
-        }
-
-        await tx.delete(schema.tailTransfers).where(and(
-          eq(schema.tailTransfers.network, network), gt(schema.tailTransfers.blockNumber, aboveNumber),
-        ));
-        await tx.delete(schema.tailBlocks).where(and(
-          eq(schema.tailBlocks.network, network), gt(schema.tailBlocks.number, aboveNumber),
-        ));
+        await fenceTip(tx, n, expectedTipHash);
+        await tx.delete(tailRaw).where(and(eq(tailRaw.network, n), gt(tailRaw.blockNumber, aboveNumber)));
+        await tx.delete(tailHeaders).where(and(eq(tailHeaders.network, n), gt(tailHeaders.number, aboveNumber)));
       });
     },
 
     async wipeTail(network, expectedTipHash) {
+      const n = id(network);
       await db.transaction(async (tx) => {
-        const tip = await getTailTip(tx, network, 'update');
-
-        if (expectedTipHash !== undefined && tip?.hash !== expectedTipHash) {
-          throw new TailConflictError(`Tail tip changed from ${expectedTipHash} to ${tip?.hash}`);
-        }
-
-        await wipeTail(tx, network);
+        await fenceTip(tx, n, expectedTipHash);
+        await wipeTail(tx, n);
       });
-    },
-
-    getProgress: (network, account) => getProgress(db, network, account),
-
-    async applyScanChunk(network, account, range, chunk) {
-      await db.transaction(async (tx) => {
-        const target = await getTarget(tx, network, account);
-
-        if (target !== undefined && range.toBlock > target) {
-          throw new Error(`Chunk ${range.fromBlock}-${range.toBlock} is beyond backfill target ${target}`);
-        }
-
-        const claimed = await tx.insert(schema.accountScanProgress).values({
-          network,
-          account,
-          progressTo: range.toBlock,
-        }).onConflictDoUpdate({
-          target: [schema.accountScanProgress.network, schema.accountScanProgress.account],
-          set: { progressTo: range.toBlock },
-          setWhere: lt(schema.accountScanProgress.progressTo, range.fromBlock),
-        }).returning({ progressTo: schema.accountScanProgress.progressTo });
-
-        if (claimed.length === 0) {
-          const appliedTo = await getProgress(tx, network, account) ?? -1n;
-
-          if (range.toBlock <= appliedTo) return;
-          throw new Error(`Chunk ${range.fromBlock}-${range.toBlock} overlaps applied progress ${appliedTo}`);
-        }
-
-        await upsertAggregates(tx, network, [[account, chunk]]);
-      });
-    },
-
-    async getLogsRange(network, account) {
-      const [row] = await db.select({ logsRange: schema.accountScanRange.logsRange })
-        .from(schema.accountScanRange).where(and(
-          eq(schema.accountScanRange.network, network),
-          eq(schema.accountScanRange.account, account),
-        )).limit(1);
-
-      return row?.logsRange;
-    },
-
-    async setLogsRange(network, account, range) {
-      await db.insert(schema.accountScanRange).values({ network, account, logsRange: range }).onConflictDoUpdate({
-        target: [schema.accountScanRange.network, schema.accountScanRange.account],
-        set: { logsRange: range },
-      });
-    },
-
-    async readAccount(network, account) {
-      return db.transaction(async (tx): Promise<AccountView | undefined> => {
-        const cursor = await getFollowerCursor(tx, network);
-
-        if (!cursor) return undefined;
-
-        const rows = await tx.select({
-          standard: schema.tailTransfers.standard,
-          token: schema.tailTransfers.token,
-          from: schema.tailTransfers.from,
-          to: schema.tailTransfers.to,
-          value: schema.tailTransfers.value,
-          blockNumber: schema.tailTransfers.blockNumber,
-          blockHash: schema.tailTransfers.blockHash,
-          logIndex: schema.tailTransfers.logIndex,
-          transactionHash: schema.tailTransfers.txHash,
-        }).from(schema.tailTransfers).where(and(
-          eq(schema.tailTransfers.network, network),
-          gt(schema.tailTransfers.blockNumber, cursor.number),
-          or(eq(schema.tailTransfers.from, account), eq(schema.tailTransfers.to, account)),
-        )).orderBy(asc(schema.tailTransfers.blockNumber), asc(schema.tailTransfers.logIndex));
-
-        const tailTransfers: TransferEvent[] = rows.map((row) => ({ ...row, value: BigInt(row.value) }));
-
-        return {
-          cursor,
-          holdings: await holdings(tx, network, account),
-          nftItems: await nftItems(tx, network, account),
-          tailTransfers,
-          tailTip: await getTailTip(tx, network),
-        };
-      }, { isolationLevel: 'repeatable read', accessMode: 'read only' });
-    },
-
-    holdings: (network, account) => holdings(db, network, account),
-    nftItems: (network, account) => nftItems(db, network, account),
-
-    async erc20Pairs(network, accounts) {
-      return (await erc20RefreshState(network, accounts)).map(({ account, token }) => ({ account, token }));
-    },
-
-    erc20RefreshState,
-
-    async saveBalances(network, block, rows, opts) {
-      await inBatches(rows, (batch) => db.insert(schema.balanceSnapshots).values(batch.map((row) => ({
-        network,
-        account: row.account,
-        token: row.token,
-        balance: row.result.status === 'ok' ? row.result.balance.toString() : null,
-        error: row.result.status === 'error' ? row.result.error : null,
-        blockNumber: block.number,
-        blockHash: block.hash,
-      }))).onConflictDoUpdate({
-        target: [schema.balanceSnapshots.network, schema.balanceSnapshots.account, schema.balanceSnapshots.token],
-        set: {
-          balance: sql`excluded.balance`,
-          error: sql`excluded.error`,
-          blockNumber: sql`excluded.block_number`,
-          blockHash: sql`excluded.block_hash`,
-        },
-        // replaceNewer (only the reorg-kicked refresh at the canonical tip) overwrites unconditionally, so snapshots of
-        // orphaned blocks, newer or at the same height, are replaced. Otherwise a snapshot only moves to a later block,
-        // or is re-read at the same block: a same-height read of another (orphaned) hash never replaces it.
-        ...(!opts?.replaceNewer && {
-          setWhere: sql`excluded.block_number > ${schema.balanceSnapshots.blockNumber}
-            OR (excluded.block_number = ${schema.balanceSnapshots.blockNumber}
-              AND excluded.block_hash = ${schema.balanceSnapshots.blockHash})`,
-        }),
-      }));
-    },
-
-    async balances(network, account) {
-      const rows = await db.select({
-        token: schema.balanceSnapshots.token,
-        balance: schema.balanceSnapshots.balance,
-        error: schema.balanceSnapshots.error,
-        blockNumber: schema.balanceSnapshots.blockNumber,
-        blockHash: schema.balanceSnapshots.blockHash,
-      }).from(schema.balanceSnapshots).where(and(
-        eq(schema.balanceSnapshots.network, network),
-        eq(schema.balanceSnapshots.account, account),
-      ));
-
-      return rows.map((row) => ({
-        token: row.token,
-        result: row.balance !== null
-          ? { status: 'ok' as const, balance: BigInt(row.balance) }
-          : { status: 'error' as const, error: row.error ?? 'unknown error' },
-        blockNumber: row.blockNumber,
-        blockHash: row.blockHash,
-      }));
     },
 
     close,

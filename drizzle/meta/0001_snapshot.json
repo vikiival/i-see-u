@@ -1,163 +1,34 @@
 {
-  "id": "c40cf76c-ba83-498f-a387-399f241625c4",
-  "prevId": "19e00ff5-8fe5-4d56-a3f9-8dd078357276",
+  "id": "789909ac-be15-4fe6-b2ba-128b3bf9e229",
+  "prevId": "bcd1f085-3455-48a9-9644-7d603baaac26",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
-    "public.account_cursor": {
-      "name": "account_cursor",
-      "schema": "",
-      "columns": {
-        "network": {
-          "name": "network",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "account": {
-          "name": "account",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "scanned_to": {
-          "name": "scanned_to",
-          "type": "bigint",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "scanned_to_hash": {
-          "name": "scanned_to_hash",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "scanned_to_timestamp": {
-          "name": "scanned_to_timestamp",
-          "type": "bigint",
-          "primaryKey": false,
-          "notNull": true
-        }
-      },
-      "indexes": {},
-      "foreignKeys": {},
-      "compositePrimaryKeys": {
-        "account_cursor_network_account_pk": {
-          "name": "account_cursor_network_account_pk",
-          "columns": [
-            "network",
-            "account"
-          ]
-        }
-      },
-      "uniqueConstraints": {},
-      "policies": {},
-      "checkConstraints": {},
-      "isRLSEnabled": false
-    },
-    "public.account_scan_progress": {
-      "name": "account_scan_progress",
-      "schema": "",
-      "columns": {
-        "network": {
-          "name": "network",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "account": {
-          "name": "account",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "progress_to": {
-          "name": "progress_to",
-          "type": "bigint",
-          "primaryKey": false,
-          "notNull": true
-        }
-      },
-      "indexes": {},
-      "foreignKeys": {},
-      "compositePrimaryKeys": {
-        "account_scan_progress_network_account_pk": {
-          "name": "account_scan_progress_network_account_pk",
-          "columns": [
-            "network",
-            "account"
-          ]
-        }
-      },
-      "uniqueConstraints": {},
-      "policies": {},
-      "checkConstraints": {},
-      "isRLSEnabled": false
-    },
-    "public.account_scan_range": {
-      "name": "account_scan_range",
-      "schema": "",
-      "columns": {
-        "network": {
-          "name": "network",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "account": {
-          "name": "account",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "logs_range": {
-          "name": "logs_range",
-          "type": "bigint",
-          "primaryKey": false,
-          "notNull": true
-        }
-      },
-      "indexes": {},
-      "foreignKeys": {},
-      "compositePrimaryKeys": {
-        "account_scan_range_network_account_pk": {
-          "name": "account_scan_range_network_account_pk",
-          "columns": [
-            "network",
-            "account"
-          ]
-        }
-      },
-      "uniqueConstraints": {},
-      "policies": {},
-      "checkConstraints": {},
-      "isRLSEnabled": false
-    },
     "public.balance_snapshots": {
       "name": "balance_snapshots",
       "schema": "",
       "columns": {
         "network": {
           "name": "network",
-          "type": "text",
+          "type": "smallint",
           "primaryKey": false,
           "notNull": true
         },
         "account": {
           "name": "account",
-          "type": "text",
+          "type": "bytea",
           "primaryKey": false,
           "notNull": true
         },
         "token": {
           "name": "token",
-          "type": "text",
+          "type": "bytea",
           "primaryKey": false,
           "notNull": true
         },
         "balance": {
           "name": "balance",
-          "type": "text",
+          "type": "numeric(78,0)",
           "primaryKey": false,
           "notNull": false
         },
@@ -175,12 +46,47 @@
         },
         "block_hash": {
           "name": "block_hash",
-          "type": "text",
+          "type": "bytea",
           "primaryKey": false,
           "notNull": true
+        },
+        "read_at": {
+          "name": "read_at",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "revision": {
+          "name": "revision",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "0"
         }
       },
-      "indexes": {},
+      "indexes": {
+        "balance_blocks": {
+          "name": "balance_blocks",
+          "columns": [
+            {
+              "expression": "network",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "block_number",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
       "foreignKeys": {},
       "compositePrimaryKeys": {
         "balance_snapshots_network_account_token_pk": {
@@ -194,39 +100,52 @@
       },
       "uniqueConstraints": {},
       "policies": {},
-      "checkConstraints": {},
+      "checkConstraints": {
+        "balance_addresses": {
+          "name": "balance_addresses",
+          "value": "octet_length(\"balance_snapshots\".\"account\") = 20 AND octet_length(\"balance_snapshots\".\"token\") = 20 AND octet_length(\"balance_snapshots\".\"block_hash\") = 32"
+        },
+        "balance_result": {
+          "name": "balance_result",
+          "value": "(\"balance_snapshots\".\"balance\" IS NULL) <> (\"balance_snapshots\".\"error\" IS NULL)"
+        },
+        "balance_uint": {
+          "name": "balance_uint",
+          "value": "\"balance_snapshots\".\"balance\" >= 0 AND \"balance_snapshots\".\"balance\" <= 115792089237316195423570985008687907853269984665640564039457584007913129639935"
+        }
+      },
       "isRLSEnabled": false
     },
-    "public.follower_cursor": {
-      "name": "follower_cursor",
+    "public.block_headers": {
+      "name": "block_headers",
       "schema": "",
       "columns": {
         "network": {
           "name": "network",
-          "type": "text",
-          "primaryKey": true,
+          "type": "smallint",
+          "primaryKey": false,
           "notNull": true
         },
-        "block_number": {
-          "name": "block_number",
+        "number": {
+          "name": "number",
           "type": "bigint",
           "primaryKey": false,
           "notNull": true
         },
-        "block_hash": {
-          "name": "block_hash",
-          "type": "text",
+        "hash": {
+          "name": "hash",
+          "type": "bytea",
           "primaryKey": false,
           "notNull": true
         },
-        "block_timestamp": {
-          "name": "block_timestamp",
-          "type": "bigint",
+        "parent_hash": {
+          "name": "parent_hash",
+          "type": "bytea",
           "primaryKey": false,
           "notNull": true
         },
-        "updated_at": {
-          "name": "updated_at",
+        "timestamp": {
+          "name": "timestamp",
           "type": "bigint",
           "primaryKey": false,
           "notNull": true
@@ -234,10 +153,23 @@
       },
       "indexes": {},
       "foreignKeys": {},
-      "compositePrimaryKeys": {},
+      "compositePrimaryKeys": {
+        "block_headers_network_number_pk": {
+          "name": "block_headers_network_number_pk",
+          "columns": [
+            "network",
+            "number"
+          ]
+        }
+      },
       "uniqueConstraints": {},
       "policies": {},
-      "checkConstraints": {},
+      "checkConstraints": {
+        "header_hash_width": {
+          "name": "header_hash_width",
+          "value": "octet_length(\"block_headers\".\"hash\") = 32 AND octet_length(\"block_headers\".\"parent_hash\") = 32"
+        }
+      },
       "isRLSEnabled": false
     },
     "public.holdings": {
@@ -246,25 +178,25 @@
       "columns": {
         "network": {
           "name": "network",
-          "type": "text",
+          "type": "smallint",
           "primaryKey": false,
           "notNull": true
         },
         "holder": {
           "name": "holder",
-          "type": "text",
+          "type": "bytea",
           "primaryKey": false,
           "notNull": true
         },
         "token": {
           "name": "token",
-          "type": "text",
+          "type": "bytea",
           "primaryKey": false,
           "notNull": true
         },
         "standard": {
           "name": "standard",
-          "type": "text",
+          "type": "smallint",
           "primaryKey": false,
           "notNull": true
         },
@@ -282,18 +214,46 @@
         },
         "sent_count": {
           "name": "sent_count",
-          "type": "integer",
+          "type": "bigint",
           "primaryKey": false,
           "notNull": true
         },
         "received_count": {
           "name": "received_count",
-          "type": "integer",
+          "type": "bigint",
           "primaryKey": false,
           "notNull": true
         }
       },
-      "indexes": {},
+      "indexes": {
+        "holdings_token_holders": {
+          "name": "holdings_token_holders",
+          "columns": [
+            {
+              "expression": "network",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "token",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "holder",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
       "foreignKeys": {},
       "compositePrimaryKeys": {
         "holdings_network_holder_token_pk": {
@@ -307,40 +267,136 @@
       },
       "uniqueConstraints": {},
       "policies": {},
-      "checkConstraints": {},
+      "checkConstraints": {
+        "holding_addresses": {
+          "name": "holding_addresses",
+          "value": "octet_length(\"holdings\".\"holder\") = 20 AND octet_length(\"holdings\".\"token\") = 20"
+        },
+        "holding_counts": {
+          "name": "holding_counts",
+          "value": "\"holdings\".\"sent_count\" >= 0 AND \"holdings\".\"received_count\" >= 0 AND \"holdings\".\"first_block\" <= \"holdings\".\"last_block\""
+        },
+        "holding_standard": {
+          "name": "holding_standard",
+          "value": "\"holdings\".\"standard\" IN (20, 721)"
+        }
+      },
       "isRLSEnabled": false
     },
-    "public.nft_items": {
-      "name": "nft_items",
+    "public.ingestion_state": {
+      "name": "ingestion_state",
       "schema": "",
       "columns": {
         "network": {
           "name": "network",
-          "type": "text",
+          "type": "smallint",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "start_block": {
+          "name": "start_block",
+          "type": "bigint",
           "primaryKey": false,
           "notNull": true
         },
-        "holder": {
-          "name": "holder",
-          "type": "text",
+        "block_number": {
+          "name": "block_number",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "block_hash": {
+          "name": "block_hash",
+          "type": "bytea",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "block_timestamp": {
+          "name": "block_timestamp",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "revision": {
+          "name": "revision",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "0"
+        },
+        "head_number": {
+          "name": "head_number",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "head_hash": {
+          "name": "head_hash",
+          "type": "bytea",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "head_timestamp": {
+          "name": "head_timestamp",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "checked_at": {
+          "name": "checked_at",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "state_hash_width": {
+          "name": "state_hash_width",
+          "value": "octet_length(\"ingestion_state\".\"block_hash\") = 32 AND (\"ingestion_state\".\"head_hash\" IS NULL OR octet_length(\"ingestion_state\".\"head_hash\") = 32)"
+        },
+        "state_progress": {
+          "name": "state_progress",
+          "value": "\"ingestion_state\".\"start_block\" >= 0 AND \"ingestion_state\".\"block_number\" >= \"ingestion_state\".\"start_block\" - 1 AND \"ingestion_state\".\"revision\" >= 0"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.nft_ownership": {
+      "name": "nft_ownership",
+      "schema": "",
+      "columns": {
+        "network": {
+          "name": "network",
+          "type": "smallint",
           "primaryKey": false,
           "notNull": true
         },
         "token": {
           "name": "token",
-          "type": "text",
+          "type": "bytea",
           "primaryKey": false,
           "notNull": true
         },
         "token_id": {
           "name": "token_id",
-          "type": "text",
+          "type": "numeric(78,0)",
           "primaryKey": false,
           "notNull": true
         },
-        "held": {
-          "name": "held",
-          "type": "boolean",
+        "owner": {
+          "name": "owner",
+          "type": "bytea",
           "primaryKey": false,
           "notNull": true
         },
@@ -357,14 +413,47 @@
           "notNull": true
         }
       },
-      "indexes": {},
+      "indexes": {
+        "nft_owner_items": {
+          "name": "nft_owner_items",
+          "columns": [
+            {
+              "expression": "network",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "owner",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "token",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "token_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
       "foreignKeys": {},
       "compositePrimaryKeys": {
-        "nft_items_network_holder_token_token_id_pk": {
-          "name": "nft_items_network_holder_token_token_id_pk",
+        "nft_ownership_network_token_token_id_pk": {
+          "name": "nft_ownership_network_token_token_id_pk",
           "columns": [
             "network",
-            "holder",
             "token",
             "token_id"
           ]
@@ -372,33 +461,48 @@
       },
       "uniqueConstraints": {},
       "policies": {},
-      "checkConstraints": {},
+      "checkConstraints": {
+        "nft_addresses": {
+          "name": "nft_addresses",
+          "value": "octet_length(\"nft_ownership\".\"owner\") = 20 AND octet_length(\"nft_ownership\".\"token\") = 20"
+        },
+        "nft_id": {
+          "name": "nft_id",
+          "value": "\"nft_ownership\".\"token_id\" >= 0 AND \"nft_ownership\".\"token_id\" <= 115792089237316195423570985008687907853269984665640564039457584007913129639935"
+        }
+      },
       "isRLSEnabled": false
     },
-    "public.tracked_accounts": {
-      "name": "tracked_accounts",
+    "public.repair_queue": {
+      "name": "repair_queue",
       "schema": "",
       "columns": {
         "network": {
           "name": "network",
-          "type": "text",
+          "type": "smallint",
           "primaryKey": false,
           "notNull": true
         },
-        "account": {
-          "name": "account",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "backfill_target": {
-          "name": "backfill_target",
+        "from_block": {
+          "name": "from_block",
           "type": "bigint",
           "primaryKey": false,
           "notNull": true
         },
-        "tracked_at": {
-          "name": "tracked_at",
+        "to_block": {
+          "name": "to_block",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "reason": {
+          "name": "reason",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
           "type": "bigint",
           "primaryKey": false,
           "notNull": true
@@ -407,17 +511,229 @@
       "indexes": {},
       "foreignKeys": {},
       "compositePrimaryKeys": {
-        "tracked_accounts_network_account_pk": {
-          "name": "tracked_accounts_network_account_pk",
+        "repair_queue_network_from_block_to_block_pk": {
+          "name": "repair_queue_network_from_block_to_block_pk",
           "columns": [
             "network",
-            "account"
+            "from_block",
+            "to_block"
           ]
         }
       },
       "uniqueConstraints": {},
       "policies": {},
-      "checkConstraints": {},
+      "checkConstraints": {
+        "repair_range": {
+          "name": "repair_range",
+          "value": "\"repair_queue\".\"from_block\" >= 0 AND \"repair_queue\".\"to_block\" >= \"repair_queue\".\"from_block\""
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.transfers": {
+      "name": "transfers",
+      "schema": "",
+      "columns": {
+        "network": {
+          "name": "network",
+          "type": "smallint",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "block_number": {
+          "name": "block_number",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "log_index": {
+          "name": "log_index",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "block_hash": {
+          "name": "block_hash",
+          "type": "bytea",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "transaction_hash": {
+          "name": "transaction_hash",
+          "type": "bytea",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "token": {
+          "name": "token",
+          "type": "bytea",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "standard": {
+          "name": "standard",
+          "type": "smallint",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "from": {
+          "name": "from",
+          "type": "bytea",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "to": {
+          "name": "to",
+          "type": "bytea",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "value": {
+          "name": "value",
+          "type": "numeric(78,0)",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {
+        "transfers_from_history": {
+          "name": "transfers_from_history",
+          "columns": [
+            {
+              "expression": "network",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "from",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "block_number",
+              "isExpression": false,
+              "asc": false,
+              "nulls": "last"
+            },
+            {
+              "expression": "log_index",
+              "isExpression": false,
+              "asc": false,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "transfers_to_history": {
+          "name": "transfers_to_history",
+          "columns": [
+            {
+              "expression": "network",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "to",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "block_number",
+              "isExpression": false,
+              "asc": false,
+              "nulls": "last"
+            },
+            {
+              "expression": "log_index",
+              "isExpression": false,
+              "asc": false,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "transfers_nft_history": {
+          "name": "transfers_nft_history",
+          "columns": [
+            {
+              "expression": "network",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "token",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "value",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "block_number",
+              "isExpression": false,
+              "asc": false,
+              "nulls": "last"
+            },
+            {
+              "expression": "log_index",
+              "isExpression": false,
+              "asc": false,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"transfers\".\"standard\" = 721",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {
+        "transfers_network_block_number_log_index_pk": {
+          "name": "transfers_network_block_number_log_index_pk",
+          "columns": [
+            "network",
+            "block_number",
+            "log_index"
+          ]
+        }
+      },
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "transfer_addresses": {
+          "name": "transfer_addresses",
+          "value": "octet_length(\"transfers\".\"token\") = 20 AND octet_length(\"transfers\".\"from\") = 20 AND octet_length(\"transfers\".\"to\") = 20"
+        },
+        "transfer_hashes": {
+          "name": "transfer_hashes",
+          "value": "octet_length(\"transfers\".\"block_hash\") = 32 AND octet_length(\"transfers\".\"transaction_hash\") = 32"
+        },
+        "transfer_quantities": {
+          "name": "transfer_quantities",
+          "value": "\"transfers\".\"block_number\" >= 0 AND \"transfers\".\"log_index\" >= 0 AND \"transfers\".\"value\" >= 0 AND \"transfers\".\"value\" <= 115792089237316195423570985008687907853269984665640564039457584007913129639935"
+        },
+        "transfer_standard": {
+          "name": "transfer_standard",
+          "value": "\"transfers\".\"standard\" IN (20, 721)"
+        }
+      },
       "isRLSEnabled": false
     }
   },

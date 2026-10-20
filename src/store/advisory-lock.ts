@@ -41,7 +41,10 @@ export function pgLeaderLock(pool: Pool, key: bigint): LeaderLock {
   let client: PoolClient | undefined;
 
   const drop = (c: PoolClient): void => {
-    if (client !== c) return;
+    if (client !== c) {
+      return;
+    }
+
     client = undefined;
     c.release(true); // destroy: the session (and with it the lock) is gone
   };
@@ -65,7 +68,9 @@ export function pgLeaderLock(pool: Pool, key: bigint): LeaderLock {
       const c = await pool.connect();
 
       try {
-        const { rows } = await c.query<{ acquired: boolean }>('SELECT pg_try_advisory_lock($1) AS acquired', [key.toString()]);
+        const { rows } = await c.query<{ acquired: boolean }>('SELECT pg_try_advisory_lock($1) AS acquired', [
+          key.toString(),
+        ]);
 
         if (!rows[0]?.acquired) {
           c.release();
@@ -86,7 +91,10 @@ export function pgLeaderLock(pool: Pool, key: bigint): LeaderLock {
     async release() {
       const c = client;
 
-      if (!c) return;
+      if (!c) {
+        return;
+      }
+
       client = undefined;
 
       try {
@@ -119,7 +127,10 @@ export function singleConnectionLeaderLock(db: StoreDatabase, key: bigint): Lead
     },
     held: () => held,
     async release() {
-      if (held) await query(sql`SELECT pg_advisory_unlock(${key}) AS ok`);
+      if (held) {
+        await query(sql`SELECT pg_advisory_unlock(${key}) AS ok`);
+      }
+
       held = false;
     },
   };

@@ -18,6 +18,7 @@ interface Endpoint {
   displayUrl: string;
   failures: number;
   openUntil: number;
+  penalizedUntil: number;
   probeInFlight: boolean;
   unsupportedUntil: Map<string, number>;
 }
@@ -32,15 +33,41 @@ const RETRY_AFTER_CAP_MS = 10_000;
 // Hands each attempt the raw Response (status, Retry-After) that viem's errors do not always carry.
 const attemptResponse = new AsyncLocalStorage<(response: Response) => void>();
 
-const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
+/** Rejects with signal.reason as soon as the signal aborts. */
+const sleep = (ms: number, signal?: AbortSignal): Promise<void> =>
+  new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason);
+
+      return;
+    }
+
+    const abort = (): void => {
+      clearTimeout(timer);
+      reject(signal?.reason);
+    };
+
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', abort);
+      resolve();
+    }, ms);
+
+    signal?.addEventListener('abort', abort, { once: true });
+  });
 
 const redactedUrl = (url: URL): string => `${url.origin}/***`;
 
 const retryAfterMs = (value: string | null | undefined): number => {
-  if (!value) return 0;
+  if (!value) {
+    return 0;
+  }
+
   const seconds = Number(value);
 
-  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1_000;
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return seconds * 1_000;
+  }
+
   const at = Date.parse(value);
 
   return Number.isNaN(at) ? 0 : Math.max(0, at - Date.now());
@@ -51,11 +78,17 @@ const retryAfterMs = (value: string | null | undefined): number => {
 const networkMessage = (error: unknown): string => {
   const seen = new Set<object>();
 
-  for (let current = error; isObject(current) && !seen.has(current); current = 'cause' in current ? current.cause : undefined) {
+  for (
+    let current = error;
+    isObject(current) && !seen.has(current);
+    current = 'cause' in current ? current.cause : undefined
+  ) {
     seen.add(current);
     const code = 'code' in current ? current.code : undefined;
 
-    if (isString(code)) return `RPC network error: ${code}`;
+    if (isString(code)) {
+      return `RPC network error: ${code}`;
+    }
   }
 
   return 'RPC network error: fetch failed';
@@ -69,14 +102,17 @@ const networkMessage = (error: unknown): string => {
  * - HttpRequestError with .status: non-2xx without a JSON-RPC error body; .headers, .details (body or statusText).
  * - HttpRequestError without .status: fetch/body-read failure (.cause chain carries e.g. ECONNRESET) or, on a 2xx,
  *   an unparsable body (SyntaxError cause).
- * - TimeoutError: per-transport timeout; AbortError never occurs since we pass no signal.
+ * - TimeoutError: per-transport timeout. The caller's signal is passed per request (viem merges it with its timeout
+ *   signal); request() checks signal.aborted before classifying, so an AbortError never reaches failureOf.
  * viem's messages embed the full endpoint URL (key in path), so only .details/.code/.status are ever surfaced.
  */
 const timeoutMessage = /timed? ?out|timeout/i;
 
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- boundary parser: maps whatever the transport threw into an RpcError
 const failureOf = (error: unknown, response: Response | undefined): RpcError => {
-  if (error instanceof RpcError) return error;
+  if (error instanceof RpcError) {
+    return error;
+  }
 
   if (error instanceof RpcRequestError) {
     const rpc = { code: error.code, message: error.details };
@@ -87,7 +123,10 @@ const failureOf = (error: unknown, response: Response | undefined): RpcError => 
   }
 
   if (error instanceof TimeoutError) {
-    return new RpcError('transient', 'RPC request timed out', { cause: { name: error.name, details: error.details }, timeout: true });
+    return new RpcError('transient', 'RPC request timed out', {
+      cause: { name: error.name, details: error.details },
+      timeout: true,
+    });
   }
 
   if (error instanceof HttpRequestError) {
@@ -95,7 +134,10 @@ const failureOf = (error: unknown, response: Response | undefined): RpcError => 
     const cause = { name: error.name, status, details: error.details, cause: error.cause };
 
     if (error.status !== undefined) {
-      return new RpcError(classify(status, error.details), `HTTP ${status}`, { cause, timeout: status === 408 || status === 504 });
+      return new RpcError(classify(status, error.details), `HTTP ${status}`, {
+        cause,
+        timeout: status === 408 || status === 504,
+      });
     }
 
     if (response?.ok && error.cause instanceof SyntaxError) {
@@ -113,9 +155,11 @@ const failureOf = (error: unknown, response: Response | undefined): RpcError => 
 };
 
 export function createRpcClient(options: RpcClientOptions): RpcClient {
-  if (options.urls.length === 0) throw new Error('At least one RPC URL is required');
+  if (options.urls.length === 0) {
+    throw new Error('At least one RPC URL is required');
+  }
 
-  const endpoints: Endpoint[] = options.urls.map(value => {
+  const endpoints: Endpoint[] = options.urls.map((value) => {
     const url = new URL(value);
 
     return {
@@ -126,11 +170,12 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
         retryCount: 0,
         timeout: options.timeoutMs,
         maxResponseBodySize: false,
-        onFetchResponse: response => attemptResponse.getStore()?.(response),
+        onFetchResponse: (response) => attemptResponse.getStore()?.(response),
       })({ retryCount: 0 }).config.request,
       displayUrl: redactedUrl(url),
       failures: 0,
       openUntil: 0,
+      penalizedUntil: 0,
       probeInFlight: false,
       unsupportedUntil: new Map(),
     };
@@ -144,13 +189,16 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
   };
 
   const bucketCapacity = Math.max(1, options.maxRps);
+  const outcomes = new Map<string, { endpoint: string; method: string; outcome: string; count: number }>();
+  let retries = 0;
+  let rateLimited = 0;
   let tokens = bucketCapacity;
   let refilledAt = performance.now();
 
-  const takeToken = async (): Promise<void> => {
+  const takeToken = async (signal?: AbortSignal): Promise<void> => {
     while (true) {
       const now = performance.now();
-      tokens = Math.min(bucketCapacity, tokens + (now - refilledAt) * options.maxRps / 1_000);
+      tokens = Math.min(bucketCapacity, tokens + ((now - refilledAt) * options.maxRps) / 1_000);
       refilledAt = now;
 
       if (tokens >= 1) {
@@ -159,12 +207,14 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
         return;
       }
 
-      await sleep(Math.max(1, Math.ceil((1 - tokens) * 1_000 / options.maxRps)));
+      await sleep(Math.max(1, Math.ceil(((1 - tokens) * 1_000) / options.maxRps)), signal);
     }
   };
 
   const stateOf = (endpoint: Endpoint, now = Date.now()): 'closed' | 'open' | 'half-open' => {
-    if (endpoint.openUntil === 0) return 'closed';
+    if (endpoint.openUntil === 0) {
+      return 'closed';
+    }
 
     return now < endpoint.openUntil ? 'open' : 'half-open';
   };
@@ -176,14 +226,23 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
       const endpoint = endpoints[(offset + step) % endpoints.length];
       const unsupportedUntil = endpoint.unsupportedUntil.get(method) ?? 0;
 
-      if (unsupportedUntil > now) continue;
+      if (unsupportedUntil > now) {
+        continue;
+      }
 
-      if (unsupportedUntil !== 0) endpoint.unsupportedUntil.delete(method);
+      if (unsupportedUntil !== 0) {
+        endpoint.unsupportedUntil.delete(method);
+      }
+
       const state = stateOf(endpoint, now);
 
-      if (state === 'open' || (state === 'half-open' && endpoint.probeInFlight)) continue;
+      if (state === 'open' || (state === 'half-open' && endpoint.probeInFlight)) {
+        continue;
+      }
 
-      if (state === 'half-open') endpoint.probeInFlight = true;
+      if (state === 'half-open') {
+        endpoint.probeInFlight = true;
+      }
 
       return endpoint;
     }
@@ -204,23 +263,34 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
     endpoint.failures += 1;
     endpoint.probeInFlight = false;
 
-    if (endpoint.failures >= BREAKER_FAILURES) endpoint.openUntil = Date.now() + OPEN_MS;
+    if (endpoint.failures >= BREAKER_FAILURES) {
+      endpoint.openUntil = Date.now() + OPEN_MS;
+    }
   };
 
   const recordSuccess = (endpoint: Endpoint): void => {
+    endpoint.probeInFlight = false;
+
+    // A response already in flight (e.g. finalized alongside latest) cannot undo a watchdog penalty.
+    if (endpoint.penalizedUntil > Date.now()) {
+      return;
+    }
+
+    endpoint.penalizedUntil = 0;
     endpoint.failures = 0;
     endpoint.openUntil = 0;
-    endpoint.probeInFlight = false;
   };
 
   const request = async <T>(method: string, params: unknown[], requestOptions: RpcRequestOptions = {}): Promise<T> => {
     counters.requests += 1;
     const { maxAttempts } = options;
+    const { signal } = requestOptions;
 
     let lastError: RpcError | undefined;
     let endpointOffset = 0;
 
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      signal?.throwIfAborted();
       const endpoint = chooseEndpoint(method, endpointOffset);
 
       if (!endpoint) {
@@ -228,39 +298,107 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
       }
 
       endpointOffset = (endpoints.indexOf(endpoint) + 1) % endpoints.length;
-      await takeToken();
-      counters.attempts += 1;
-      counters.byMethod[method] = (counters.byMethod[method] ?? 0) + 1;
-
       let response: Response | undefined;
-      const startedAt = performance.now();
+      let startedAt = 0;
 
       const report = (ok: boolean): void => {
-        if (!requestOptions.onAttempt) return;
-        const length = response && !response.headers.get('content-encoding') ? Number(response.headers.get('content-length') ?? NaN) : NaN;
-        requestOptions.onAttempt({ ok, durationMs: performance.now() - startedAt, bytes: Number.isFinite(length) ? length : undefined });
+        if (!requestOptions.onAttempt) {
+          return;
+        }
+
+        const length =
+          response && !response.headers.get('content-encoding')
+            ? Number(response.headers.get('content-length') ?? NaN)
+            : NaN;
+
+        requestOptions.onAttempt({
+          ok,
+          durationMs: performance.now() - startedAt,
+          bytes: Number.isFinite(length) ? length : undefined,
+        });
+      };
+
+      const countOutcome = (outcome: string): void => {
+        const key = `${endpoints.indexOf(endpoint)}:${method}:${outcome}`;
+
+        const row = outcomes.get(key) ?? {
+          endpoint: `${endpoints.indexOf(endpoint)}:${endpoint.displayUrl}`,
+          method,
+          outcome,
+          count: 0,
+        };
+
+        row.count += 1;
+        outcomes.set(key, row);
       };
 
       try {
+        await takeToken(signal);
+        counters.attempts += 1;
+
+        if (attempt > 0) {
+          retries += 1;
+        }
+
+        counters.byMethod[method] = (counters.byMethod[method] ?? 0) + 1;
+        startedAt = performance.now();
+
         const result = await attemptResponse.run(
-          value => { response = value; },
-          () => endpoint.send({ method, params }),
+          (value) => {
+            response = value;
+          },
+          () => endpoint.send({ method, params }, { signal }),
         );
 
-        if (result === undefined) throw new RpcError('fatal', 'Malformed JSON-RPC response');
+        if (result === undefined) {
+          throw new RpcError('fatal', 'Malformed JSON-RPC response');
+        }
 
         if (requestOptions.validate && !requestOptions.validate(result)) {
           throw new RpcError('transient', 'RPC endpoint returned an invalid result');
         }
 
         recordSuccess(endpoint);
+        countOutcome('success');
+        requestOptions.onEndpoint?.(() => {
+          const now = Date.now();
+
+          const canFailOver = endpoints.some(
+            (other) =>
+              other !== endpoint &&
+              (other.unsupportedUntil.get(method) ?? 0) <= now &&
+              stateOf(other, now) !== 'open' &&
+              !(stateOf(other, now) === 'half-open' && other.probeInFlight),
+          );
+
+          if (endpoint.penalizedUntil > now || !canFailOver) {
+            return;
+          }
+
+          endpoint.failures = Math.max(endpoint.failures, BREAKER_FAILURES);
+          endpoint.openUntil = now + OPEN_MS;
+          endpoint.penalizedUntil = endpoint.openUntil;
+          endpoint.probeInFlight = false;
+        });
         report(true);
 
         // SAFETY: T is the caller's declared result type for `method`: the transport returns the JSON-RPC `result`
         // parsed from the response body, checked by the caller's `validate` above where the shape is not guaranteed.
         return result as T;
       } catch (cause) {
+        if (signal?.aborted) {
+          // The caller gave up: not an endpoint failure, and not worth another attempt.
+          endpoint.probeInFlight = false;
+          throw signal.reason;
+        }
+
         const error = failureOf(cause, response);
+        countOutcome(error.kind);
+
+        if (response?.status === 429) {
+          rateLimited += 1;
+        }
+
         lastError = error;
         report(false);
 
@@ -284,7 +422,10 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
           const cap = Math.min(BACKOFF_CAP_MS, BACKOFF_BASE_MS * 2 ** attempt);
           const headers = response?.headers ?? (cause instanceof HttpRequestError ? cause.headers : undefined);
           // Honour Retry-After, but never hold an API request longer than RETRY_AFTER_CAP_MS per attempt.
-          await sleep(Math.max(Math.min(retryAfterMs(headers?.get('retry-after')), RETRY_AFTER_CAP_MS), Math.random() * cap));
+          await sleep(
+            Math.max(Math.min(retryAfterMs(headers?.get('retry-after')), RETRY_AFTER_CAP_MS), Math.random() * cap),
+            signal,
+          );
         }
       }
     }
@@ -299,7 +440,10 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
       attempts: counters.attempts,
       byMethod: { ...counters.byMethod },
       errors: { ...counters.errors },
-      endpoints: endpoints.map(endpoint => ({
+      outcomes: [...outcomes.values()].map((row) => ({ ...row })),
+      retries,
+      rateLimited,
+      endpoints: endpoints.map((endpoint) => ({
         url: endpoint.displayUrl,
         state: stateOf(endpoint),
         failures: endpoint.failures,

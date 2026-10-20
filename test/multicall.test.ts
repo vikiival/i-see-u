@@ -12,41 +12,49 @@ const aggregate3Abi = [
     type: 'function',
     name: 'aggregate3',
     stateMutability: 'payable',
-    inputs: [{
-      name: 'calls',
-      type: 'tuple[]',
-      components: [
-        { name: 'target', type: 'address' },
-        { name: 'allowFailure', type: 'bool' },
-        { name: 'callData', type: 'bytes' },
-      ],
-    }],
-    outputs: [{
-      name: 'returnData',
-      type: 'tuple[]',
-      components: [
-        { name: 'success', type: 'bool' },
-        { name: 'returnData', type: 'bytes' },
-      ],
-    }],
+    inputs: [
+      {
+        name: 'calls',
+        type: 'tuple[]',
+        components: [
+          { name: 'target', type: 'address' },
+          { name: 'allowFailure', type: 'bool' },
+          { name: 'callData', type: 'bytes' },
+        ],
+      },
+    ],
+    outputs: [
+      {
+        name: 'returnData',
+        type: 'tuple[]',
+        components: [
+          { name: 'success', type: 'bool' },
+          { name: 'returnData', type: 'bytes' },
+        ],
+      },
+    ],
   },
 ] as const;
 
-const balanceOfAbi = [{
-  type: 'function',
-  name: 'balanceOf',
-  stateMutability: 'view',
-  inputs: [{ name: 'account', type: 'address' }],
-  outputs: [{ name: 'balance', type: 'uint256' }],
-}] as const;
+const balanceOfAbi = [
+  {
+    type: 'function',
+    name: 'balanceOf',
+    stateMutability: 'view',
+    inputs: [{ name: 'account', type: 'address' }],
+    outputs: [{ name: 'balance', type: 'uint256' }],
+  },
+] as const;
 
-const ownerOfAbi = [{
-  type: 'function',
-  name: 'ownerOf',
-  stateMutability: 'view',
-  inputs: [{ name: 'tokenId', type: 'uint256' }],
-  outputs: [{ name: 'owner', type: 'address' }],
-}] as const;
+const ownerOfAbi = [
+  {
+    type: 'function',
+    name: 'ownerOf',
+    stateMutability: 'view',
+    inputs: [{ name: 'tokenId', type: 'uint256' }],
+    outputs: [{ name: 'owner', type: 'address' }],
+  },
+] as const;
 
 const address = (n: number): Address => `0x${n.toString(16).padStart(40, '0')}`;
 const blockHash = (number: bigint): Hex => `0x${number.toString(16).padStart(64, 'a')}`;
@@ -83,7 +91,9 @@ class ValidatingRpc implements RpcClient {
     for (const response of this.responses) {
       this.attempts += 1;
 
-      if (!opts?.validate || opts.validate(response)) return staged<T>(response);
+      if (!opts?.validate || opts.validate(response)) {
+        return staged<T>(response);
+      }
     }
 
     throw new RpcError('transient', 'RPC endpoint returned an invalid result');
@@ -119,7 +129,10 @@ test('ERC-20 calls round-trip through aggregate3 and are pinned to the requested
       abi: aggregate3Abi,
       functionName: 'aggregate3',
       result: [
-        { success: true, returnData: encodeFunctionResult({ abi: balanceOfAbi, functionName: 'balanceOf', result: 11n }) },
+        {
+          success: true,
+          returnData: encodeFunctionResult({ abi: balanceOfAbi, functionName: 'balanceOf', result: 11n }),
+        },
         { success: false, returnData: '0x' },
         { success: true, returnData: '0x12' },
       ],
@@ -152,16 +165,21 @@ test('out-of-gas failures recursively halve and preserve input order', async () 
     const calls = callsFrom(params);
     seenSizes.push(calls.length);
 
-    if (calls.length > 1) throw new RpcError('fatal', 'execution ran out of gas');
+    if (calls.length > 1) {
+      throw new RpcError('fatal', 'execution ran out of gas');
+    }
+
     const value = BigInt(tokens.indexOf(lowerAddress(calls[0].target)) + 100);
 
     return encodeFunctionResult({
       abi: aggregate3Abi,
       functionName: 'aggregate3',
-      result: [{
-        success: true,
-        returnData: encodeFunctionResult({ abi: balanceOfAbi, functionName: 'balanceOf', result: value }),
-      }],
+      result: [
+        {
+          success: true,
+          returnData: encodeFunctionResult({ abi: balanceOfAbi, functionName: 'balanceOf', result: value }),
+        },
+      ],
     });
   });
 
@@ -174,16 +192,19 @@ test('malformed outer aggregate result is rejected by RPC validation and retried
   const valid = encodeFunctionResult({
     abi: aggregate3Abi,
     functionName: 'aggregate3',
-    result: [{
-      success: true,
-      returnData: encodeFunctionResult({ abi: balanceOfAbi, functionName: 'balanceOf', result: 17n }),
-    }],
+    result: [
+      {
+        success: true,
+        returnData: encodeFunctionResult({ abi: balanceOfAbi, functionName: 'balanceOf', result: 17n }),
+      },
+    ],
   });
 
   const rpc = new ValidatingRpc(['0x12', valid]);
 
-  expect(await readErc20Balances(rpc, address(50), [address(10)], blockHash(77n), 4))
-    .toEqual([{ status: 'ok', balance: 17n }]);
+  expect(await readErc20Balances(rpc, address(50), [address(10)], blockHash(77n), 4)).toEqual([
+    { status: 'ok', balance: 17n },
+  ]);
   expect(rpc.attempts).toBe(2);
 });
 
@@ -193,7 +214,9 @@ test('one failed chunk preserves successful chunks and input order', async () =>
   const rpc = new FakeRpc((_method, params) => {
     const calls = callsFrom(params);
 
-    if (calls[0].target.toLowerCase() === tokens[2]) throw new RpcError('transient', 'upstream unavailable after retries');
+    if (calls[0].target.toLowerCase() === tokens[2]) {
+      throw new RpcError('transient', 'upstream unavailable after retries');
+    }
 
     return encodeFunctionResult({
       abi: aggregate3Abi,
@@ -227,13 +250,17 @@ test('all failed chunks reject with the first error', async () => {
 
   const tokens = [address(10), address(11), address(12), address(13)];
 
-  await expect(readErc20Balances(rpc, address(50), tokens, blockHash(77n), 2))
-    .rejects.toThrow(`failed ${tokens[0]}`);
+  await expect(readErc20Balances(rpc, address(50), tokens, blockHash(77n), 2)).rejects.toThrow(`failed ${tokens[0]}`);
 });
 
 test('ERC-721 ownerOf results decode and normalize owner addresses', async () => {
   const token = address(70);
-  const items = [{ token, tokenId: 5n }, { token, tokenId: 9n }];
+
+  const items = [
+    { token, tokenId: 5n },
+    { token, tokenId: 9n },
+  ];
+
   const owner = address(88);
 
   const rpc = new FakeRpc((_method, params) => {
@@ -251,6 +278,5 @@ test('ERC-721 ownerOf results decode and normalize owner addresses', async () =>
     });
   });
 
-  expect(await readErc721Owners(rpc, items, blockHash(500n), 100))
-    .toEqual(items.map(() => ({ status: 'ok', owner })));
+  expect(await readErc721Owners(rpc, items, blockHash(500n), 100)).toEqual(items.map(() => ({ status: 'ok', owner })));
 });
