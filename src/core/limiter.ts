@@ -42,15 +42,21 @@ export function createLimiter(maxActive: number, maxQueued: number, retryAfterS 
       // One clock read: a second one could see the deadline pass and hand AbortSignal.timeout a negative delay.
       const remainingMs = deadlineAt === undefined ? Infinity : deadlineAt - Date.now();
 
-      const cancelled = (when: string, cause?: unknown): Error => Object.assign(
-        unavailable(`Request ${expired() ? 'deadline passed' : 'cancelled'} ${when}`, retryAfterS),
-        { cause: cause ?? opts.signal?.reason },
-      );
+      const cancelled = (when: string, cause?: unknown): Error =>
+        Object.assign(unavailable(`Request ${expired() ? 'deadline passed' : 'cancelled'} ${when}`, retryAfterS), {
+          cause: cause ?? opts.signal?.reason,
+        });
 
-      if (opts.signal?.aborted || remainingMs <= 0) throw cancelled('before it ran');
+      if (opts.signal?.aborted || remainingMs <= 0) {
+        throw cancelled('before it ran');
+      }
+
       const signals = opts.signal ? [opts.signal] : [];
 
-      if (remainingMs !== Infinity) signals.push(AbortSignal.timeout(remainingMs));
+      if (remainingMs !== Infinity) {
+        signals.push(AbortSignal.timeout(remainingMs));
+      }
+
       const signal = AbortSignal.any(signals);
 
       if (active >= maxActive) {
@@ -86,9 +92,15 @@ export function createLimiter(maxActive: number, maxQueued: number, retryAfterS 
         release();
       }
     },
-    get active() { return active; },
-    get queued() { return queue.length; },
-    get rejections() { return rejections; },
+    get active() {
+      return active;
+    },
+    get queued() {
+      return queue.length;
+    },
+    get rejections() {
+      return rejections;
+    },
   };
 }
 
@@ -119,8 +131,11 @@ export function withDeadline<T, U>(
     controller.abort(new DOMException('Request deadline passed', 'TimeoutError'));
   }, ms);
 
-  if (parent?.aborted) cancel();
-  else parent?.addEventListener('abort', cancel, { once: true });
+  if (parent?.aborted) {
+    cancel();
+  } else {
+    parent?.addEventListener('abort', cancel, { once: true });
+  }
 
   // The executor turns a synchronous throw into a rejection, so the cleanup below always runs.
   const running = new Promise<T>((resolve) => resolve(work(signal)));

@@ -126,7 +126,11 @@ export interface ChainAdapter {
   /** All Transfer logs, verified against the supplied contiguous header chain. */
   transfersInRange(range: BlockRange, headers: BlockHeader[]): Promise<TransferEvent[]>;
   erc20BalancePairs(pairs: BalancePair[], blockHash: Hex, signal?: AbortSignal): Promise<BalanceResult[]>;
-  erc721Owners(items: { token: Address; tokenId: bigint }[], blockHash: Hex, signal?: AbortSignal): Promise<OwnerResult[]>;
+  erc721Owners(
+    items: { token: Address; tokenId: bigint }[],
+    blockHash: Hex,
+    signal?: AbortSignal,
+  ): Promise<OwnerResult[]>;
 }
 
 export interface BalancePair {
@@ -301,7 +305,14 @@ export interface OpsSnapshot {
   state?: IndexState;
   tipNumber?: bigint;
   tipTimestamp?: bigint;
-  bootstrap?: { status: string; startBlock: bigint; targetBlock: bigint; segmentsDone: number; segmentsApplied: number; segmentsTotal: number };
+  bootstrap?: {
+    status: string;
+    startBlock: bigint;
+    targetBlock: bigint;
+    segmentsDone: number;
+    segmentsApplied: number;
+    segmentsTotal: number;
+  };
 }
 
 export interface Store {
@@ -312,25 +323,47 @@ export interface Store {
   indexSnapshot(network: string): Promise<IndexSnapshot | undefined>;
   observeHead(network: string, head: BlockRef, at: number): Promise<void>;
   /** Bulk append for bootstrap and follower. Complete headers include empty blocks. Atomic cursor + raw + derived. */
-  appendRange(network: string, range: BlockRange, headers: BlockHeader[], transfers: TransferEvent[], at: number): Promise<boolean>;
+  appendRange(
+    network: string,
+    range: BlockRange,
+    headers: BlockHeader[],
+    transfers: TransferEvent[],
+    at: number,
+  ): Promise<boolean>;
   /** Replace committed raw rows/headers and rebuild affected pairs/items from ALL remaining history atomically. */
   replaceRange(network: string, range: BlockRange, headers: BlockHeader[], transfers: TransferEvent[]): Promise<void>;
   /** Rebuild accounts/items touched by an existing raw range, without refetching or changing raw rows. */
   rebuildRange(network: string, range: BlockRange): Promise<void>;
   enqueueRepair(network: string, range: BlockRange, reason: string, at: number): Promise<void>;
   repairs(network: string): Promise<RepairRange[]>;
-  readAccount(network: string, account: Address, options?: { tail?: boolean; balances?: boolean }): Promise<AccountView | undefined>;
+  readAccount(
+    network: string,
+    account: Address,
+    options?: { tail?: boolean; balances?: boolean },
+  ): Promise<AccountView | undefined>;
   holdings(network: string, account: Address): Promise<Holding[]>;
   nftItems(network: string, account: Address): Promise<NftItem[]>;
   /** Interaction holders, not a claim of positive balance. Keyset by holder. */
   tokenHolders(network: string, token: Address, limit: number, after?: Address): Promise<Address[]>;
   /** With `tail`, merges tail rows above the cursor up to the tail tip; a cursor above the finalized cursor needs the tail. */
-  transferHistory(network: string, account: Address, limit: number, before?: TransferCursor, tail?: boolean): Promise<TransferPage | undefined>;
+  transferHistory(
+    network: string,
+    account: Address,
+    limit: number,
+    before?: TransferCursor,
+    tail?: boolean,
+  ): Promise<TransferPage | undefined>;
   /**
    * Validates the expected repair revision and that the block is canonical (finalized header, or the tail block at
    * that height); returns false for a read invalidated by repair or reorg.
    */
-  saveBalances(network: string, at: BlockRef, rows: (BalancePair & { result: BalanceResult })[], readAt: number, revision: bigint): Promise<boolean>;
+  saveBalances(
+    network: string,
+    at: BlockRef,
+    rows: (BalancePair & { result: BalanceResult })[],
+    readAt: number,
+    revision: bigint,
+  ): Promise<boolean>;
   balances(network: string, account: Address): Promise<StoredBalance[]>;
   tailTip(network: string): Promise<BlockHeader | undefined>;
   tailBlocks(network: string): Promise<BlockHeader[]>;
@@ -398,26 +431,28 @@ export interface ServingStatus {
   reason?: string;
 }
 
-export type ServingMetadata = {
-  status: 'ready';
-  complete: true;
-  blockHeight: bigint;
-  blockHash: Hex;
-  blockTimestamp: bigint;
-  revision: bigint;
-  lastProgressAt: number;
-  stale: boolean;
-  staleReason?: string;
-  repairPending?: true;
-  headHashMismatch?: true;
-  note?: string;
-  lagBlocks: bigint;
-  followerLagBlocks: bigint;
-} | (BootstrapCoverage & {
-  status: 'partial';
-  complete: false;
-  note: string;
-});
+export type ServingMetadata =
+  | {
+      status: 'ready';
+      complete: true;
+      blockHeight: bigint;
+      blockHash: Hex;
+      blockTimestamp: bigint;
+      revision: bigint;
+      lastProgressAt: number;
+      stale: boolean;
+      staleReason?: string;
+      repairPending?: true;
+      headHashMismatch?: true;
+      note?: string;
+      lagBlocks: bigint;
+      followerLagBlocks: bigint;
+    }
+  | (BootstrapCoverage & {
+      status: 'partial';
+      complete: false;
+      note: string;
+    });
 
 export type DiscoveryResult = ServingMetadata & {
   network: string;
@@ -446,6 +481,16 @@ export type HistoryResult = ServingMetadata & {
 export interface DiscoveryService {
   status(network: string, snapshot?: { state?: IndexState }): Promise<ServingStatus>;
   /** Pure DB reads. Readiness is per network, never per account. */
-  discover(network: string, account: string, options?: { finality?: Finality; balances?: boolean }): Promise<DiscoveryResult>;
-  history(network: string, account: string, limit: number, before?: TransferCursor, finality?: Finality): Promise<HistoryResult>;
+  discover(
+    network: string,
+    account: string,
+    options?: { finality?: Finality; balances?: boolean },
+  ): Promise<DiscoveryResult>;
+  history(
+    network: string,
+    account: string,
+    limit: number,
+    before?: TransferCursor,
+    finality?: Finality,
+  ): Promise<HistoryResult>;
 }

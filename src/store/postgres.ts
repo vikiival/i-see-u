@@ -28,11 +28,18 @@ export async function openPostgresStore(
   databaseUrl: string,
   opts: { max?: number; connectionTimeoutMillis?: number; migrate?: boolean } = {},
 ): Promise<PostgresHandle> {
-  const pool = new Pool({ connectionString: databaseUrl, max: opts.max, connectionTimeoutMillis: opts.connectionTimeoutMillis });
+  const pool = new Pool({
+    connectionString: databaseUrl,
+    max: opts.max,
+    connectionTimeoutMillis: opts.connectionTimeoutMillis,
+  });
+
   const db = drizzle(pool, { schema });
 
   try {
-    if (opts.migrate !== false) await migrate(db, { migrationsFolder });
+    if (opts.migrate !== false) {
+      await migrate(db, { migrationsFolder });
+    }
   } catch (error) {
     await pool.end();
     throw error;

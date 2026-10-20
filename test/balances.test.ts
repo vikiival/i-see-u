@@ -33,11 +33,19 @@ const read = async (s: Stack, who = account) => {
   return response.json();
 };
 
-const byToken = (body: { tokens: { contract: string }[] }, token: string) => body.tokens.find((t) => t.contract === token);
+const byToken = (body: { tokens: { contract: string }[] }, token: string) =>
+  body.tokens.find((t) => t.contract === token);
 
 /** Advance the finalized index; transfers land in the new block. */
-const advance = async (s: Stack, to: bigint, transfers: { token: typeof tokenA; from: typeof account; to: typeof account }[] = []) => {
-  for (const t of transfers) s.chain.addTransfer({ ...t, value: 1n, blockNumber: to });
+const advance = async (
+  s: Stack,
+  to: bigint,
+  transfers: { token: typeof tokenA; from: typeof account; to: typeof account }[] = [],
+) => {
+  for (const t of transfers) {
+    s.chain.addTransfer({ ...t, value: 1n, blockNumber: to });
+  }
+
   s.chain.finalized = to;
   await s.follower.tick();
   expect(s.follower.status()).toMatchObject({ ready: true, cursor: { number: to } });
@@ -49,13 +57,25 @@ test('first request reads and caches; the same cursor is then served with zero R
   try {
     const first = await read(s);
     expect(ethCalls(s)).toBe(1);
-    expect(byToken(first, tokenA)).toMatchObject({ balance: '50', balanceBlock: '102', balanceValidAt: '102', balanceCached: false });
+    expect(byToken(first, tokenA)).toMatchObject({
+      balance: '50',
+      balanceBlock: '102',
+      balanceValidAt: '102',
+      balanceCached: false,
+    });
     expect(await s.store.balances('ethereum', account)).toHaveLength(2);
     const second = await read(s);
     expect(ethCalls(s)).toBe(1);
     expect(second).toMatchObject({ balancesCurrent: true });
-    expect(byToken(second, tokenB)).toMatchObject({ balance: '50', balanceBlock: '102', balanceValidAt: '102', balanceCached: true });
-  } finally { await s.close(); }
+    expect(byToken(second, tokenB)).toMatchObject({
+      balance: '50',
+      balanceBlock: '102',
+      balanceValidAt: '102',
+      balanceCached: true,
+    });
+  } finally {
+    await s.close();
+  }
 });
 
 test('an advanced cursor without a relevant transfer reuses the read, labelled with read and valid-at blocks', async () => {
@@ -67,14 +87,23 @@ test('an advanced cursor without a relevant transfer reuses the read, labelled w
     const body = await read(s);
     expect(ethCalls(s)).toBe(1);
     expect(body).toMatchObject({ blockHeight: '103', balancesCurrent: true });
-    expect(byToken(body, tokenA)).toMatchObject({ balanceBlock: '102', balanceBlockHash: blockHash(102n), balanceValidAt: '103', balanceCached: true });
-  } finally { await s.close(); }
+    expect(byToken(body, tokenA)).toMatchObject({
+      balanceBlock: '102',
+      balanceBlockHash: blockHash(102n),
+      balanceValidAt: '103',
+      balanceCached: true,
+    });
+  } finally {
+    await s.close();
+  }
 });
 
 test('a transfer touching (account, token) re-reads only that token', async () => {
   const s = await fixture();
   const targets: string[][] = [];
-  s.chain.beforeMulticall = (t) => { targets.push(t); };
+  s.chain.beforeMulticall = (t) => {
+    targets.push(t);
+  };
 
   try {
     await read(s);
@@ -83,13 +112,17 @@ test('a transfer touching (account, token) re-reads only that token', async () =
     expect(targets.at(-1)).toEqual([tokenB]);
     expect(byToken(body, tokenB)).toMatchObject({ balanceBlock: '103', balanceValidAt: '103', balanceCached: false });
     expect(byToken(body, tokenA)).toMatchObject({ balanceBlock: '102', balanceValidAt: '103', balanceCached: true });
-  } finally { await s.close(); }
+  } finally {
+    await s.close();
+  }
 });
 
 test('an always-refresh (rebasing) token is re-read at every new cursor, but not twice at the same one', async () => {
   const s = await fixture({ alwaysRefresh: [tokenB] });
   const targets: string[][] = [];
-  s.chain.beforeMulticall = (t) => { targets.push(t); };
+  s.chain.beforeMulticall = (t) => {
+    targets.push(t);
+  };
 
   try {
     await read(s);
@@ -97,7 +130,9 @@ test('an always-refresh (rebasing) token is re-read at every new cursor, but not
     await read(s);
     await read(s);
     expect(targets).toEqual([[tokenA, tokenB], [tokenB]]);
-  } finally { await s.close(); }
+  } finally {
+    await s.close();
+  }
 });
 
 test('a repair revision bump invalidates snapshots of untouched accounts', async () => {
@@ -111,14 +146,21 @@ test('a repair revision bump invalidates snapshots of untouched accounts', async
     expect(s.chain.multicallSizes).toEqual([2, 2]);
     expect(byToken(body, tokenA)).toMatchObject({ balanceCached: false, balanceValidAt: '102' });
     expect((await s.store.balances('ethereum', account))[0].revision).toBe(1n);
-  } finally { await s.close(); }
+  } finally {
+    await s.close();
+  }
 });
 
 test('100 concurrent requests for different accounts share ceil(pairs / batch) Multicalls', async () => {
   const chain = new FakeChain(102n);
   const accounts = Array.from({ length: 100 }, (_, i) => address(1000 + i));
 
-  for (const who of accounts) for (const token of [tokenA, tokenB]) chain.addTransfer({ token, from: peer, to: who, value: 1n, blockNumber: 100n });
+  for (const who of accounts) {
+    for (const token of [tokenA, tokenB]) {
+      chain.addTransfer({ token, from: peer, to: who, value: 1n, blockNumber: 100n });
+    }
+  }
+
   chain.balanceOf = () => 9n;
   const s = await stack(chain, { balances: { batchSize: 64, windowMs: 1_000 } });
 
@@ -128,7 +170,9 @@ test('100 concurrent requests for different accounts share ceil(pairs / batch) M
     expect(bodies.every((body) => body.balancesCurrent === true)).toBe(true);
     expect(s.chain.calls.eth_call).toBe(Math.ceil(200 / 64));
     expect(s.chain.multicallSizes.reduce((a, b) => a + b, 0)).toBe(200);
-  } finally { await s.close(); }
+  } finally {
+    await s.close();
+  }
 });
 
 test('concurrent requests for the same account share one read', async () => {
@@ -137,38 +181,59 @@ test('concurrent requests for the same account share one read', async () => {
   try {
     await Promise.all(Array.from({ length: 5 }, () => read(s)));
     expect(s.chain.multicallSizes).toEqual([2]);
-  } finally { await s.close(); }
+  } finally {
+    await s.close();
+  }
 });
 
 test('a reverted balanceOf is stored as an error at its block and is not an outage', async () => {
   const s = await fixture();
-  s.chain.balanceOf = (_account, token) => token === tokenB ? undefined : 50n;
+  s.chain.balanceOf = (_account, token) => (token === tokenB ? undefined : 50n);
 
   try {
     const body = await read(s);
     expect(body).toMatchObject({ balancesCurrent: false });
-    expect(byToken(body, tokenB)).toMatchObject({ balanceStatus: 'error', balanceError: 'inner call failed', balanceBlock: '102' });
+    expect(byToken(body, tokenB)).toMatchObject({
+      balanceStatus: 'error',
+      balanceError: 'inner call failed',
+      balanceBlock: '102',
+    });
     expect(byToken(body, tokenB)).not.toHaveProperty('balanceValidAt');
-    expect(await s.store.balances('ethereum', account)).toContainEqual(expect.objectContaining({ token: tokenB, blockNumber: 102n, result: { status: 'error', error: 'inner call failed' } }));
+    expect(await s.store.balances('ethereum', account)).toContainEqual(
+      expect.objectContaining({
+        token: tokenB,
+        blockNumber: 102n,
+        result: { status: 'error', error: 'inner call failed' },
+      }),
+    );
     await advance(s, 103n);
     const later = await read(s);
     expect(ethCalls(s)).toBe(1);
     expect(byToken(later, tokenB)).toMatchObject({ balanceStatus: 'error', balanceBlock: '102', balanceCached: true });
     expect(byToken(later, tokenB)).not.toHaveProperty('balanceValidAt');
-  } finally { await s.close(); }
+  } finally {
+    await s.close();
+  }
 });
 
-for (const [kind, message] of [['transient', 'HTTP 503'], ['fatal', 'HTTP 401']] as const) {
+for (const [kind, message] of [
+  ['transient', 'HTTP 503'],
+  ['fatal', 'HTTP 401'],
+] as const) {
   test(`an RPC outage (${message}) fails the request with 503 and caches nothing`, async () => {
     const s = await fixture();
-    s.chain.beforeMulticall = () => { throw new RpcError(kind, message); };
+    s.chain.beforeMulticall = () => {
+      throw new RpcError(kind, message);
+    };
 
     try {
       const response = await s.app.request(`/v1/ethereum/accounts/${account}/erc20?balances=true`);
       expect(response.status).toBe(503);
       expect(response.headers.get('retry-after')).toBe('5');
       expect(await s.store.balances('ethereum', account)).toEqual([]);
-    } finally { await s.close(); }
+    } finally {
+      await s.close();
+    }
   });
 }
 
@@ -177,13 +242,22 @@ test('a delayed read from an older block never overwrites a newer snapshot', asy
   const pause = gate();
   let gated = false;
   let entered = false;
-  s.chain.balanceOf = (_account, _token, at) => at === blockHash(102n) ? 5n : 7n;
-  s.chain.beforeMulticall = async () => { if (!gated) { gated = true; entered = true; await pause.opened; } };
+  s.chain.balanceOf = (_account, _token, at) => (at === blockHash(102n) ? 5n : 7n);
+  s.chain.beforeMulticall = async () => {
+    if (!gated) {
+      gated = true;
+      entered = true;
+      await pause.opened;
+    }
+  };
 
   try {
     const old = read(s);
 
-    while (!entered) await new Promise((resolve) => setImmediate(resolve));
+    while (!entered) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+
     await advance(s, 103n);
     expect(byToken(await read(s), tokenA)).toMatchObject({ balance: '7', balanceBlock: '103' });
     pause.release();
@@ -192,7 +266,10 @@ test('a delayed read from an older block never overwrites a newer snapshot', asy
       expect.objectContaining({ blockNumber: 103n, result: { status: 'ok', balance: 7n } }),
       expect.objectContaining({ blockNumber: 103n, result: { status: 'ok', balance: 7n } }),
     ]);
-  } finally { pause.release(); await s.close(); }
+  } finally {
+    pause.release();
+    await s.close();
+  }
 });
 
 test('without balances=true no balance RPC or cache write happens', async () => {
@@ -202,7 +279,9 @@ test('without balances=true no balance RPC or cache write happens', async () => 
     expect((await s.app.request(`/v1/ethereum/accounts/${account}/erc20`)).status).toBe(200);
     expect(ethCalls(s)).toBe(0);
     expect(await s.store.balances('ethereum', account)).toEqual([]);
-  } finally { await s.close(); }
+  } finally {
+    await s.close();
+  }
 });
 
 const at102 = { number: 102n, hash: blockHash(102n), timestamp: 0n };
@@ -218,9 +297,13 @@ const cancellableReader = (s: Stack, opts: { batchSize?: number; failing?: strin
     adapter: {
       ...s.adapter,
       erc20BalancePairs: (pairs, _hash, signal) => {
-        if (signal) signals.push(signal);
+        if (signal) {
+          signals.push(signal);
+        }
 
-        if (pairs.some((pair) => opts.failing?.includes(pair.token))) return Promise.reject(new RpcError('transient', 'HTTP 503'));
+        if (pairs.some((pair) => opts.failing?.includes(pair.token))) {
+          return Promise.reject(new RpcError('transient', 'HTTP 503'));
+        }
 
         return new Promise((_resolve, reject) => signal?.addEventListener('abort', () => reject(signal.reason)));
       },
@@ -260,7 +343,9 @@ test('a shared balance batch stops its RPC only once every waiting request gave 
     expect(signals[1].aborted).toBe(false);
     c.abort();
     await expect(third).rejects.toMatchObject({ statusCode: 503 });
-  } finally { await s.close(); }
+  } finally {
+    await s.close();
+  }
 });
 
 test('two requests for the same pair share one read, aborted only when the second one leaves too', async () => {
@@ -282,18 +367,29 @@ test('two requests for the same pair share one read, aborted only when the secon
     await expect(second).rejects.toMatchObject({ statusCode: 503, message: 'Request cancelled' });
     expect(signals[0].aborted).toBe(true);
     expect(signals).toHaveLength(1);
-  } finally { await s.close(); }
+  } finally {
+    await s.close();
+  }
 });
 
 test('when one batch of a request fails, the request aborts its other batches instead of leaving them running', async () => {
   const s = await fixture();
   // One pair per batch: tokenA's batch fails at once, tokenB's would hang until aborted.
   const { reader, signals } = cancellableReader(s, { batchSize: 1, failing: [tokenA] });
-  const holdings = [{ token: tokenA, lastBlock: 100n }, { token: tokenB, lastBlock: 100n }];
+
+  const holdings = [
+    { token: tokenA, lastBlock: 100n },
+    { token: tokenB, lastBlock: 100n },
+  ];
 
   try {
-    await expect(reader.forAccount(account, holdings, at102, 0n, [])).rejects.toMatchObject({ statusCode: 503, message: 'Balance RPC unavailable' });
+    await expect(reader.forAccount(account, holdings, at102, 0n, [])).rejects.toMatchObject({
+      statusCode: 503,
+      message: 'Balance RPC unavailable',
+    });
     expect(signals).toHaveLength(2);
     await vi.waitFor(() => expect(signals[1].aborted).toBe(true));
-  } finally { await s.close(); }
+  } finally {
+    await s.close();
+  }
 });

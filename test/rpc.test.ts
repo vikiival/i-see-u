@@ -20,8 +20,22 @@ test('classify recognizes provider, HTTP, and network failures', () => {
     [413, { message: 'anything' }, 'too_large'],
     [401, { message: 'anything' }, 'fatal'],
     [403, { message: 'anything' }, 'fatal'],
-    [undefined, { code: -32005, message: 'query returned more than 10000 results. Try with this block range [0x18E2D98, 0x18E4B00]' }, 'too_large'],
-    [undefined, { code: -32602, message: 'Query returned more than 20000 results. Try with this block range [0x18e2d98, 0x18e411f]' }, 'too_large'],
+    [
+      undefined,
+      {
+        code: -32005,
+        message: 'query returned more than 10000 results. Try with this block range [0x18E2D98, 0x18E4B00]',
+      },
+      'too_large',
+    ],
+    [
+      undefined,
+      {
+        code: -32602,
+        message: 'Query returned more than 20000 results. Try with this block range [0x18e2d98, 0x18e411f]',
+      },
+      'too_large',
+    ],
     [undefined, { message: 'ranges over 10000 blocks are not supported' }, 'too_large'],
     [undefined, { message: 'Max range: 800' }, 'too_large'],
     [undefined, { message: 'block range too large' }, 'too_large'],
@@ -41,7 +55,9 @@ test('classify recognizes provider, HTTP, and network failures', () => {
     [undefined, { code: -32602, message: 'invalid params' }, 'fatal'],
   ];
 
-  for (const [status, error, expected] of cases) expect(classify(status, error), String(error)).toBe(expected);
+  for (const [status, error, expected] of cases) {
+    expect(classify(status, error), String(error)).toBe(expected);
+  }
 
   const parsed = new RpcError('too_large', 'Try with this block range [0x18E2D98, 0x18E4B00]');
   expect(parsed.suggestedRange).toEqual({ fromBlock: 0x18e2d98n, toBlock: 0x18e4b00n });
@@ -53,23 +69,29 @@ test('client retries on a fallback and opens the failing endpoint breaker', asyn
   let failedCalls = 0;
   let goodCalls = 0;
   vi.spyOn(Math, 'random').mockReturnValue(0);
-  vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
-    if (String(input).startsWith('https://primary.example')) {
-      failedCalls += 1;
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: string | URL | Request) => {
+      if (String(input).startsWith('https://primary.example')) {
+        failedCalls += 1;
 
-      return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code: -32000, message: 'temporarily unavailable' } }), {
-        status: 503,
+        return new Response(
+          JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code: -32000, message: 'temporarily unavailable' } }),
+          {
+            status: 503,
+            headers: { 'content-type': 'application/json' },
+          },
+        );
+      }
+
+      goodCalls += 1;
+
+      return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: '0x2a' }), {
+        status: 200,
         headers: { 'content-type': 'application/json' },
       });
-    }
-
-    goodCalls += 1;
-
-    return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: '0x2a' }), {
-      status: 200,
-      headers: { 'content-type': 'application/json' },
-    });
-  }));
+    }),
+  );
 
   const client = createRpcClient({
     urls: ['https://primary.example/api-key?secret=yes', 'https://fallback.example/other-key'],
@@ -78,7 +100,10 @@ test('client retries on a fallback and opens the failing endpoint breaker', asyn
     maxRps: 1_000,
   });
 
-  for (let i = 0; i < 5; i += 1) expect(await client.request('eth_blockNumber', [])).toBe('0x2a');
+  for (let i = 0; i < 5; i += 1) {
+    expect(await client.request('eth_blockNumber', [])).toBe('0x2a');
+  }
+
   expect(failedCalls).toBe(5);
   expect(goodCalls).toBe(5);
   expect(client.stats().endpoints[0].state).toBe('open');
@@ -86,7 +111,7 @@ test('client retries on a fallback and opens the failing endpoint breaker', asyn
   expect(await client.request('eth_blockNumber', [])).toBe('0x2a');
   expect(failedCalls, 'open primary is skipped').toBe(5);
   expect(goodCalls).toBe(6);
-  expect(client.stats().endpoints.map(endpoint => endpoint.url)).toEqual([
+  expect(client.stats().endpoints.map((endpoint) => endpoint.url)).toEqual([
     'https://primary.example/***',
     'https://fallback.example/***',
   ]);
@@ -102,7 +127,10 @@ test('finalized head is single-flight, cached, records the latest number, and se
     async request<T>(_method: string, params: unknown[]): Promise<T> {
       calls += 1;
 
-      if (fail) throw new Error('offline');
+      if (fail) {
+        throw new Error('offline');
+      }
+
       await Promise.resolve();
       const tag = params[0];
       const number = tag === 'latest' ? '0xa' : '0x8';
@@ -165,26 +193,34 @@ test('finalized head never moves backwards and marks a lagging observation stale
   expect(lagging.stale).toBe(true);
   // Recorded rather than asserted in the mock: a throw there would be swallowed by the background 'latest' refresh.
   expect(tags).toContain('finalized');
-  expect(tags.every(tag => tag === 'finalized' || tag === 'latest'), String(tags)).toBe(true);
+  expect(
+    tags.every((tag) => tag === 'finalized' || tag === 'latest'),
+    String(tags),
+  ).toBe(true);
 });
 
 test('result validation fails over from a null head response', async () => {
   const called: string[] = [];
-  vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-    // finalizedHead() also refreshes 'latest' in the background; track only the finalized lookups.
-    const [tag] = JSON.parse(String(init?.body)).params;
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      // finalizedHead() also refreshes 'latest' in the background; track only the finalized lookups.
+      const [tag] = JSON.parse(String(init?.body)).params;
 
-    if (tag === 'finalized') called.push(String(input));
+      if (tag === 'finalized') {
+        called.push(String(input));
+      }
 
-    const result = String(input).startsWith('https://primary.example')
-      ? null
-      : { number: '0xa', hash: '0xabc', parentHash: '0xdef', timestamp: '0x64' };
+      const result = String(input).startsWith('https://primary.example')
+        ? null
+        : { number: '0xa', hash: '0xabc', parentHash: '0xdef', timestamp: '0x64' };
 
-    return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result }), {
-      status: 200,
-      headers: { 'content-type': 'application/json' },
-    });
-  }));
+      return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }),
+  );
   vi.spyOn(Math, 'random').mockReturnValue(0);
 
   const client = createRpcClient({
@@ -246,7 +282,10 @@ const json = (body: RpcEnvelope, status = 200, headers: Record<string, string> =
 
 /** The next link of an error's cause chain, if any. */
 const causeOf = (value: NonNullable<unknown>): NonNullable<unknown> | undefined => {
-  if (!(value instanceof Object) || !('cause' in value)) return undefined;
+  if (!(value instanceof Object) || !('cause' in value)) {
+    return undefined;
+  }
+
   const { cause } = value;
 
   return cause === null || cause === undefined ? undefined : cause;
@@ -254,22 +293,34 @@ const causeOf = (value: NonNullable<unknown>): NonNullable<unknown> | undefined 
 
 const stubFetch = (respond: (url: string, call: number) => Response) => {
   const urls: string[] = [];
-  vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
-    urls.push(String(input));
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: string | URL | Request) => {
+      urls.push(String(input));
 
-    return respond(String(input), urls.length);
-  }));
+      return respond(String(input), urls.length);
+    }),
+  );
 
   return urls;
 };
 
 test('-32005 with "more than 10000 results" is too_large with the suggested range, not retried', async () => {
-  const urls = stubFetch(() => json({
-    jsonrpc: '2.0', id: 1,
-    error: { code: -32005, message: 'query returned more than 10000 results. Try with this block range [0x1, 0x2].' },
-  }));
+  const urls = stubFetch(() =>
+    json({
+      jsonrpc: '2.0',
+      id: 1,
+      error: { code: -32005, message: 'query returned more than 10000 results. Try with this block range [0x1, 0x2].' },
+    }),
+  );
 
-  const client = createRpcClient({ urls: ['https://a.example/key', 'https://b.example/key'], timeoutMs: 1_000, maxAttempts: 4, maxRps: 1_000 });
+  const client = createRpcClient({
+    urls: ['https://a.example/key', 'https://b.example/key'],
+    timeoutMs: 1_000,
+    maxAttempts: 4,
+    maxRps: 1_000,
+  });
+
   const error = await client.request('eth_getLogs', []).catch((e: Error) => e);
   assert.instanceOf(error, RpcError);
   expect(error).toMatchObject({ kind: 'too_large', code: -32005, suggestedRange: { fromBlock: 1n, toBlock: 2n } });
@@ -280,10 +331,19 @@ test('-32005 with "more than 10000 results" is too_large with the suggested rang
 
 test('Quicknode -32010 is retried as rate_limited', async () => {
   vi.spyOn(Math, 'random').mockReturnValue(0);
-  stubFetch((_url, call) => call === 1
-    ? json({ jsonrpc: '2.0', id: 1, error: { code: -32010, message: 'eth_getLogs is limited to 1/sec' } })
-    : json({ jsonrpc: '2.0', id: 1, result: [] }));
-  const client = createRpcClient({ urls: ['https://only.example/key'], timeoutMs: 1_000, maxAttempts: 3, maxRps: 1_000 });
+  stubFetch((_url, call) =>
+    call === 1
+      ? json({ jsonrpc: '2.0', id: 1, error: { code: -32010, message: 'eth_getLogs is limited to 1/sec' } })
+      : json({ jsonrpc: '2.0', id: 1, result: [] }),
+  );
+
+  const client = createRpcClient({
+    urls: ['https://only.example/key'],
+    timeoutMs: 1_000,
+    maxAttempts: 3,
+    maxRps: 1_000,
+  });
+
   expect(await client.request('eth_getLogs', [])).toEqual([]);
   expect(client.stats()).toMatchObject({ attempts: 2, errors: { rate_limited: 1 } });
 });
@@ -292,13 +352,25 @@ test('HTTP 429 Retry-After is honoured only up to the cap', async () => {
   vi.useFakeTimers();
   vi.spyOn(Math, 'random').mockReturnValue(0);
 
-  const urls = stubFetch((_url, call) => call === 1
-    ? new Response('Too Many Requests', { status: 429, headers: { 'retry-after': '3600' } })
-    : json({ jsonrpc: '2.0', id: 1, result: '0x1' }));
+  const urls = stubFetch((_url, call) =>
+    call === 1
+      ? new Response('Too Many Requests', { status: 429, headers: { 'retry-after': '3600' } })
+      : json({ jsonrpc: '2.0', id: 1, result: '0x1' }),
+  );
 
-  const client = createRpcClient({ urls: ['https://only.example/key'], timeoutMs: 1_000, maxAttempts: 2, maxRps: 1_000 });
+  const client = createRpcClient({
+    urls: ['https://only.example/key'],
+    timeoutMs: 1_000,
+    maxAttempts: 2,
+    maxRps: 1_000,
+  });
+
   let settled = false;
-  const pending = client.request('eth_blockNumber', []).finally(() => { settled = true; });
+
+  const pending = client.request('eth_blockNumber', []).finally(() => {
+    settled = true;
+  });
+
   await vi.advanceTimersByTimeAsync(9_999);
   expect(settled).toBe(false);
   expect(urls.length).toBe(1);
@@ -309,8 +381,19 @@ test('HTTP 429 Retry-After is honoured only up to the cap', async () => {
 
 test('HTTP 401 is fatal: one attempt, no failover', async () => {
   const urls = stubFetch(() => new Response('unauthorized', { status: 401 }));
-  const client = createRpcClient({ urls: ['https://a.example/key', 'https://b.example/key'], timeoutMs: 1_000, maxAttempts: 4, maxRps: 1_000 });
-  await expect(client.request('eth_blockNumber', [])).rejects.toMatchObject({ name: 'RpcError', kind: 'fatal', message: 'HTTP 401' });
+
+  const client = createRpcClient({
+    urls: ['https://a.example/key', 'https://b.example/key'],
+    timeoutMs: 1_000,
+    maxAttempts: 4,
+    maxRps: 1_000,
+  });
+
+  await expect(client.request('eth_blockNumber', [])).rejects.toMatchObject({
+    name: 'RpcError',
+    kind: 'fatal',
+    message: 'HTTP 401',
+  });
   expect(urls).toEqual(['https://a.example/key']);
 });
 
@@ -321,22 +404,34 @@ test('endpoint path and key never leak into thrown errors or stats', async () =>
   const responses = [
     () => new Response('bad gateway', { status: 502 }),
     () => json({ jsonrpc: '2.0', id: 1, error: { code: -32000, message: 'execution reverted' } }),
-    () => { throw new TypeError('fetch failed', { cause: { code: 'ECONNRESET' } }); },
+    () => {
+      throw new TypeError('fetch failed', { cause: { code: 'ECONNRESET' } });
+    },
     () => new Response('not json', { status: 200 }),
   ];
 
   const errors: RpcError[] = [];
 
   for (const respond of responses) {
-    vi.stubGlobal('fetch', vi.fn(async () => respond()));
-    const client = createRpcClient({ urls: [`https://node.example/${secret}?token=${secret}`], timeoutMs: 1_000, maxAttempts: 1, maxRps: 1_000 });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => respond()),
+    );
+
+    const client = createRpcClient({
+      urls: [`https://node.example/${secret}?token=${secret}`],
+      timeoutMs: 1_000,
+      maxAttempts: 1,
+      maxRps: 1_000,
+    });
+
     const error = await client.request('eth_call', []).catch((e: Error) => e);
     assert.instanceOf(error, RpcError);
     errors.push(error);
     expect(JSON.stringify(client.stats())).not.toContain(secret);
   }
 
-  expect(errors.map(error => error.kind)).toEqual(['transient', 'fatal', 'transient', 'fatal']);
+  expect(errors.map((error) => error.kind)).toEqual(['transient', 'fatal', 'transient', 'fatal']);
 
   // Walk the whole cause chain (what a logger would print), not just the top-level message.
   for (const error of errors) {
@@ -350,30 +445,52 @@ test('endpoint path and key never leak into thrown errors or stats', async () =>
 test('a viem transport timeout is transient and fails over', async () => {
   vi.spyOn(Math, 'random').mockReturnValue(0);
   const urls: string[] = [];
-  vi.stubGlobal('fetch', vi.fn((input: string, init?: RequestInit) => {
-    urls.push(input);
+  vi.stubGlobal(
+    'fetch',
+    vi.fn((input: string, init?: RequestInit) => {
+      urls.push(input);
 
-    if (!input.startsWith('https://slow.example')) return Promise.resolve(json({ jsonrpc: '2.0', id: 1, result: '0x1' }));
+      if (!input.startsWith('https://slow.example')) {
+        return Promise.resolve(json({ jsonrpc: '2.0', id: 1, result: '0x1' }));
+      }
 
-    return new Promise((_resolve, reject) => init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError'))));
-  }));
-  const client = createRpcClient({ urls: ['https://slow.example/key', 'https://fast.example/key'], timeoutMs: 20, maxAttempts: 2, maxRps: 1_000 });
+      return new Promise((_resolve, reject) =>
+        init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError'))),
+      );
+    }),
+  );
+
+  const client = createRpcClient({
+    urls: ['https://slow.example/key', 'https://fast.example/key'],
+    timeoutMs: 20,
+    maxAttempts: 2,
+    maxRps: 1_000,
+  });
+
   expect(await client.request('eth_blockNumber', [])).toBe('0x1');
-  expect(urls.map(url => new URL(url).host)).toEqual(['slow.example', 'fast.example']);
+  expect(urls.map((url) => new URL(url).host)).toEqual(['slow.example', 'fast.example']);
   expect(client.stats().errors).toEqual({ transient: 1 });
 });
 
 test('failFastOnTimeout throws a flagged timeout after one attempt without tripping the breaker', async () => {
   let calls = 0;
-  vi.stubGlobal('fetch', vi.fn((_input: string, init?: RequestInit) => {
-    calls += 1;
+  vi.stubGlobal(
+    'fetch',
+    vi.fn((_input: string, init?: RequestInit) => {
+      calls += 1;
 
-    return new Promise((_resolve, reject) => init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError'))));
-  }));
+      return new Promise((_resolve, reject) =>
+        init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError'))),
+      );
+    }),
+  );
   const client = createRpcClient({ urls: ['https://slow.example/key'], timeoutMs: 10, maxAttempts: 3, maxRps: 1_000 });
 
   for (let i = 0; i < 6; i += 1) {
-    await expect(client.request('eth_getLogs', [], { failFastOnTimeout: true })).rejects.toMatchObject({ kind: 'transient', timeout: true });
+    await expect(client.request('eth_getLogs', [], { failFastOnTimeout: true })).rejects.toMatchObject({
+      kind: 'transient',
+      timeout: true,
+    });
   }
 
   expect(calls).toBe(6);
@@ -383,28 +500,50 @@ test('failFastOnTimeout throws a flagged timeout after one attempt without tripp
 
 test('onAttempt reports duration and the uncompressed Content-Length', async () => {
   const body = JSON.stringify({ jsonrpc: '2.0', id: 1, result: [] });
-  vi.stubGlobal('fetch', vi.fn(async () => json({ jsonrpc: '2.0', id: 1, result: [] }, 200, { 'content-length': String(body.length) })));
-  const client = createRpcClient({ urls: ['https://only.example/key'], timeoutMs: 1_000, maxAttempts: 1, maxRps: 1_000 });
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async () => json({ jsonrpc: '2.0', id: 1, result: [] }, 200, { 'content-length': String(body.length) })),
+  );
+
+  const client = createRpcClient({
+    urls: ['https://only.example/key'],
+    timeoutMs: 1_000,
+    maxAttempts: 1,
+    maxRps: 1_000,
+  });
+
   const attempts: unknown[] = [];
-  await client.request('eth_getLogs', [], { onAttempt: attempt => attempts.push(attempt) });
+  await client.request('eth_getLogs', [], { onAttempt: (attempt) => attempts.push(attempt) });
   expect(attempts).toEqual([{ ok: true, durationMs: expect.any(Number), bytes: body.length }]);
 });
 
 /** fetch that never answers until its (viem-merged) signal aborts, like a slow provider. */
 const hangingFetch = () => {
   const calls: (AbortSignal | undefined)[] = [];
-  vi.stubGlobal('fetch', vi.fn((_input: string, init?: RequestInit) => {
-    calls.push(init?.signal ?? undefined);
+  vi.stubGlobal(
+    'fetch',
+    vi.fn((_input: string, init?: RequestInit) => {
+      calls.push(init?.signal ?? undefined);
 
-    return new Promise((_resolve, reject) => init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError'))));
-  }));
+      return new Promise((_resolve, reject) =>
+        init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError'))),
+      );
+    }),
+  );
 
   return calls;
 };
 
 test('aborting the signal cancels the in-flight fetch and makes no further attempt', async () => {
   const calls = hangingFetch();
-  const client = createRpcClient({ urls: ['https://a.example/key', 'https://b.example/key'], timeoutMs: 60_000, maxAttempts: 4, maxRps: 1_000 });
+
+  const client = createRpcClient({
+    urls: ['https://a.example/key', 'https://b.example/key'],
+    timeoutMs: 60_000,
+    maxAttempts: 4,
+    maxRps: 1_000,
+  });
+
   const controller = new AbortController();
   const pending = client.request('eth_getLogs', [], { signal: controller.signal });
   await vi.waitFor(() => expect(calls.length).toBe(1));
@@ -416,12 +555,19 @@ test('aborting the signal cancels the in-flight fetch and makes no further attem
   expect(calls.length).toBe(1);
   // A cancellation is not an endpoint failure.
   expect(client.stats()).toMatchObject({ attempts: 1, errors: {} });
-  expect(client.stats().endpoints.map(endpoint => endpoint.failures)).toEqual([0, 0]);
+  expect(client.stats().endpoints.map((endpoint) => endpoint.failures)).toEqual([0, 0]);
 });
 
 test('aborting during the retry backoff stops at once without another attempt', async () => {
   const urls = stubFetch(() => new Response('Too Many Requests', { status: 429, headers: { 'retry-after': '5' } }));
-  const client = createRpcClient({ urls: ['https://only.example/key'], timeoutMs: 1_000, maxAttempts: 3, maxRps: 1_000 });
+
+  const client = createRpcClient({
+    urls: ['https://only.example/key'],
+    timeoutMs: 1_000,
+    maxAttempts: 3,
+    maxRps: 1_000,
+  });
+
   const controller = new AbortController();
   const pending = client.request('eth_blockNumber', [], { signal: controller.signal });
   await vi.waitFor(() => expect(client.stats().errors).toEqual({ rate_limited: 1 }));
@@ -436,7 +582,9 @@ test('aborting during the retry backoff stops at once without another attempt', 
 test('an already aborted signal makes no attempt, and the token-bucket wait is abortable', async () => {
   const urls = stubFetch(() => json({ jsonrpc: '2.0', id: 1, result: '0x1' }));
   const client = createRpcClient({ urls: ['https://only.example/key'], timeoutMs: 1_000, maxAttempts: 1, maxRps: 1 });
-  await expect(client.request('eth_blockNumber', [], { signal: AbortSignal.abort() })).rejects.toMatchObject({ name: 'AbortError' });
+  await expect(client.request('eth_blockNumber', [], { signal: AbortSignal.abort() })).rejects.toMatchObject({
+    name: 'AbortError',
+  });
   expect(urls.length).toBe(0);
 
   // maxRps 1: the first request takes the only token, the second waits ~1 s for the next one.

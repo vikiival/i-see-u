@@ -21,8 +21,8 @@ Jeden z mnoha problémů nastává u non-rich JSON-RPC, které neumí dělat tok
 - pro jednoduchost bere jako zdroj pravdy data na ETH mainnet od bloku 25 933 634 do aktuálního bloku, tzn. umí fungovat v módu skoro „realtime“ parsování
 - volba technologií (jazyka, frameworku, databáze) je na tobě, očekáváme však zdůvodnění co a proč si vybral
 - obsahuje REST API nebo GraphQL endpoint pro získání všech adres tokenů (ERC-20), se kterými poskytnutá adresa účtu interagovala
-    - obsahuje i parametr pro poskytnutí aktuálního zůstatku účtu na adrese tokenu
-    - odpověď by měla obsahovat výšku bloku, pro který jsou tato data platná
+  - obsahuje i parametr pro poskytnutí aktuálního zůstatku účtu na adrese tokenu
+  - odpověď by měla obsahovat výšku bloku, pro který jsou tato data platná
 - je z hlediska datového modelu/contractu a architektury codebase do jisté míry modulární, aby při implementaci dalších networků šel použít např. Adapter pattern (na patternu nezáleží, cílem je, aby codebase měla nějaký modulární základ)
 - služba by měla být škálovatelná (schopná obsluhovat 5k uživatelů, kteří zjišťují své zůstatky 1× za minutu)
 - služba by měla počítat s tím, že RPC není spolehlivé - může být pomalé, vracet chyby, rate-limitovat nebo být pozadu za chain-tipem. Popiš, jak to tvoje řešení řeší

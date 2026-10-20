@@ -18,11 +18,15 @@ interface WireBlockHeader {
 const isHexString = (value: unknown): value is Hex => isString(value) && hexPattern.test(value);
 
 const validBlock = (value: unknown): value is WireBlockHeader =>
-  isObject(value)
-  && 'number' in value && isHexString(value.number)
-  && 'hash' in value && isHexString(value.hash)
-  && 'parentHash' in value && isHexString(value.parentHash)
-  && 'timestamp' in value && isHexString(value.timestamp);
+  isObject(value) &&
+  'number' in value &&
+  isHexString(value.number) &&
+  'hash' in value &&
+  isHexString(value.hash) &&
+  'parentHash' in value &&
+  isHexString(value.parentHash) &&
+  'timestamp' in value &&
+  isHexString(value.timestamp);
 
 export interface HeadTracker {
   /** Cached for cacheMs and single-flight; on failure or a lagging node, the newer cached block is served stale. */
@@ -45,9 +49,12 @@ export function createHeadTracker(
   const client = createPublicClient({
     batch: { multicall: false },
     chain: opts.chain,
-    transport: custom({
-      request: ({ method, params }) => rpc.request(method, params ? [...params] : [], { validate: validBlock }),
-    }, { retryCount: 0 }),
+    transport: custom(
+      {
+        request: ({ method, params }) => rpc.request(method, params ? [...params] : [], { validate: validBlock }),
+      },
+      { retryCount: 0 },
+    ),
   });
 
   let observation: HeadObservation | undefined;
@@ -72,15 +79,25 @@ export function createHeadTracker(
 
     try {
       const block = await rpc.request<WireBlockHeader>('eth_getBlockByNumber', ['latest', false], {
-        validate: validBlock, onEndpoint: (trip) => { penalize = trip; },
+        validate: validBlock,
+        onEndpoint: (trip) => {
+          penalize = trip;
+        },
       });
 
       const number = BigInt(block.number);
       watchdog.observe(number, penalize);
 
-      if (latest === undefined || number > latest) latest = number;
+      if (latest === undefined || number > latest) {
+        latest = number;
+      }
 
-      return { number, hash: toLowerHex(block.hash), parentHash: toLowerHex(block.parentHash), timestamp: BigInt(block.timestamp) };
+      return {
+        number,
+        hash: toLowerHex(block.hash),
+        parentHash: toLowerHex(block.parentHash),
+        timestamp: BigInt(block.timestamp),
+      };
     } catch (error) {
       watchdog.observe(undefined);
       throw error;
@@ -100,11 +117,16 @@ export function createHeadTracker(
         // A lagging node: keep the newer block, but flag it.
         observation = { block: observation.block, lastProgressAt: observation.lastProgressAt, stale: true };
       } else {
-        const lastProgressAt = !observation || block.number > observation.block.number ? checkedAt : observation.lastProgressAt;
+        const lastProgressAt =
+          !observation || block.number > observation.block.number ? checkedAt : observation.lastProgressAt;
+
         observation = { block, lastProgressAt, stale: checkedAt - lastProgressAt > opts.maxNoProgressMs };
       }
     } catch (error) {
-      if (!observation) throw error;
+      if (!observation) {
+        throw error;
+      }
+
       checkedAt = Date.now();
       observation = { ...observation, stale: true, refreshFailed: true };
     }
@@ -114,8 +136,13 @@ export function createHeadTracker(
 
   return {
     finalizedHead() {
-      if (observation && Date.now() - checkedAt < opts.cacheMs) return Promise.resolve(observation);
-      inFlight ??= refresh().finally(() => { inFlight = undefined; });
+      if (observation && Date.now() - checkedAt < opts.cacheMs) {
+        return Promise.resolve(observation);
+      }
+
+      inFlight ??= refresh().finally(() => {
+        inFlight = undefined;
+      });
 
       return inFlight;
     },

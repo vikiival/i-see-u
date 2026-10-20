@@ -17,42 +17,87 @@ import { createTail } from './tail/tail.ts';
 
 const rpc = createRpcClient(config.rpc);
 
-const adapters = Object.fromEntries(Object.values(config.networks).map((network) =>
-  [network.name, createEvmAdapter(rpc, { ...network, network: network.name, headStallMs: config.headStallMs })]));
+const adapters = Object.fromEntries(
+  Object.values(config.networks).map((network) => [
+    network.name,
+    createEvmAdapter(rpc, { ...network, network: network.name, headStallMs: config.headStallMs }),
+  ]),
+);
 
-const { store, bootstrap, followerLock, bootstrapLock } = await openPostgresStore(config.databaseUrl, { max: config.db.poolMax, connectionTimeoutMillis: config.db.connectTimeoutMs });
+const { store, bootstrap, followerLock, bootstrapLock } = await openPostgresStore(config.databaseUrl, {
+  max: config.db.poolMax,
+  connectionTimeoutMillis: config.db.connectTimeoutMs,
+});
 
 // A database initialized (or being bootstrapped) from another START_BLOCK cannot serve this configuration.
 try {
-  for (const network of Object.values(config.networks)) await assertStartBlock(store, bootstrap, network.name, network.startBlock);
+  for (const network of Object.values(config.networks)) {
+    await assertStartBlock(store, bootstrap, network.name, network.startBlock);
+  }
 } catch (error) {
   await store.close();
   throw error;
 }
 
-const requestRpc = { limiter: createLimiter(config.request.rpcConcurrency, config.request.rpcQueue), deadlineMs: config.request.deadlineMs };
+const requestRpc = {
+  limiter: createLimiter(config.request.rpcConcurrency, config.request.rpcQueue),
+  deadlineMs: config.request.deadlineMs,
+};
 
-const balances = Object.fromEntries(Object.values(config.networks).map((network) => [network.name, createBalanceReader({
-  adapter: adapters[network.name], store, requestRpc,
-  batchSize: network.multicallBatch, windowMs: config.balances.batchWindowMs, alwaysRefresh: network.alwaysRefreshTokens,
-})]));
+const balances = Object.fromEntries(
+  Object.values(config.networks).map((network) => [
+    network.name,
+    createBalanceReader({
+      adapter: adapters[network.name],
+      store,
+      requestRpc,
+      batchSize: network.multicallBatch,
+      windowMs: config.balances.batchWindowMs,
+      alwaysRefresh: network.alwaysRefreshTokens,
+    }),
+  ]),
+);
 
-const followers = Object.fromEntries(Object.values(adapters).map((adapter) => [adapter.network, createFollower({
-  adapter, store, lock: config.serveOnly ? undefined : followerLock(adapter.network), ...config.follower,
-  maxNoAdvanceMs: config.maxHeadProgressAgeMs,
-  onError: (message) => console.warn('Follower failed:', message),
-})]));
+const followers = Object.fromEntries(
+  Object.values(adapters).map((adapter) => [
+    adapter.network,
+    createFollower({
+      adapter,
+      store,
+      lock: config.serveOnly ? undefined : followerLock(adapter.network),
+      ...config.follower,
+      maxNoAdvanceMs: config.maxHeadProgressAgeMs,
+      onError: (message) => console.warn('Follower failed:', message),
+    }),
+  ]),
+);
 
 // Leader-only (the follower's lock); every replica loads the shared tip and serves latest from the database.
-const tails = config.tail.enabled ? Object.fromEntries(Object.values(adapters).map((adapter) => [adapter.network, createTail({
-  adapter, store, follower: followers[adapter.network],
-  maxDepth: config.tail.maxDepth, maxAheadBlocks: config.tail.maxAheadBlocks, pollOffsetsMs: config.tail.pollOffsetsMs,
-  onEpoch: () => followers[adapter.network].kick(),
-  onError: (message) => console.warn('Tail failed:', message),
-})])) : undefined;
+const tails = config.tail.enabled
+  ? Object.fromEntries(
+      Object.values(adapters).map((adapter) => [
+        adapter.network,
+        createTail({
+          adapter,
+          store,
+          follower: followers[adapter.network],
+          maxDepth: config.tail.maxDepth,
+          maxAheadBlocks: config.tail.maxAheadBlocks,
+          pollOffsetsMs: config.tail.pollOffsetsMs,
+          onEpoch: () => followers[adapter.network].kick(),
+          onError: (message) => console.warn('Tail failed:', message),
+        }),
+      ]),
+    )
+  : undefined;
 
 const discovery = createDiscoveryService({
-  adapters, store, tails, maxTailTipAgeMs: config.tail.maxTipAgeMs, maxHeadAgeMs: config.maxHeadAgeMs, maxNoAdvanceMs: config.maxHeadProgressAgeMs,
+  adapters,
+  store,
+  tails,
+  maxTailTipAgeMs: config.tail.maxTipAgeMs,
+  maxHeadAgeMs: config.maxHeadAgeMs,
+  maxNoAdvanceMs: config.maxHeadProgressAgeMs,
 });
 
 const bootstrapRuns = new Map<string, ConfiguredBootstrap>();
@@ -60,13 +105,18 @@ const bootstrapRuns = new Map<string, ConfiguredBootstrap>();
 console.log(`i-see-u mode: ${config.serveOnly ? 'serve-only' : 'indexer + API'}`);
 
 await startBackground(config.serveOnly, [...Object.values(followers), ...Object.values(tails ?? {})], async () => {
-  if (!config.bootstrap.onStart) return;
+  if (!config.bootstrap.onStart) {
+    return;
+  }
 
   for (const network of Object.values(config.networks)) {
-    if (await store.indexState(network.name)) continue;
+    if (await store.indexState(network.name)) {
+      continue;
+    }
+
     const lock = bootstrapLock(network.name);
 
-    if (!await lock.tryAcquire()) {
+    if (!(await lock.tryAcquire())) {
       console.warn(`Bootstrap of ${network.name} is running elsewhere`);
       continue;
     }
@@ -74,30 +124,48 @@ await startBackground(config.serveOnly, [...Object.values(followers), ...Object.
     const log = (message: string) => console.log(`[bootstrap ${network.name}] ${message}`);
     const run = runConfiguredBootstrap(config, network, { store, bootstrap, log, lock });
     bootstrapRuns.set(network.name, run);
-    run.done
-      .then(() => followers[network.name].kick(), (error) => console.error(`[bootstrap ${network.name}] failed: ${error instanceof Error ? error.message : String(error)}`));
+    run.done.then(
+      () => followers[network.name].kick(),
+      (error) =>
+        console.error(`[bootstrap ${network.name}] failed: ${error instanceof Error ? error.message : String(error)}`),
+    );
   }
 });
 
-const app = createApp({
-  discovery, adapters, balances, followers, tails, requestRpc,
-  maxVerifyOwnershipItems: config.request.maxVerifyOwnershipItems,
-  rpcStats: () => rpc.stats(), startedAt: Date.now(),
-  bootstrap: (network) => bootstrap.status(network, Date.now()),
-  opsSnapshot: (network) => store.opsSnapshot(network),
-  hypersyncStats: (network) => bootstrapRuns.get(network)?.stats().hypersync,
-  bootstrapRpcStats: () => Object.fromEntries([...bootstrapRuns].map(([network, run]) => [`bootstrap:${network}`, run.rpcStats()])),
-  readyzAllow: config.readyzAllow,
-}, { requestLog: process.env.LOG_LEVEL !== 'warn' && process.env.LOG_LEVEL !== 'error' });
+const app = createApp(
+  {
+    discovery,
+    adapters,
+    balances,
+    followers,
+    tails,
+    requestRpc,
+    maxVerifyOwnershipItems: config.request.maxVerifyOwnershipItems,
+    rpcStats: () => rpc.stats(),
+    startedAt: Date.now(),
+    bootstrap: (network) => bootstrap.status(network, Date.now()),
+    opsSnapshot: (network) => store.opsSnapshot(network),
+    hypersyncStats: (network) => bootstrapRuns.get(network)?.stats().hypersync,
+    bootstrapRpcStats: () =>
+      Object.fromEntries([...bootstrapRuns].map(([network, run]) => [`bootstrap:${network}`, run.rpcStats()])),
+    readyzAllow: config.readyzAllow,
+  },
+  { requestLog: process.env.LOG_LEVEL !== 'warn' && process.env.LOG_LEVEL !== 'error' },
+);
 
 const server = serve({ fetch: app.fetch, port: config.port, hostname: '0.0.0.0' }, (info) => {
-  console.log(`i-see-u listening on http://localhost:${info.port}; bootstrap (npm run bootstrap) serves partial data until publication`);
+  console.log(
+    `i-see-u listening on http://localhost:${info.port}; bootstrap (npm run bootstrap) serves partial data until publication`,
+  );
 });
 
 let shuttingDown = false;
 
 const shutdown = () => {
-  if (shuttingDown) return;
+  if (shuttingDown) {
+    return;
+  }
+
   shuttingDown = true;
   const bootstrapsStopped = Promise.all([...bootstrapRuns.values()].map((run) => run.stop()));
   server.close(async (error) => {

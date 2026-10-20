@@ -13,13 +13,28 @@ import { createRpcClient } from '../src/rpc/client.ts';
 import { address, FakeChain, gate } from './fake-chain.ts';
 import { header, stack } from './stack.ts';
 
-afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+afterEach(() => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
 
-const opsApp = (s: Awaited<ReturnType<typeof stack>>, overrides: Partial<RouteDeps> = {}, requestLog = false) => createApp({
-  adapters: { ethereum: s.adapter }, discovery: s.discovery, followers: { ethereum: s.follower },
-  balances: { ethereum: s.balances }, tails: s.tail ? { ethereum: s.tail } : undefined, requestRpc: s.requestRpc,
-  startedAt: s.clock.at, rpcStats: () => s.chain.rpc.stats(), opsSnapshot: (network) => s.store.opsSnapshot(network), ...overrides,
-}, { requestLog });
+const opsApp = (s: Awaited<ReturnType<typeof stack>>, overrides: Partial<RouteDeps> = {}, requestLog = false) =>
+  createApp(
+    {
+      adapters: { ethereum: s.adapter },
+      discovery: s.discovery,
+      followers: { ethereum: s.follower },
+      balances: { ethereum: s.balances },
+      tails: s.tail ? { ethereum: s.tail } : undefined,
+      requestRpc: s.requestRpc,
+      startedAt: s.clock.at,
+      rpcStats: () => s.chain.rpc.stats(),
+      opsSnapshot: (network) => s.store.opsSnapshot(network),
+      ...overrides,
+    },
+    { requestLog },
+  );
 
 /** Parse the complete 0.0.4 grammar used here, and check metadata and unique series. */
 const parseExposition = (body: string): Map<string, number> => {
@@ -28,15 +43,28 @@ const parseExposition = (body: string): Map<string, number> => {
   const types = new Map<string, string>();
 
   for (const line of body.trim().split('\n')) {
-    if (!line) continue;
+    if (!line) {
+      continue;
+    }
+
     const description = /^# HELP ([a-zA-Z_:][a-zA-Z0-9_:]*) .+$/.exec(line);
     const type = /^# TYPE ([a-zA-Z_:][a-zA-Z0-9_:]*) (counter|gauge|histogram)$/.exec(line);
 
-    if (description) { help.add(description[1]); continue; }
+    if (description) {
+      help.add(description[1]);
+      continue;
+    }
 
-    if (type) { types.set(type[1], type[2]); continue; }
+    if (type) {
+      types.set(type[1], type[2]);
+      continue;
+    }
 
-    const sample = /^([a-zA-Z_:][a-zA-Z0-9_:]*(?:\{[a-zA-Z_][a-zA-Z0-9_]*="(?:[^"\\\n]|\\[\\"n])*"(?:,[a-zA-Z_][a-zA-Z0-9_]*="(?:[^"\\\n]|\\[\\"n])*")*\})?) (-?(?:\d+(?:\.\d+)?(?:e[+-]?\d+)?|Inf)|NaN)$/.exec(line);
+    const sample =
+      /^([a-zA-Z_:][a-zA-Z0-9_:]*(?:\{[a-zA-Z_][a-zA-Z0-9_]*="(?:[^"\\\n]|\\[\\"n])*"(?:,[a-zA-Z_][a-zA-Z0-9_]*="(?:[^"\\\n]|\\[\\"n])*")*\})?) (-?(?:\d+(?:\.\d+)?(?:e[+-]?\d+)?|Inf)|NaN)$/.exec(
+        line,
+      );
+
     expect(sample, line).not.toBeNull();
     const key = sample![1];
     const name = key.split('{')[0];
@@ -65,7 +93,9 @@ test('ops routes retain their histogram patterns with production request logging
     await app.request('/livez');
     const m = parseExposition(await (await app.request('/metrics')).text());
     expect(m.get('http_request_duration_seconds_count{route="/livez",status="200"}')).toBe(1);
-  } finally { await s.close(); }
+  } finally {
+    await s.close();
+  }
 });
 
 test('metrics use the shared cursor, head and tail, not stale local follower state, without RPC', async () => {
@@ -94,7 +124,9 @@ test('metrics use the shared cursor, head and tail, not stale local follower sta
     expect(m.get('cursor_age_seconds{network="ethereum"}')).toBeGreaterThanOrEqual(0);
     expect(m.get('serving{network="ethereum",mode="stale"}')).toBe(1);
     expect(m.get('serving{network="ethereum",mode="full"}')).toBe(0);
-    expect(m.get('http_request_duration_seconds_count{route="/v1/:network/accounts/:address/erc20",status="200"}')).toBe(1);
+    expect(
+      m.get('http_request_duration_seconds_count{route="/v1/:network/accounts/:address/erc20",status="200"}'),
+    ).toBe(1);
     expect(m.get('http_request_duration_seconds_count{route="unmatched",status="404"}')).toBe(1);
     expect(m.get('http_request_duration_seconds_bucket{route="unmatched",status="404",le="+Inf"}')).toBe(1);
     expect(body).not.toContain(address(1));
@@ -102,7 +134,9 @@ test('metrics use the shared cursor, head and tail, not stale local follower sta
     expect(queries).toHaveBeenCalledTimes(1);
     expect(status).toHaveBeenCalledWith('ethereum', expect.objectContaining({ state: expect.any(Object) }));
     expect(chain.total).toBe(calls);
-  } finally { await s.close(); }
+  } finally {
+    await s.close();
+  }
 });
 
 test('metrics expose bootstrap applied/done/total before publication and local HyperSync quota stats', async () => {
@@ -110,8 +144,18 @@ test('metrics expose bootstrap applied/done/total before publication and local H
 
   try {
     const bootstrap = createBootstrapStore(s.db);
-    await bootstrap.createRun('ethereum', { startBlock: 100n, target: header(103n), anchor: header(99n), segmentBlocks: 2n }, s.clock.at);
-    await bootstrap.commitSegment('ethereum', { fromBlock: 102n, toBlock: 103n }, 'rpc', async () => ({ logs: 0, requests: 1 }), s.clock.at);
+    await bootstrap.createRun(
+      'ethereum',
+      { startBlock: 100n, target: header(103n), anchor: header(99n), segmentBlocks: 2n },
+      s.clock.at,
+    );
+    await bootstrap.commitSegment(
+      'ethereum',
+      { fromBlock: 102n, toBlock: 103n },
+      'rpc',
+      async () => ({ logs: 0, requests: 1 }),
+      s.clock.at,
+    );
     const app = opsApp(s, { hypersyncStats: () => ({ requests: 7, rateLimitWaits: 2 }) });
     const m = parseExposition(await (await app.request('/metrics')).text());
     expect(m.get('bootstrap_segments_total{network="ethereum"}')).toBe(2);
@@ -121,7 +165,9 @@ test('metrics expose bootstrap applied/done/total before publication and local H
     expect(m.has('finalized_cursor_block{network="ethereum"}')).toBe(false);
     expect(m.get('hypersync_requests_total{network="ethereum"}')).toBe(7);
     expect(m.get('hypersync_rate_limit_waits_total{network="ethereum"}')).toBe(2);
-  } finally { await s.close(); }
+  } finally {
+    await s.close();
+  }
 });
 
 test('metrics reuse RPC outcome stats with redacted credentials, retries, 429s and breaker state', async () => {
@@ -129,13 +175,25 @@ test('metrics reuse RPC outcome stats with redacted credentials, retries, 429s a
   const secret = 'SECRET-KEY-123';
   let requests = 0;
   vi.spyOn(Math, 'random').mockReturnValue(0);
-  vi.stubGlobal('fetch', vi.fn(async () => {
-    requests += 1;
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async () => {
+      requests += 1;
 
-    return requests === 1 ? new Response('limited', { status: 429 })
-      : new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: '0x1' }), { headers: { 'content-type': 'application/json' } });
-  }));
-  const rpc = createRpcClient({ urls: [`https://user:${secret}@primary.example/${secret}?key=${secret}`, `https://fallback.example/${secret}`], timeoutMs: 1000, maxAttempts: 2, maxRps: 1000 });
+      return requests === 1
+        ? new Response('limited', { status: 429 })
+        : new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: '0x1' }), {
+            headers: { 'content-type': 'application/json' },
+          });
+    }),
+  );
+
+  const rpc = createRpcClient({
+    urls: [`https://user:${secret}@primary.example/${secret}?key=${secret}`, `https://fallback.example/${secret}`],
+    timeoutMs: 1000,
+    maxAttempts: 2,
+    maxRps: 1000,
+  });
 
   try {
     await rpc.request('eth_blockNumber', []);
@@ -146,10 +204,20 @@ test('metrics reuse RPC outcome stats with redacted credentials, retries, 429s a
     expect(body).not.toContain('user:');
     expect(m.get('rpc_retries_total{client="runtime"}')).toBe(1);
     expect(m.get('rpc_429_total{client="runtime"}')).toBe(1);
-    expect(m.get('rpc_errors_total{client="runtime",endpoint="0:https://primary.example/***",method="eth_blockNumber",outcome="rate_limited"}')).toBe(1);
-    expect(m.get('rpc_attempts_total{client="runtime",endpoint="1:https://fallback.example/***",method="eth_blockNumber",outcome="success"}')).toBe(1);
+    expect(
+      m.get(
+        'rpc_errors_total{client="runtime",endpoint="0:https://primary.example/***",method="eth_blockNumber",outcome="rate_limited"}',
+      ),
+    ).toBe(1);
+    expect(
+      m.get(
+        'rpc_attempts_total{client="runtime",endpoint="1:https://fallback.example/***",method="eth_blockNumber",outcome="success"}',
+      ),
+    ).toBe(1);
     expect(m.get('rpc_breaker_open{client="runtime",endpoint="0:https://primary.example/***"}')).toBe(0);
-  } finally { await s.close(); }
+  } finally {
+    await s.close();
+  }
 });
 
 test('metrics reuse limiter queue depth and rejection counter', async () => {
@@ -164,7 +232,11 @@ test('metrics reuse limiter queue depth and rejection counter', async () => {
     const m = parseExposition(await (await s.app.request('/metrics')).text());
     expect(m.get('limiter_queue_depth')).toBe(1);
     expect(m.get('limiter_rejections_total')).toBe(1);
-  } finally { pause.release(); await Promise.all([active, queued]); await s.close(); }
+  } finally {
+    pause.release();
+    await Promise.all([active, queued]);
+    await s.close();
+  }
 });
 
 for (const serving of ['full', 'stale', 'partial'] as const) {
@@ -172,7 +244,10 @@ for (const serving of ['full', 'stale', 'partial'] as const) {
     const s = await stack(new FakeChain(102n), { initialize: serving !== 'partial' });
 
     try {
-      if (serving === 'full') await s.follower.tick();
+      if (serving === 'full') {
+        await s.follower.tick();
+      }
+
       const order = ['full', 'stale', 'partial'];
 
       for (const allow of ['full', 'stale', 'partial'] as const) {
@@ -181,12 +256,16 @@ for (const serving of ['full', 'stale', 'partial'] as const) {
         const json = await response.json();
         expect(json.networks[0].serving).toBe(serving);
 
-        if (serving !== 'full') expect(json.networks[0].reason).toEqual(expect.any(String));
+        if (serving !== 'full') {
+          expect(json.networks[0].reason).toEqual(expect.any(String));
+        }
       }
 
       expect((await s.app.request('/health')).status).toBe(200);
       expect((await s.app.request('/readyz')).status).toBe(serving === 'full' ? 200 : 503);
-    } finally { await s.close(); }
+    } finally {
+      await s.close();
+    }
   });
 }
 
@@ -198,14 +277,20 @@ test('livez never probes the database; readyz requires every network and fails c
     expect(await (await s.app.request('/livez')).json()).toEqual({ status: 'ok' });
     expect(status).not.toHaveBeenCalled();
     expect((await opsApp(s, { readyzAllow: 'partial' }).request('/readyz')).status).toBe(503);
-    status.mockImplementation(async (network) => ({ ready: network === 'ethereum', serving: network === 'ethereum' ? 'full' : 'stale', reason: network === 'ethereum' ? undefined : 'Old observation' }));
+    status.mockImplementation(async (network) => ({
+      ready: network === 'ethereum',
+      serving: network === 'ethereum' ? 'full' : 'stale',
+      reason: network === 'ethereum' ? undefined : 'Old observation',
+    }));
     const app = opsApp(s, { adapters: { ethereum: s.adapter, other: s.adapter } });
     const response = await app.request('/readyz');
     expect(response.status).toBe(503);
     expect((await response.json()).networks).toHaveLength(2);
     expect(() => readyMode('invalid')).toThrow('READYZ_ALLOW');
     expect(readyMode()).toBe('full');
-  } finally { await s.close(); }
+  } finally {
+    await s.close();
+  }
 });
 
 test('SERVE_ONLY loads shared read state but starts no workers or bootstrap and acquires no leadership', async () => {
@@ -213,7 +298,10 @@ test('SERVE_ONLY loads shared read state but starts no workers or bootstrap and 
   const acquire = vi.fn(async () => true);
 
   const lockedFollower = createFollower({
-    adapter: s.adapter, store: s.store, pollMs: 30_000, maxNoAdvanceMs: 1_800_000,
+    adapter: s.adapter,
+    store: s.store,
+    pollMs: 30_000,
+    maxNoAdvanceMs: 1_800_000,
     lock: { tryAcquire: acquire, held: () => false, release: async () => {} },
   });
 
@@ -233,7 +321,9 @@ test('SERVE_ONLY loads shared read state but starts no workers or bootstrap and 
     expect((await s.app.request(`/v1/ethereum/accounts/${address(1)}/erc20`)).status).toBe(200);
     await startBackground(false, [], bootstrap);
     expect(bootstrap).toHaveBeenCalledTimes(1);
-  } finally { await s.close(); }
+  } finally {
+    await s.close();
+  }
 });
 
 test('metrics report reorgs and deep-reorg wipes from the existing tail status', async () => {
@@ -250,7 +340,9 @@ test('metrics report reorgs and deep-reorg wipes from the existing tail status',
     expect(m.get('tail_reorgs_total{network="ethereum"}')).toBe(1);
     expect(m.get('tail_wipes_total{network="ethereum"}')).toBe(1);
     expect(m.has('tail_tip_block{network="ethereum"}')).toBe(false);
-  } finally { await s.close(); }
+  } finally {
+    await s.close();
+  }
 });
 
 test('the follower feeds the watchdog through its existing latest refresh when the tail is disabled', async () => {
@@ -268,22 +360,33 @@ test('the follower feeds the watchdog through its existing latest refresh when t
     chain.latest = 105n;
     await s.follower.tick();
     expect(s.follower.status().headStalled).toBe(false);
-  } finally { vi.useRealTimers(); await s.close(); }
+  } finally {
+    vi.useRealTimers();
+    await s.close();
+  }
 });
 
 test('a stalled single endpoint keeps serving RPC and clears the flag on progress', async () => {
   vi.useFakeTimers();
   let number = 104n;
-  vi.stubGlobal('fetch', vi.fn(async (_input: string, init: RequestInit) => {
-    const { method } = JSON.parse(String(init.body));
-    const block = header(number);
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (_input: string, init: RequestInit) => {
+      const { method } = JSON.parse(String(init.body));
+      const block = header(number);
 
-    const result = method === 'eth_getBlockByNumber'
-      ? { number: `0x${number.toString(16)}`, hash: block.hash, parentHash: block.parentHash, timestamp: '0x64' }
-      : method === 'eth_getLogs' ? [] : '0x1';
+      const result =
+        method === 'eth_getBlockByNumber'
+          ? { number: `0x${number.toString(16)}`, hash: block.hash, parentHash: block.parentHash, timestamp: '0x64' }
+          : method === 'eth_getLogs'
+            ? []
+            : '0x1';
 
-    return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result }), { headers: { 'content-type': 'application/json' } });
-  }));
+      return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result }), {
+        headers: { 'content-type': 'application/json' },
+      });
+    }),
+  );
   const rpc = createRpcClient({ urls: ['https://primary.example/key'], timeoutMs: 1000, maxAttempts: 1, maxRps: 1000 });
   const tracker = createHeadTracker(rpc, { cacheMs: 0, maxNoProgressMs: 100_000, headStallMs: 60_000, chain: mainnet });
   await tracker.latestHeader();
@@ -309,23 +412,59 @@ test.each(['open', 'unsupported'])('a stalled endpoint stays usable when the fal
   vi.useFakeTimers({ toFake: ['Date'] });
   let seed = true;
   vi.spyOn(Math, 'random').mockReturnValue(0);
-  vi.stubGlobal('fetch', vi.fn(async (input: string) => {
-    const block = header(104n);
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: string) => {
+      const block = header(104n);
 
-    const error = seed && input.includes('primary')
-      ? { code: -32000, message: 'temporarily unavailable' }
-      : seed && state === 'unsupported' ? { code: -32601, message: 'Method not found' } : undefined;
+      const error =
+        seed && input.includes('primary')
+          ? { code: -32000, message: 'temporarily unavailable' }
+          : seed && state === 'unsupported'
+            ? { code: -32601, message: 'Method not found' }
+            : undefined;
 
-    return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, ...(error ? { error } : { result: {
-      number: '0x68', hash: block.hash, parentHash: block.parentHash, timestamp: '0x64',
-    } }) }), { status: seed && input.includes('primary') ? 503 : 200, headers: { 'content-type': 'application/json' } });
-  }));
-  const rpc = createRpcClient({ urls: ['https://primary.example/key', 'https://fallback.example/key'], timeoutMs: 1000, maxAttempts: 2, maxRps: 1000 });
+      return new Response(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          ...(error
+            ? { error }
+            : {
+                result: {
+                  number: '0x68',
+                  hash: block.hash,
+                  parentHash: block.parentHash,
+                  timestamp: '0x64',
+                },
+              }),
+        }),
+        { status: seed && input.includes('primary') ? 503 : 200, headers: { 'content-type': 'application/json' } },
+      );
+    }),
+  );
+
+  const rpc = createRpcClient({
+    urls: ['https://primary.example/key', 'https://fallback.example/key'],
+    timeoutMs: 1000,
+    maxAttempts: 2,
+    maxRps: 1000,
+  });
+
   let penalize = () => {};
-  const request = rpc.request('eth_getBlockByNumber', ['latest', false], { onEndpoint: (trip) => { penalize = trip; } });
 
-  if (state === 'unsupported') await expect(request).rejects.toMatchObject({ kind: 'unsupported' });
-  else { await request; penalize(); }
+  const request = rpc.request('eth_getBlockByNumber', ['latest', false], {
+    onEndpoint: (trip) => {
+      penalize = trip;
+    },
+  });
+
+  if (state === 'unsupported') {
+    await expect(request).rejects.toMatchObject({ kind: 'unsupported' });
+  } else {
+    await request;
+    penalize();
+  }
 
   seed = false;
   const tracker = createHeadTracker(rpc, { cacheMs: 0, maxNoProgressMs: 100_000, headStallMs: 1000, chain: mainnet });
@@ -342,16 +481,36 @@ test('watchdog trips the exact latest endpoint after no higher head, fails over,
   vi.setSystemTime(1000);
   let primary = 104n;
   const called: string[] = [];
-  vi.stubGlobal('fetch', vi.fn(async (input: string) => {
-    called.push(input);
-    const number = input.includes('primary') ? primary : 105n;
-    const block = header(number);
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: string) => {
+      called.push(input);
+      const number = input.includes('primary') ? primary : 105n;
+      const block = header(number);
 
-    return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: {
-      number: `0x${number.toString(16)}`, hash: block.hash, parentHash: block.parentHash, timestamp: '0x64',
-    } }), { headers: { 'content-type': 'application/json' } });
-  }));
-  const rpc = createRpcClient({ urls: ['https://primary.example/secret', 'https://fallback.example/secret'], timeoutMs: 1000, maxAttempts: 1, maxRps: 1000 });
+      return new Response(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          result: {
+            number: `0x${number.toString(16)}`,
+            hash: block.hash,
+            parentHash: block.parentHash,
+            timestamp: '0x64',
+          },
+        }),
+        { headers: { 'content-type': 'application/json' } },
+      );
+    }),
+  );
+
+  const rpc = createRpcClient({
+    urls: ['https://primary.example/secret', 'https://fallback.example/secret'],
+    timeoutMs: 1000,
+    maxAttempts: 1,
+    maxRps: 1000,
+  });
+
   const tracker = createHeadTracker(rpc, { cacheMs: 0, maxNoProgressMs: 100_000, headStallMs: 60_000, chain: mainnet });
   await tracker.latestHeader();
   await vi.advanceTimersByTimeAsync(59_999);
@@ -371,17 +530,35 @@ test('a concurrent successful response cannot clear a watchdog penalty', async (
   vi.useFakeTimers();
   const pause = gate();
   let requests = 0;
-  vi.stubGlobal('fetch', vi.fn(async () => {
-    requests += 1;
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async () => {
+      requests += 1;
 
-    if (requests === 2) await pause.opened;
+      if (requests === 2) {
+        await pause.opened;
+      }
 
-    return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: '0x1' }), { headers: { 'content-type': 'application/json' } });
-  }));
-  const rpc = createRpcClient({ urls: ['https://primary.example/key', 'https://fallback.example/key'], timeoutMs: 1000, maxAttempts: 1, maxRps: 1000 });
+      return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: '0x1' }), {
+        headers: { 'content-type': 'application/json' },
+      });
+    }),
+  );
+
+  const rpc = createRpcClient({
+    urls: ['https://primary.example/key', 'https://fallback.example/key'],
+    timeoutMs: 1000,
+    maxAttempts: 1,
+    maxRps: 1000,
+  });
+
   let penalize = () => {};
 
-  await rpc.request('eth_blockNumber', [], { onEndpoint: (trip) => { penalize = trip; } });
+  await rpc.request('eth_blockNumber', [], {
+    onEndpoint: (trip) => {
+      penalize = trip;
+    },
+  });
   const inFlight = rpc.request('eth_chainId', []);
 
   try {
@@ -398,7 +575,10 @@ test('a concurrent successful response cannot clear a watchdog penalty', async (
     expect(rpc.stats().endpoints[0].state).toBe('closed');
     penalize();
     expect(rpc.stats().endpoints[0].state).toBe('open');
-  } finally { pause.release(); await inFlight; }
+  } finally {
+    pause.release();
+    await inFlight;
+  }
 });
 
 test('stalled head surfaces in tail, health and metrics, then clears after progress', async () => {
@@ -416,9 +596,14 @@ test('stalled head surfaces in tail, health and metrics, then clears after progr
     expect(s.tail!.status()).toMatchObject({ headStalled: true, healthy: false });
     const health = await (await s.app.request('/health')).json();
     expect(health.tails.ethereum.headStalled).toBe(true);
-    expect(parseExposition(await (await s.app.request('/metrics')).text()).get('head_stalled{network="ethereum"}')).toBe(1);
+    expect(
+      parseExposition(await (await s.app.request('/metrics')).text()).get('head_stalled{network="ethereum"}'),
+    ).toBe(1);
     chain.latest = 105n;
     await s.tail!.tick();
     expect(s.tail!.status()).toMatchObject({ headStalled: false, healthy: true });
-  } finally { vi.useRealTimers(); await s.close(); }
+  } finally {
+    vi.useRealTimers();
+    await s.close();
+  }
 });

@@ -5,13 +5,17 @@ import { readyMode } from './api/ops.ts';
 try {
   process.loadEnvFile(new URL('../.env', import.meta.url));
 } catch (error) {
-  if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error;
+  if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) {
+    throw error;
+  }
 }
 
 const env = (k: string, d?: string): string => {
   const v = process.env[k] ?? d;
 
-  if (v === undefined) throw new Error(`Missing env ${k}`);
+  if (v === undefined) {
+    throw new Error(`Missing env ${k}`);
+  }
 
   return v;
 };
@@ -20,7 +24,9 @@ const env = (k: string, d?: string): string => {
 const int = (k: string, d: string): number => {
   const v = Number(env(k, d));
 
-  if (!Number.isSafeInteger(v) || v < 1) throw new Error(`${k} must be a positive integer`);
+  if (!Number.isSafeInteger(v) || v < 1) {
+    throw new Error(`${k} must be a positive integer`);
+  }
 
   return v;
 };
@@ -28,19 +34,29 @@ const int = (k: string, d: string): number => {
 const bool = (k: string, d: boolean): boolean => {
   const value = env(k, d ? 'true' : 'false');
 
-  if (value === 'true' || value === '1') return true;
+  if (value === 'true' || value === '1') {
+    return true;
+  }
 
-  if (value === 'false' || value === '0') return false;
+  if (value === 'false' || value === '0') {
+    return false;
+  }
+
   throw new Error(`${k} must be true or false`);
 };
 
-const intList = (k: string, d: string): number[] => env(k, d).split(',').map((part) => {
-  const value = Number(part.trim());
+const intList = (k: string, d: string): number[] =>
+  env(k, d)
+    .split(',')
+    .map((part) => {
+      const value = Number(part.trim());
 
-  if (!Number.isSafeInteger(value) || value < 0) throw new Error(`${k} must contain non-negative integers`);
+      if (!Number.isSafeInteger(value) || value < 0) {
+        throw new Error(`${k} must contain non-negative integers`);
+      }
 
-  return value;
-});
+      return value;
+    });
 
 const isLowercaseAddress = (value: string): value is Address => /^0x[0-9a-f]{40}$/.test(value);
 
@@ -53,11 +69,18 @@ const evmTuning = {
   followerMaxRange: BigInt(int('ETH_FOLLOWER_MAX_RANGE', '500')),
 };
 
-const addresses = (k: string, value: string): Address[] => value.split(',').map((token) => token.trim().toLowerCase()).filter(Boolean).map((token) => {
-  if (!isLowercaseAddress(token)) throw new Error(`${k} must contain addresses`);
+const addresses = (k: string, value: string): Address[] =>
+  value
+    .split(',')
+    .map((token) => token.trim().toLowerCase())
+    .filter(Boolean)
+    .map((token) => {
+      if (!isLowercaseAddress(token)) {
+        throw new Error(`${k} must contain addresses`);
+      }
 
-  return token;
-});
+      return token;
+    });
 
 /** When set, replaces (not extends) each network's default list from src/networks.ts. */
 const refreshOverride = process.env.BALANCE_ALWAYS_REFRESH_TOKENS;
@@ -66,18 +89,31 @@ const refreshOverride = process.env.BALANCE_ALWAYS_REFRESH_TOKENS;
 const startBlockOverride = (() => {
   const value = process.env.START_BLOCK;
 
-  if (value === undefined || value === '') return undefined;
+  if (value === undefined || value === '') {
+    return undefined;
+  }
 
-  if (!/^\d+$/.test(value) || BigInt(value) < 1n) throw new Error('START_BLOCK must be a positive block number');
+  if (!/^\d+$/.test(value) || BigInt(value) < 1n) {
+    throw new Error('START_BLOCK must be a positive block number');
+  }
 
   return BigInt(value);
 })();
 
-const networks = Object.fromEntries(Object.values(networkRegistry).map((network) => [network.name, {
-  ...network, ...evmTuning,
-  startBlock: startBlockOverride ?? network.startBlock,
-  alwaysRefreshTokens: refreshOverride === undefined ? network.alwaysRefreshTokens : addresses('BALANCE_ALWAYS_REFRESH_TOKENS', refreshOverride),
-}]));
+const networks = Object.fromEntries(
+  Object.values(networkRegistry).map((network) => [
+    network.name,
+    {
+      ...network,
+      ...evmTuning,
+      startBlock: startBlockOverride ?? network.startBlock,
+      alwaysRefreshTokens:
+        refreshOverride === undefined
+          ? network.alwaysRefreshTokens
+          : addresses('BALANCE_ALWAYS_REFRESH_TOKENS', refreshOverride),
+    },
+  ]),
+);
 
 const ethereum = networks.ethereum;
 

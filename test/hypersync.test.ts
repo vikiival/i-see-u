@@ -62,28 +62,45 @@ const response = (logs: Log[], nextBlock: number, archiveHeight = 100): QueryRes
 });
 
 /** Answers getWithRateLimit from a script: a page, a thrown error, a 429, or (exhausted) an error. */
-const pager = (values: Array<QueryResponse | Error | 'limited'>, seen: Query[] = []): HypersyncPager & { seen: Query[] } => ({
+const pager = (
+  values: Array<QueryResponse | Error | 'limited'>,
+  seen: Query[] = [],
+): HypersyncPager & { seen: Query[] } => ({
   seen,
   async getWithRateLimit(query) {
     seen.push(query);
     const value = values.shift();
 
-    if (value instanceof Error) throw value;
+    if (value instanceof Error) {
+      throw value;
+    }
 
-    if (value === 'limited') return { rateLimit: { resetSecs: 0, remaining: 0, cost: 1000 } };
+    if (value === 'limited') {
+      return { rateLimit: { resetSecs: 0, remaining: 0, cost: 1000 } };
+    }
 
-    if (!value) throw new Error('no more pages');
+    if (!value) {
+      throw new Error('no more pages');
+    }
 
     return { response: value, rateLimit: { remaining: 14_000, cost: 1000 } };
   },
 });
 
-const clientFactory = (client: HypersyncPager): (() => Promise<HypersyncFactoryResult>) =>
+const clientFactory =
+  (client: HypersyncPager): (() => Promise<HypersyncFactoryResult>) =>
   async () => ({ client, joinNothing: 2 });
 
 const canonical = (aggregate: ChunkAggregate) => ({
-  tokens: [...aggregate.tokens].sort().map(([token, value]) => [token, { ...value, firstBlock: value.firstBlock.toString(), lastBlock: value.lastBlock.toString() }]),
-  nfts: [...aggregate.nfts].sort().map(([key, value]) => [key, { ...value, tokenId: value.tokenId.toString(), block: value.block.toString() }]),
+  tokens: [...aggregate.tokens]
+    .sort()
+    .map(([token, value]) => [
+      token,
+      { ...value, firstBlock: value.firstBlock.toString(), lastBlock: value.lastBlock.toString() },
+    ]),
+  nfts: [...aggregate.nfts]
+    .sort()
+    .map(([key, value]) => [key, { ...value, tokenId: value.tokenId.toString(), block: value.block.toString() }]),
   selfSeen: [...aggregate.selfSeen].sort(),
 });
 
@@ -124,8 +141,14 @@ test('HyperSync multi-page streaming exactly matches RPC aggregation, including 
   const waits: number[] = [];
 
   const hs = createHypersyncLogSource({
-    url: 'https://eth.hypersync.xyz', apiToken: 'token', preferredMaxRange: 100_000n, timeoutMs: 1_000,
-    clientFactory: clientFactory(hsClient), sleep: async (ms) => { waits.push(ms); },
+    url: 'https://eth.hypersync.xyz',
+    apiToken: 'token',
+    preferredMaxRange: 100_000n,
+    timeoutMs: 1_000,
+    clientFactory: clientFactory(hsClient),
+    sleep: async (ms) => {
+      waits.push(ms);
+    },
   });
 
   const rpc: RpcClient = {
@@ -133,9 +156,13 @@ test('HyperSync multi-page streaming exactly matches RPC aggregation, including 
       const filter = rpcParam<{ topics: Array<Hex | null> }>(params, 0);
       const sent = filter.topics[1] !== null;
 
-      return staged<T>(logs.flatMap((item) => (sent ? item.topics[1] === topic(ACCOUNT) : item.topics[2] === topic(ACCOUNT))
-        ? [{ ...item, blockNumber: quantity(item.blockNumber!), logIndex: quantity(item.logIndex!) }]
-        : []));
+      return staged<T>(
+        logs.flatMap((item) =>
+          (sent ? item.topics[1] === topic(ACCOUNT) : item.topics[2] === topic(ACCOUNT))
+            ? [{ ...item, blockNumber: quantity(item.blockNumber!), logIndex: quantity(item.logIndex!) }]
+            : [],
+        ),
+      );
     },
     stats: rpcStats,
   };
@@ -144,12 +171,21 @@ test('HyperSync multi-page streaming exactly matches RPC aggregation, including 
 
   try {
     const range = { fromBlock: 10n, toBlock: 20n };
-    const [fromHs, fromRpc] = await Promise.all([hs.scanAccount(ACCOUNT, range), rpcSource.scanAccount(ACCOUNT, range)]);
+
+    const [fromHs, fromRpc] = await Promise.all([
+      hs.scanAccount(ACCOUNT, range),
+      rpcSource.scanAccount(ACCOUNT, range),
+    ]);
+
     expect(canonical(fromHs.aggregate)).toEqual(canonical(fromRpc.aggregate));
     expect(fromHs.logs).toBe(4);
     expect(fromHs.calls).toBe(3);
     // Page two continues at nextBlock; the 429 sleeps for the quota window and repeats the same request.
-    expect(hsClient.seen.map((query) => [query.fromBlock, query.toBlock])).toEqual([[10, 21], [12, 21], [12, 21]]);
+    expect(hsClient.seen.map((query) => [query.fromBlock, query.toBlock])).toEqual([
+      [10, 21],
+      [12, 21],
+      [12, 21],
+    ]);
     expect(waits).toEqual([1_000]);
     expect(hsClient.seen[0]).toMatchObject({ joinMode: 2 });
     expect(hsClient.seen[0].logs).toEqual([
@@ -167,7 +203,10 @@ test('height below the inclusive range fails the primary and serves the identica
   const expected = { aggregate, calls: 2, logs: 0, heavy: false };
 
   const hs = createHypersyncLogSource({
-    url: 'https://eth.hypersync.xyz', apiToken: 'token', preferredMaxRange: 100n, timeoutMs: 1_000,
+    url: 'https://eth.hypersync.xyz',
+    apiToken: 'token',
+    preferredMaxRange: 100n,
+    timeoutMs: 1_000,
     clientFactory: clientFactory(pager([response([], 21, 19)])),
   });
 
@@ -195,14 +234,19 @@ test.each([
   const expected = { aggregate: emptyAggregate(), calls: 2, logs: 0, heavy: false };
 
   const hs = createHypersyncLogSource({
-    url: 'https://eth.hypersync.xyz', apiToken: 'VERY_SECRET', preferredMaxRange: 100n, timeoutMs: 1_000,
+    url: 'https://eth.hypersync.xyz',
+    apiToken: 'VERY_SECRET',
+    preferredMaxRange: 100n,
+    timeoutMs: 1_000,
     clientFactory: clientFactory(makeClient()),
   });
 
   const source = withFallback(hs, fixedSource('rpc', expected), { failureThreshold: 99 });
 
   try {
-    expect(await source.scanAccount(ACCOUNT, { fromBlock: 10n, toBlock: 20n })).toMatchObject({ aggregate: expected.aggregate });
+    expect(await source.scanAccount(ACCOUNT, { fromBlock: 10n, toBlock: 20n })).toMatchObject({
+      aggregate: expected.aggregate,
+    });
     expect(JSON.stringify(source.stats())).not.toContain('VERY_SECRET');
     expect(source.stats().hypersync).toMatchObject({ failures: 1, fallbacks: 1 });
   } finally {
@@ -214,7 +258,10 @@ test('a request that never answers times out without being awaited again, and th
   let calls = 0;
 
   const hs = createHypersyncLogSource({
-    url: 'https://eth.hypersync.xyz', apiToken: 'token', preferredMaxRange: 100n, timeoutMs: 10,
+    url: 'https://eth.hypersync.xyz',
+    apiToken: 'token',
+    preferredMaxRange: 100n,
+    timeoutMs: 10,
     clientFactory: clientFactory({
       getWithRateLimit: () => {
         calls += 1;
@@ -228,7 +275,9 @@ test('a request that never answers times out without being awaited again, and th
   const source = withFallback(hs, fixedSource('rpc', expected), { failureThreshold: 1 });
 
   try {
-    expect(await source.scanAccount(ACCOUNT, { fromBlock: 10n, toBlock: 20n })).toMatchObject({ aggregate: expected.aggregate });
+    expect(await source.scanAccount(ACCOUNT, { fromBlock: 10n, toBlock: 20n })).toMatchObject({
+      aggregate: expected.aggregate,
+    });
     expect(source.stats().hypersync.lastError).toContain('timed out');
     expect(calls).toBe(1);
   } finally {
@@ -244,13 +293,17 @@ test('fallback breaker skips a dead primary during cooldown and retries it after
   const primary = fixedSource('primary', result, async () => {
     attempts += 1;
 
-    if (attempts <= 2) throw new Error('down');
+    if (attempts <= 2) {
+      throw new Error('down');
+    }
 
     return result;
   });
 
   const source = withFallback(primary, fixedSource('rpc', result), {
-    failureThreshold: 2, cooldownMs: 500, now: () => clock,
+    failureThreshold: 2,
+    cooldownMs: 500,
+    now: () => clock,
   });
 
   const range: BlockRange = { fromBlock: 1n, toBlock: 1n };
@@ -270,10 +323,15 @@ test('a mid-range failure exposes no aggregate and a retry returns the complete 
   const transfer = log({ block: 15, index: 0, from: PEER, to: ACCOUNT });
 
   const source = createHypersyncLogSource({
-    url: 'https://eth.hypersync.xyz', apiToken: 'token', preferredMaxRange: 100n, timeoutMs: 1_000,
+    url: 'https://eth.hypersync.xyz',
+    apiToken: 'token',
+    preferredMaxRange: 100n,
+    timeoutMs: 1_000,
     clientFactory: clientFactory({
       async getWithRateLimit(query) {
-        if (fail && query.fromBlock !== 10) throw new Error('stream broke');
+        if (fail && query.fromBlock !== 10) {
+          throw new Error('stream broke');
+        }
 
         return { response: fail ? response([transfer], 16, 20) : response([transfer], 21, 20), rateLimit: {} };
       },

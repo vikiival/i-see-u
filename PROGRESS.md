@@ -6,25 +6,25 @@ Times are local (CEST). "We" is Viktor plus AI agents: a Claude orchestrator han
 
 ## The arc in one table
 
-| Time | Phase | Outcome |
-|---|---|---|
-| 10:15–11:06 | Research: indexer frameworks or plain RPC | Plain JSON-RPC (`eth_getLogs`) on Quicknode is the primary source. SQD and Envio are backfill or backup sources |
-| 11:06–11:52 | Scope questions and verification | Six scope answers. Quicknode probed live. REPORT rev 2 argued for global ingestion |
-| 11:52–12:10 | First build: per-account, on demand | Works end to end. Live runs exposed a stack overflow and a 720 MB SQLite file |
-| 12:58–13:10 | External review, then finalized-only | Only finalized blocks are stored. The cursor stores the block hash |
-| 13:18–14:00 | Stack swaps | Hono, vitest, `process.loadEnvFile`, viem on top of our own RpcClient |
-| 13:56–14:28 | Second review and quick fixes | Stuck-provider detection, resumable cold scans. The cost model was corrected (balances dominate) |
-| 14:23–15:23 | Chunk-size experiments (10k, 1k, 3k) | 3k blocks, a pipelined scan, aggregation during decoding, an adaptive range |
-| 15:31–15:44 | First commits and a simplify pass | 9 commits, then −636 lines with no behaviour change |
-| 15:42–15:54 | Postgres 18 and Drizzle | SQLite removed. PGlite in tests |
-| 15:54–16:21+ | Squid SDK, Envio and Ponder research | Squid SDK and Ponder rejected. HyperSync benchmarked live and is very promising for backfill |
-| 15:56–16:52 | Shared finalized follower and balance worker | Warm requests make 0 RPC calls. About 51M credits/month for 5k users |
-| 17:00– | HyperSync `LogSource` for backfill | Codex, started from Viktor's main session. Landed as an opt-in, experimental source with per-chunk RPC fallback (76 tests) |
-| 18:00–21:00 | Realtime tail with reorg handling | Jakub: realtime is part of the brief. Opus design, Codex build, Opus audit (9 bugs fixed). Tail lag 0 blocks live; 93 tests |
-| 23:50–01:15 | `/improve` audit and fixes (branch `feat/improve`) | Three parallel audits (Codex sol, 2× Opus), 5 fix plans run by Sonnet, sol and Opus in isolated worktrees, each reviewed. 115 tests; live run passed every check |
-| 11:00–13:30 | Budget: change-driven balance refresh (plan 006) | Opus built levers 1+3, 1 revision (orphaned snapshots on non-leaders). Balance sweep ~43M → ~1.6–6M credits/month; total ≈53M → ≈12–17M (estimates). 130 tests |
-| evening | SQD squid-sdk RPC source, revisited (`../disquid`) | Sonnet, source-level. Not adopted. Full blocks and unfiltered `getLogs` are hardcoded; a patch to three packages would reach our call count. Kept as a speculative spike in `../disquid` |
-| 2026-10-16 | Cancellation, Codex review and fixes | Effect not adopted; plain `AbortSignal` makes abandoned request-path work stop. Two Codex gpt-6-sol reviews: 6 of 8 and then 5 of 5 findings addressed, 2 kept by design. 166 tests |
+| Time             | Phase                                                   | Outcome                                                                                                                                                                                                                                                                                                                            |
+| ---------------- | ------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 10:15–11:06      | Research: indexer frameworks or plain RPC               | Plain JSON-RPC (`eth_getLogs`) on Quicknode is the primary source. SQD and Envio are backfill or backup sources                                                                                                                                                                                                                    |
+| 11:06–11:52      | Scope questions and verification                        | Six scope answers. Quicknode probed live. REPORT rev 2 argued for global ingestion                                                                                                                                                                                                                                                 |
+| 11:52–12:10      | First build: per-account, on demand                     | Works end to end. Live runs exposed a stack overflow and a 720 MB SQLite file                                                                                                                                                                                                                                                      |
+| 12:58–13:10      | External review, then finalized-only                    | Only finalized blocks are stored. The cursor stores the block hash                                                                                                                                                                                                                                                                 |
+| 13:18–14:00      | Stack swaps                                             | Hono, vitest, `process.loadEnvFile`, viem on top of our own RpcClient                                                                                                                                                                                                                                                              |
+| 13:56–14:28      | Second review and quick fixes                           | Stuck-provider detection, resumable cold scans. The cost model was corrected (balances dominate)                                                                                                                                                                                                                                   |
+| 14:23–15:23      | Chunk-size experiments (10k, 1k, 3k)                    | 3k blocks, a pipelined scan, aggregation during decoding, an adaptive range                                                                                                                                                                                                                                                        |
+| 15:31–15:44      | First commits and a simplify pass                       | 9 commits, then −636 lines with no behaviour change                                                                                                                                                                                                                                                                                |
+| 15:42–15:54      | Postgres 18 and Drizzle                                 | SQLite removed. PGlite in tests                                                                                                                                                                                                                                                                                                    |
+| 15:54–16:21+     | Squid SDK, Envio and Ponder research                    | Squid SDK and Ponder rejected. HyperSync benchmarked live and is very promising for backfill                                                                                                                                                                                                                                       |
+| 15:56–16:52      | Shared finalized follower and balance worker            | Warm requests make 0 RPC calls. About 51M credits/month for 5k users                                                                                                                                                                                                                                                               |
+| 17:00–           | HyperSync `LogSource` for backfill                      | Codex, started from Viktor's main session. Landed as an opt-in, experimental source with per-chunk RPC fallback (76 tests)                                                                                                                                                                                                         |
+| 18:00–21:00      | Realtime tail with reorg handling                       | Jakub: realtime is part of the brief. Opus design, Codex build, Opus audit (9 bugs fixed). Tail lag 0 blocks live; 93 tests                                                                                                                                                                                                        |
+| 23:50–01:15      | `/improve` audit and fixes (branch `feat/improve`)      | Three parallel audits (Codex sol, 2× Opus), 5 fix plans run by Sonnet, sol and Opus in isolated worktrees, each reviewed. 115 tests; live run passed every check                                                                                                                                                                   |
+| 11:00–13:30      | Budget: change-driven balance refresh (plan 006)        | Opus built levers 1+3, 1 revision (orphaned snapshots on non-leaders). Balance sweep ~43M → ~1.6–6M credits/month; total ≈53M → ≈12–17M (estimates). 130 tests                                                                                                                                                                     |
+| evening          | SQD squid-sdk RPC source, revisited (`../disquid`)      | Sonnet, source-level. Not adopted. Full blocks and unfiltered `getLogs` are hardcoded; a patch to three packages would reach our call count. Kept as a speculative spike in `../disquid`                                                                                                                                           |
+| 2026-10-16       | Cancellation, Codex review and fixes                    | Effect not adopted; plain `AbortSignal` makes abandoned request-path work stop. Two Codex gpt-6-sol reviews: 6 of 8 and then 5 of 5 findings addressed, 2 kept by design. 166 tests                                                                                                                                                |
 | 2026-10-16 to 18 | Subsquid reimplementation (`../disquid`), measured live | Claude orchestrator with Opus and Sonnet subagents; Viktor added ERC-721. RPC-only `EvmRpcDataSourceBuilder` plus our RPC layer: 103.6k blocks in 3 h for 1.02 calls/block, 18.2k calls/day at the head, 8 live reorgs handled, 0 parity mismatches against i-see-u, about 3k req/s per API process ([BENCHMARK.md](BENCHMARK.md)) |
 
 ---
@@ -44,30 +44,30 @@ Times are local (CEST). "We" is Viktor plus AI agents: a Claude orchestrator han
 
 Viktor asked for one more round of checks before any code. **Scope answers from Viktor:**
 
-| # | Question | Answer |
-|---|---|---|
-| 1 | Tokens held before block 25,933,634 and never moved since | Skip in the PoC (documented limit) |
-| 2 | Spam tokens | Return everything for now |
-| 3 | Lag behind the chain tip | "A few seconds is OK." This was later overridden by the finalized-only decision (section 4) |
-| 4 | What "interacted" means | `Transfer` in or out |
-| 5 | Native ETH balance | Skip |
-| 6 | ERC-721 response shape | Not specified. We prepared contracts plus token IDs, with optional `ownerOf` verification |
+| #   | Question                                                  | Answer                                                                                      |
+| --- | --------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| 1   | Tokens held before block 25,933,634 and never moved since | Skip in the PoC (documented limit)                                                          |
+| 2   | Spam tokens                                               | Return everything for now                                                                   |
+| 3   | Lag behind the chain tip                                  | "A few seconds is OK." This was later overridden by the finalized-only decision (section 4) |
+| 4   | What "interacted" means                                   | `Transfer` in or out                                                                        |
+| 5   | Native ETH balance                                        | Skip                                                                                        |
+| 6   | ERC-721 response shape                                    | Not specified. We prepared contracts plus token IDs, with optional `ownerOf` verification   |
 
 Our Quicknode endpoint (shared by Tali) is on a **premium plan, so 10k-block `getLogs` ranges work**.
 
 **Measurements in this phase:**
 
-| What | Result |
-|---|---|
-| Window | Block 25,933,634 was mined on 2026-09-08, so the window was about 256k blocks and grows by about 7,200 per day |
-| Unfiltered `Transfer` logs, Quicknode demo endpoint | 10 blocks: 15k logs, 9.7 MB, 0.17 s. 100 blocks: 48 MB, 0.5 s. **1,000 blocks: 701,764 logs, 446 MB, 4.0 s.** No result cap |
-| Address-filtered, 10k blocks (Binance hot wallet) | received side: 31k logs, 20 MB, 0.37 s |
-| Logs per block (dRPC samples) | 305–999, typically about 450 (about 280 KB). Quicknode samples were closer to about 700 |
-| Public RPCs | archive refused, "specify an address", "method not available", rate limited, HTTP 525. Result caps of 10k (mevblocker) and 20k (tenderly), both with a suggested sub-range in the error |
-| Multicall3 `aggregate3` with `balanceOf` | 2,000 calls are safe (about 6.8k gas each). HTTP 413 above about 1.3–1.7 MB of calldata. `eth_estimateGas` is capped at 16.7M |
-| SQD Portal | 0 head lag. Topics must be lowercase and 32-byte padded, otherwise it **silently returns 0 logs**. Frequent 529 errors on the free tier, about 0.1 MB/s |
-| HyperSync | API token required (401) |
-| Distinct (holder, token) pairs if we indexed everyone | about 15–40M, about 1.5–6 GB *(extrapolated from 300-block samples)* |
+| What                                                  | Result                                                                                                                                                                                  |
+| ----------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Window                                                | Block 25,933,634 was mined on 2026-09-08, so the window was about 256k blocks and grows by about 7,200 per day                                                                          |
+| Unfiltered `Transfer` logs, Quicknode demo endpoint   | 10 blocks: 15k logs, 9.7 MB, 0.17 s. 100 blocks: 48 MB, 0.5 s. **1,000 blocks: 701,764 logs, 446 MB, 4.0 s.** No result cap                                                             |
+| Address-filtered, 10k blocks (Binance hot wallet)     | received side: 31k logs, 20 MB, 0.37 s                                                                                                                                                  |
+| Logs per block (dRPC samples)                         | 305–999, typically about 450 (about 280 KB). Quicknode samples were closer to about 700                                                                                                 |
+| Public RPCs                                           | archive refused, "specify an address", "method not available", rate limited, HTTP 525. Result caps of 10k (mevblocker) and 20k (tenderly), both with a suggested sub-range in the error |
+| Multicall3 `aggregate3` with `balanceOf`              | 2,000 calls are safe (about 6.8k gas each). HTTP 413 above about 1.3–1.7 MB of calldata. `eth_estimateGas` is capped at 16.7M                                                           |
+| SQD Portal                                            | 0 head lag. Topics must be lowercase and 32-byte padded, otherwise it **silently returns 0 logs**. Frequent 529 errors on the free tier, about 0.1 MB/s                                 |
+| HyperSync                                             | API token required (401)                                                                                                                                                                |
+| Distinct (holder, token) pairs if we indexed everyone | about 15–40M, about 1.5–6 GB _(extrapolated from 300-block samples)_                                                                                                                    |
 
 **Doc review corrections (Opus):** Quicknode bills **every call inside a JSON-RPC batch**, so batching saves nothing. GoldRush and Ankr do serve historical holdings, but they are proprietary and cover major chains only. That still leaves the "new network" gap open.
 
@@ -79,18 +79,20 @@ The orchestrator wrote the shared contracts (`ChainAdapter`, `RpcClient`, `Store
 
 A request for a new account scanned [start, head] with two `getLogs` calls per 10k-block chunk (sent, received). Later requests scanned only the new blocks.
 
-| Account | Cold | Warm |
-|---|---|---|
-| Normal (`0x6752…`, 9 tokens) | 2.4 s, 52 calls | 13 ms, 0 calls |
-| Active (`0x5a52…`, 109 tokens) | 2.3–2.6 s, 52 calls | 19 ms |
-| Binance hot wallet (`0x28c6…`, about 2.5M transfers, 385 tokens) | 81 s, 52 calls, mostly client-side JSON parsing | 77 ms |
+| Account                                                          | Cold                                            | Warm           |
+| ---------------------------------------------------------------- | ----------------------------------------------- | -------------- |
+| Normal (`0x6752…`, 9 tokens)                                     | 2.4 s, 52 calls                                 | 13 ms, 0 calls |
+| Active (`0x5a52…`, 109 tokens)                                   | 2.3–2.6 s, 52 calls                             | 19 ms          |
+| Binance hot wallet (`0x28c6…`, about 2.5M transfers, 385 tokens) | 81 s, 52 calls, mostly client-side JSON parsing | 77 ms          |
 
 **Bugs the live run found that unit tests did not:**
+
 - `push(...bigArray)` overflowed the call stack on Binance.
 - The store journalled every transfer, which made **720 MB of SQLite for one wallet**. It changed to one aggregate row per (account, token), under 200 KB.
 - `rpcCalls` in the response always said 2.
 
 **Opus code review, 7 fixes, 22 → 27 tests:**
+
 - `isTooLarge` was true for any RPC error. One failed chunk became 15 calls.
 - Multicall halved its batch on rate limits. One request made 1,999 `eth_call`s.
 - `Retry-After` was uncapped, so a request could wait up to an hour. Capped at 10 s.
@@ -102,6 +104,7 @@ A request for a new account scanned [start, head] with two `getLogs` calls per 1
 ## 4. External review, then finalized-only (12:58–13:10)
 
 Viktor pasted an external review with six findings, all valid:
+
 1. Polling load: 5k users need about 250 RPC calls/s, but the client limit is 20/s.
 2. A reorg corrupts stored results permanently.
 3. `blockHeight` and `blockHash` could describe different blocks.
@@ -110,34 +113,38 @@ Viktor pasted an external review with six findings, all valid:
 6. Multicall still split on 401.
 
 **Decision (Viktor, 13:01): "let's try the finalized first".** Only finalized blocks are stored, the cursor saves that block's hash, and `blockHeight`/`blockHash` come from the same cursor. Responses gained `stale`/`lagBlocks`, with a 503 past a maximum age. A new `validate` option makes `null` results fail over inside the client. Multicall now splits only on size, gas or revert errors.
+
 - Bug found afterwards: `lagBlocks` was always 0, because `latest` was never fetched in finalized mode.
 - Later (14:23, section 7), Viktor confirmed: "We do not need roll-back… only finalized blocks". Responses therefore trail the tip by about 64 blocks (about 13 min). That is well beyond the "few seconds" from scope answer 3; see "Where we stand".
 
 ## 5. Stack swaps (13:18–14:00)
 
-| Change | Why |
-|---|---|
-| Fastify → **Hono** | Viktor prefers Hono. Only `routes.ts`, `server.ts` and the API tests depended on the framework. Live testing caught a bug the tests missed: the logger wrapper app made 404s plain text |
-| Hand-written `.env` parser → **`process.loadEnvFile()`** | Viktor asked why not dotenv. Node has a built-in loader, so we need neither a dependency nor our own parser |
-| `node:test` → **vitest** | Viktor asked for it. Watch mode, `vi.fn`, fake timers and `stubGlobal` replaced hand-rolled stubs |
-| viem used only for ABI encoding → **viem on top of our RpcClient** | Viktor: "Why didn't we use viem? It was literally mentioned by you." He was right; the docs implied usage the code didn't have. viem now provides types, ABIs, topic encoding, strict `decodeEventLog`, and `getBlock`/`call` |
-| Our `fetch` code → **viem `http()` transport inside RpcClient** | Viktor: "why are we handling that on our own?" We checked viem 2.57.6's source. Its retry and fallback would resend `-32005` "more than 10000 results" instead of splitting the range, miss Quicknode `-32010`, treat `null` as success, and lack a breaker and a Retry-After cap. So viem `http()` does only the transport (`retryCount: 0`, no batching), and our policy stays |
+| Change                                                             | Why                                                                                                                                                                                                                                                                                                                                                                              |
+| ------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Fastify → **Hono**                                                 | Viktor prefers Hono. Only `routes.ts`, `server.ts` and the API tests depended on the framework. Live testing caught a bug the tests missed: the logger wrapper app made 404s plain text                                                                                                                                                                                          |
+| Hand-written `.env` parser → **`process.loadEnvFile()`**           | Viktor asked why not dotenv. Node has a built-in loader, so we need neither a dependency nor our own parser                                                                                                                                                                                                                                                                      |
+| `node:test` → **vitest**                                           | Viktor asked for it. Watch mode, `vi.fn`, fake timers and `stubGlobal` replaced hand-rolled stubs                                                                                                                                                                                                                                                                                |
+| viem used only for ABI encoding → **viem on top of our RpcClient** | Viktor: "Why didn't we use viem? It was literally mentioned by you." He was right; the docs implied usage the code didn't have. viem now provides types, ABIs, topic encoding, strict `decodeEventLog`, and `getBlock`/`call`                                                                                                                                                    |
+| Our `fetch` code → **viem `http()` transport inside RpcClient**    | Viktor: "why are we handling that on our own?" We checked viem 2.57.6's source. Its retry and fallback would resend `-32005` "more than 10000 results" instead of splitting the range, miss Quicknode `-32010`, treat `null` as success, and lack a breaker and a Retry-After cap. So viem `http()` does only the transport (`retryCount: 0`, no batching), and our policy stays |
 
 Catches from the transport swap: viem caps responses at **10 MB** by default (our logs reach 446 MB), so the cap is disabled. viem's error messages contain the full URL with the API key, so they are never passed through as `cause`. Tests went from 35 to 42.
 
 ## 6. Second review, quick fixes, cost correction (13:56–14:28)
 
 A second pasted review: "tests show component correctness, not assignment completion". The new valid findings:
+
 - A stuck provider looked healthy, because `observedAt` kept resetting.
 - `null` from `getLogs` did not fail over.
 - Cold scans were all-or-nothing in memory.
 - A test assertion inside a mock was swallowed.
 
 It also corrected two of our own assumptions:
+
 - **Rescanning the tail per request does not scale.** It still costs 2 calls per request. One shared follower has to do it.
 - **"No Transfer, so the balance is unchanged" is false.** WETH `deposit`, rebasing tokens and admin actions break it. Every balance must carry the block it was read at.
 
 Quick fixes (codex):
+
 - Three separate timestamps: last success, last progress, block age.
 - `null` validation on logs.
 - Per-chunk commits that resume after a failure.
@@ -153,40 +160,42 @@ Tests went to 47. Codex ran out of usage partway through, so the rest went to Op
 
 Viktor wanted to see raw responses, so we wrote `scripts/call.sh`. The probes of 10k-block chunks filled `out/` with 90 MB.
 
-| 10k-block call | Time | Size | Logs |
-|---|---|---|---|
-| Normal account, sent / received | 0.27 / 0.21 s | 3.1 KB / 37 B | 5 / 0 |
-| Binance, received | 2.6 s | **49 MB** | 80,726 |
-| Binance, sent | 6.3 s | 7.7 MB | 12,716 |
-| Unfiltered, 10 blocks | 0.10 s | 1.6 MB | 2,613 |
+| 10k-block call                  | Time          | Size          | Logs   |
+| ------------------------------- | ------------- | ------------- | ------ |
+| Normal account, sent / received | 0.27 / 0.21 s | 3.1 KB / 37 B | 5 / 0  |
+| Binance, received               | 2.6 s         | **49 MB**     | 80,726 |
+| Binance, sent                   | 6.3 s         | 7.7 MB        | 12,716 |
+| Unfiltered, 10 blocks           | 0.10 s        | 1.6 MB        | 2,613  |
 
 By then the normal account had slowed from about 2.5 s to about 5.5 s. A plain curl showed Quicknode at 1.7–2.0 s per call, against 0.2–0.4 s in the morning. Our in-order commit window made it worse: one slow chunk at the front idled the rest. Binance hit 1.9 GB RSS and 9–12 transient errors, from 8 parallel 20–50 MB downloads against a 15 s timeout.
 
 **Jakub suggested 1k-block chunks** (smaller responses, cheap retries, under other providers' result caps). We measured before changing anything:
 
-| Chunk | Normal, cold | Binance, cold | Peak RSS | Calls/scan | Errors | Provider |
-|---|---|---|---|---|---|---|
-| 10k | 5.5–11.7 s | 64–98 s, some attempts failed | 1.9 GB | 52 | 9–12 transient | slow |
-| 1k | 36.7 s | 305 s | 733 MB | 516 | 12 transient | slow |
-| 1k, `RPC_MAX_RPS=40` | 43.8 s | stopped | | 516 | | slow |
-| **3k** | **7.8 s** | **73 s** | about 1.2 GB | **172** | **0** | fast again |
+| Chunk                | Normal, cold | Binance, cold                 | Peak RSS     | Calls/scan | Errors         | Provider   |
+| -------------------- | ------------ | ----------------------------- | ------------ | ---------- | -------------- | ---------- |
+| 10k                  | 5.5–11.7 s   | 64–98 s, some attempts failed | 1.9 GB       | 52         | 9–12 transient | slow       |
+| 1k                   | 36.7 s       | 305 s                         | 733 MB       | 516        | 12 transient   | slow       |
+| 1k, `RPC_MAX_RPS=40` | 43.8 s       | stopped                       |              | 516        |                | slow       |
+| **3k**               | **7.8 s**    | **73 s**                      | about 1.2 GB | **172**    | **0**          | fast again |
 
 Raising the RPS cap did not help 1k, so the bottleneck was per-request latency at Quicknode. The rows were not measured under equal provider conditions. **Decision: 3k blocks** (`ETH_LOGS_MAX_RANGE=3000`). It is Jakub's "smaller is safer" at 3.4k credits per new account.
 
 Then an Opus agent rebuilt the scan (47 → 58 tests):
+
 - **Pipelining:** a new chunk starts as soon as any chunk finishes, and commits stay strictly in order. Buffered chunks are capped at 2× concurrency, and the default concurrency is 8.
 - **Aggregation while decoding:** each log goes straight into per-token totals. There are no event arrays to concatenate, sort and dedupe.
 - **Split on timeout:** a timed-out multi-block `getLogs` is halved, like "too large", instead of re-downloading the same response.
 - **Adaptive per-account range,** persisted in `account_scan_range`.
 
-| Run (3k, pipelined) | Time | Calls | Peak RSS |
-|---|---|---|---|
-| Normal, concurrency 4 (provider 4–9 s per call) | 15.3 s | 172 | 152 MB |
-| Normal, concurrency 8 / 16 | 8.1 / 8.0 s | 172 | 153 MB |
-| Binance, adaptive at a 5 MB threshold | 76.2 s | 446 | 1,045 MB |
-| Binance, adaptive at a 50 MB threshold | 71.6 s | 320 | 1,107 MB |
+| Run (3k, pipelined)                             | Time        | Calls | Peak RSS |
+| ----------------------------------------------- | ----------- | ----- | -------- |
+| Normal, concurrency 4 (provider 4–9 s per call) | 15.3 s      | 172   | 152 MB   |
+| Normal, concurrency 8 / 16                      | 8.1 / 8.0 s | 172   | 153 MB   |
+| Binance, adaptive at a 5 MB threshold           | 76.2 s      | 446   | 1,045 MB |
+| Binance, adaptive at a 50 MB threshold          | 71.6 s      | 320   | 1,107 MB |
 
 **Learned:**
+
 - Normal accounts are floored by our own `RPC_MAX_RPS=20`: 172 calls take at least 8.6 s.
 - Heavy accounts are bound by download (about 1.6 GB of JSON). More scan tuning won't fix that; a faster backfill source will.
 - The 5 MB threshold cost 2.6× the calls and saved no time, so we raised it to 50 MB.
@@ -198,6 +207,7 @@ The work was committed as 9 logical commits on `poc/token-discovery`, at 15:32. 
 ## 9. Postgres 18 and Drizzle (15:42–15:54)
 
 Viktor: "We should also now set up Postgres. We agreed on that in the report." The follower needs an advisory lock and transactional cursor/upserts, so we switched before building it rather than writing the store twice.
+
 - `docker-compose.yml` with `postgres:18-alpine`. A Drizzle schema and generated SQL migrations in `drizzle/` run at startup. The `Store` became async.
 - **PGlite** (Postgres compiled to WASM) runs the same migrations in `npm test`, with no Docker needed.
 - Live: the cold backfill took 172 calls and 9.6 s, then 0 calls and 60 ms. **Port 5432 clashed with another local container**, so the host port became configurable (`POSTGRES_PORT`).
@@ -206,6 +216,7 @@ Viktor: "We should also now set up Postgres. We agreed on that in the report." T
 ## 10. Shared finalized follower and balance worker (15:36–16:52)
 
 **Why:** a parallel session (Viktor testing the API himself) proposed the shared follower, and we corrected its numbers before building:
+
 - **Our own overstatement:** it said "≈ 10–15k RPC calls/min". Under the finalized model, per-account rescans happen once per epoch, so discovery was about **1.6k calls/min**.
 - The bigger cost was **balances: one Multicall per request, about 5k calls/min** (about 4.3B credits/month).
 - So the follower alone was not enough. It had to come with a **cross-account balance worker**.
@@ -213,20 +224,21 @@ Viktor: "We should also now set up Postgres. We agreed on that in the report." T
 **The handoff rule:** track the account first, read the follower cursor C, backfill [start, C]. The follower owns every block above C.
 
 **Built (Opus):**
+
 - **Follower:** a session advisory lock elects the leader. It makes one unfiltered `getLogs` per finalized epoch (≤ 500-block ranges) and applies it to tracked accounts only.
 - **Handoff:** while the backfill runs, requests get `202 syncing`.
 - **Balance worker:** for accounts active in the last 5 min, it refreshes every 60 s and on each follower advance, with Multicall at the follower block pinned by hash. Every token carries its `balanceBlock`.
 - **Request path:** bounded limiters with a per-request deadline (503 instead of unbounded queues).
 - **Acceptance tests:** 5k tracked accounts, both handoff races, a frozen follower, single-flight balance reads, a backfill that fails midway.
 
-| Live check | Result |
-|---|---|
-| One follower advance (26,191,174 → 26,191,206) | **1 `getLogs`**, plus 2 head calls per 30 s poll |
-| Balance refresh, 109 pairs | **1 `eth_call`** |
-| 10 repeat requests | **0 RPC calls**, 7–12 ms |
-| Cold backfill under the shared 20 RPS limiter | 172 calls, about 26 s, two 202s |
-| Fake RPC: 5k accounts × 10 tokens | 1 `getLogs` per epoch, 50 `eth_call` for 50k pairs, 0 calls for 5k requests |
-| Vitalik (`0xd8dA6BF2…`) | 157 tokens after two 202s |
+| Live check                                     | Result                                                                      |
+| ---------------------------------------------- | --------------------------------------------------------------------------- |
+| One follower advance (26,191,174 → 26,191,206) | **1 `getLogs`**, plus 2 head calls per 30 s poll                            |
+| Balance refresh, 109 pairs                     | **1 `eth_call`**                                                            |
+| 10 repeat requests                             | **0 RPC calls**, 7–12 ms                                                    |
+| Cold backfill under the shared 20 RPS limiter  | 172 calls, about 26 s, two 202s                                             |
+| Fake RPC: 5k accounts × 10 tokens              | 1 `getLogs` per epoch, 50 `eth_call` for 50k pairs, 0 calls for 5k requests |
+| Vitalik (`0xd8dA6BF2…`)                        | 157 tokens after two 202s                                                   |
 
 - The agent's "Vitalik returned 0 tokens" came from a mistyped address, not a bug.
 - **Startup 503 (fixed, `2b7779c`):** the follower loaded its cursor only on its first RPC poll. `follower.load()` now reads it from Postgres before the server listens, and the server answered 200 50 ms after start. That made 66 tests.
@@ -234,30 +246,31 @@ Viktor: "We should also now set up Postgres. We agreed on that in the report." T
 
 ## 11. Squid SDK, Envio and Ponder (15:54–16:21, Ponder afterwards)
 
-| Option | Verdict | Deciding facts |
-|---|---|---|
-| `@subsquid/evm-processor` 1.30.1 (RPC mode) | **Rejected** (Sonnet, source-level) | `eth_getBlockByNumber` per block plus unfiltered `getLogs` in 10-block slices is about 36 calls per epoch against our about 2 (15–20× the credits). Fixed filters before `run()`, so no dynamic tracked set or handoff. TypeORM store, owns the main loop, GPL-3.0 |
-| SQD Pipes SDK 1.0.0-beta.8 | Rejected for now | Beta, Portal-only. Portal's free tier gave 529s at about 0.1 MB/s |
-| Envio HyperIndex | Rejected | Same reasons as the Squid SDK: a full framework with a fixed config, its own DB and its own loop |
-| **Envio HyperSync** | **Recommended backfill `LogSource`** | Benchmarked live with a free token (below) |
-| Envio HyperRPC | Untested | 403: our token is not enabled for it |
-| Ponder 0.18.1 | Rejected (no spike) | Static addresses force global ingestion. Per-block `eth_getBlockByNumber`, so 32+ calls per epoch. Reorg-aware only. Owns schema and process. See below |
+| Option                                      | Verdict                              | Deciding facts                                                                                                                                                                                                                                                     |
+| ------------------------------------------- | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `@subsquid/evm-processor` 1.30.1 (RPC mode) | **Rejected** (Sonnet, source-level)  | `eth_getBlockByNumber` per block plus unfiltered `getLogs` in 10-block slices is about 36 calls per epoch against our about 2 (15–20× the credits). Fixed filters before `run()`, so no dynamic tracked set or handoff. TypeORM store, owns the main loop, GPL-3.0 |
+| SQD Pipes SDK 1.0.0-beta.8                  | Rejected for now                     | Beta, Portal-only. Portal's free tier gave 529s at about 0.1 MB/s                                                                                                                                                                                                  |
+| Envio HyperIndex                            | Rejected                             | Same reasons as the Squid SDK: a full framework with a fixed config, its own DB and its own loop                                                                                                                                                                   |
+| **Envio HyperSync**                         | **Recommended backfill `LogSource`** | Benchmarked live with a free token (below)                                                                                                                                                                                                                         |
+| Envio HyperRPC                              | Untested                             | 403: our token is not enabled for it                                                                                                                                                                                                                               |
+| Ponder 0.18.1                               | Rejected (no spike)                  | Static addresses force global ingestion. Per-block `eth_getBlockByNumber`, so 32+ calls per epoch. Reorg-aware only. Owns schema and process. See below                                                                                                            |
 
 **HyperSync live** (window 25,933,634 to finalized; `@envio-dev/hypersync-client` 1.4.1, napi addon, loads on Node 26 darwin-arm64 with ESM):
 
-| Case | HyperSync | Quicknode today |
-|---|---|---|
-| Normal account, full window | **1 request, 0.6 s**, 219 logs, identical to Quicknode (0 diffs) | 172 calls, about 9.6 s |
-| Binance, client `stream()` | **13.0 s**, 2,548,175 logs, peak RSS 580 MB | about 73 s, about 1 GB |
-| Binance, `collect()` / sequential JSON | 19.3 s at 2.6 GB / 76.7 s | |
-| Binance, one 3k-block slice | 26,902 logs, identical to Quicknode | |
-| Follower epoch, 32 blocks unfiltered | 1 request, 150 ms, 16,777 logs (equal) | 1 call, 112 ms |
+| Case                                   | HyperSync                                                        | Quicknode today        |
+| -------------------------------------- | ---------------------------------------------------------------- | ---------------------- |
+| Normal account, full window            | **1 request, 0.6 s**, 219 logs, identical to Quicknode (0 diffs) | 172 calls, about 9.6 s |
+| Binance, client `stream()`             | **13.0 s**, 2,548,175 logs, peak RSS 580 MB                      | about 73 s, about 1 GB |
+| Binance, `collect()` / sequential JSON | 19.3 s at 2.6 GB / 76.7 s                                        |                        |
+| Binance, one 3k-block slice            | 26,902 logs, identical to Quicknode                              |                        |
+| Follower epoch, 32 blocks unfiltered   | 1 request, 150 ms, 16,777 logs (equal)                           | 1 call, 112 ms         |
 
 - **One OR query covers sent and received.** Two selections in one request return the union, with self-transfers deduplicated. Quicknode needs 2 calls.
 - **HyperSync serves the chain head (0 lag vs `latest`).** A HyperSync source must cap `to_block` at our RPC finalized block, which ran about 75 blocks behind `latest`.
 - No rate limit showed at 8 parallel requests. The client keeps the process alive until closed, and only the darwin-arm64 build was checked.
 
 **Ponder (after the HyperSync benchmark).** Viktor asked to evaluate Ponder too (`ponder` 0.18.1, MIT, Node ≥ 22.12, Postgres 14–17 only). **Rejected from its docs and source (`sync-historical`), with no spike.** The log, row and credit numbers are estimates:
+
 1. **Static addresses.** They are fixed in `ponder.config.ts`; only `factory()` is dynamic. Runtime-tracked accounts would force global ingestion: about 177M logs and 15–40M rows. There is no per-account backfill handoff.
 2. **Per-block calls.** It calls `eth_getBlockByNumber(n, true)` for every block with a matching log, and realtime fetches every block. That is ≥ 257k block calls for the backfill (about 5–10M credits) and 32+ calls per epoch against our 1–2. This is the same reason the Squid SDK was rejected.
 3. **Reorg-aware realtime** (`reorgWindow`), with no finalized-only mode.
@@ -267,6 +280,7 @@ Viktor: "We should also now set up Postgres. We agreed on that in the report." T
 ## 12. HyperSync backfill source (from 17:00, landed)
 
 After the benchmark, Viktor started a Codex worker from his main session to build the HyperSync backfill. The parallel docs work stayed out of its files. **Planned shape** (taken from the work in progress, not yet reviewed or verified):
+
 - **A new per-account `AccountLogSource` interface** in `src/core/types.ts`, with implementations in `src/sources/`:
   - `rpc-logs.ts`: today's Quicknode chunked scan.
   - `hypersync.ts`: `@envio-dev/hypersync-client` `stream()`, using the sent-or-received OR query. The native addon is loaded only on first use, so tests inject a fake.
@@ -276,6 +290,7 @@ After the benchmark, Viktor started a Codex worker from his main session to buil
 - **Unchanged:** the follower and balances stay on Quicknode. HyperSync serves the chain head, so its ranges must be capped at our RPC-finalized block.
 
 **Landed** (`9286c4f`…`6f8a812`, 76 tests):
+
 - **Source selection:** `LOG_SOURCE` defaults to `rpc`. `auto` picks HyperSync only when `HYPERSYNC_API_KEY` is set, and the native addon is imported only when it is selected.
 - **Query:** HyperSync sends one query for both directions and folds pages as they stream in (never `collect()`). It commits 100k-block chunks in order, always ending at the pinned finalized backfill target (exclusive `target + 1`).
 - **Fallback:** any HyperSync failure reruns the whole uncommitted chunk through RPC, so partial vendor data never reaches the store. After two consecutive failures, a 60 s breaker skips HyperSync.
@@ -290,13 +305,14 @@ After the benchmark, Viktor started a Codex worker from his main session to buil
 
 **Research (Opus, about 125 Quicknode calls in a live probe):**
 
-| Option | Verdict |
-|---|---|
+| Option                                                                                                                  | Verdict                                                                                                                                                                                        |
+| ----------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Tail overlay**: store every decoded Transfer of the unfinalized blocks (finalized, tip] and overlay them at read time | **Chosen.** The finalized base is never touched, so a reorg only deletes and re-ingests tail rows. Accounts tracked mid-tail are covered, and the follower, backfill and handoff are unchanged |
-| Journal plus rollback of the base tables | Rejected. Counts can be subtracted, but `LEAST`/`GREATEST` first/last block and NFT latest-wins cannot be undone without per-row before-images |
-| Quicknode Streams, WebSocket `newHeads` (billed per notification), HyperSync head | Not now. Each adds a vendor to the hot path and conflicts with "new networks with only JSON-RPC". The head source stays pluggable |
+| Journal plus rollback of the base tables                                                                                | Rejected. Counts can be subtracted, but `LEAST`/`GREATEST` first/last block and NFT latest-wins cannot be undone without per-row before-images                                                 |
+| Quicknode Streams, WebSocket `newHeads` (billed per notification), HyperSync head                                       | Not now. Each adds a vendor to the hot path and conflicts with "new networks with only JSON-RPC". The head source stays pluggable                                                              |
 
 **Measured:**
+
 - **Logs by block hash:** `eth_getLogs({blockHash})` (EIP-234) works on Quicknode, returning the same logs as by-number in 14–84 ms.
 - **Load balancing:** responses carry varying `x-node-id`. By-number queries can therefore return logs from a different fork than the header we just read, so tail logs are fetched by hash, or every `log.blockHash` is verified.
 - **Visibility:** new blocks became visible **2.0–3.8 s** (median 2.6 s) after their timestamp.
@@ -304,6 +320,7 @@ After the benchmark, Viktor started a Codex worker from his main session to buil
 **From literature:** about 4–8 reorgs per day post-merge, about 99.7% of them depth 1.
 
 **Reorg algorithm:**
+
 - **Steady state:** a new head whose parent is our tip is fetched by hash and appended.
 - **Gap:** fetch the missing headers, check that the hash chain links up, then fetch the range and verify each log's block hash.
 - **Parent mismatch:** walk back to the common ancestor (capped at 64 blocks and never below the finalized cursor), rewind, and re-ingest. If no ancestor is found, wipe the tail and serve finalized.
@@ -313,6 +330,7 @@ After the benchmark, Viktor started a Codex worker from his main session to buil
 **Cost:** polling aligned to slots (`latest` at +2.5 s, with retries) costs about 1.2 header calls plus 1 `getLogs` per block. That is about 15.8k calls per day, about **+9.5M credits/month**. Polling `finalized` only at epoch boundaries saves about 3.5M. The total becomes **about 57M/month (about 61M with per-block balances)**, within the 80M Build plan.
 
 **API:**
+
 - `?finality=latest|finalized`, defaulting to `latest`.
 - `blockHeight` becomes the tail tip; `finalizedBlockHeight`/`finalizedBlockHash` are added.
 - Per token, unfinalized sent and received counts are reported.
@@ -320,6 +338,7 @@ After the benchmark, Viktor started a Codex worker from his main session to buil
 - Balances are read at the tip hash.
 
 **Implementation:**
+
 - **Codex (gpt-5.6-sol):** built most of the brief: schema and migration 0003, compare-and-append, prune plus hash check inside the follower commit, a single repeatable-read snapshot for base and tail, the merge in the service, the reorg walk, and 10 tests. It **ran out of usage** before reporting.
 - **Opus audit:** checked the work item by item against the brief and **fixed 9 bugs**, each with a test:
   1. A lagging head exactly at the cursor height wiped the whole tail (`<` instead of `<=`).
@@ -335,30 +354,32 @@ After the benchmark, Viktor started a Codex worker from his main session to buil
 
 **Live check (Quicknode, Docker Postgres):**
 
-| What | Result |
-|---|---|
-| Tail lag vs `latest` | **0 blocks** in every sample, one block per slot |
-| Rebuild on start | 72 headers plus 1 range `getLogs` for 73 blocks (37.8k transfer rows) |
-| Steady state | about 1.26 header calls and exactly 1 `getLogs` per block |
-| Follower | advanced on the epoch kick (one epoch, 32 blocks) |
-| `?balances=true` (latest) | `blockHeight` = tip, `finalizedBlockHeight` present, 109 tokens, 30 ms. Repeats cost 0 RPC calls |
-| `?finality=finalized` | the old response shape. An invalid value gets 400 |
-| Network outage mid-run (ENOTFOUND) | the tail went unhealthy (lag 487) and served finalized with `tailError`, as designed |
-| Real reorg | none in the window (expected about 4–8 per day) |
+| What                               | Result                                                                                           |
+| ---------------------------------- | ------------------------------------------------------------------------------------------------ |
+| Tail lag vs `latest`               | **0 blocks** in every sample, one block per slot                                                 |
+| Rebuild on start                   | 72 headers plus 1 range `getLogs` for 73 blocks (37.8k transfer rows)                            |
+| Steady state                       | about 1.26 header calls and exactly 1 `getLogs` per block                                        |
+| Follower                           | advanced on the epoch kick (one epoch, 32 blocks)                                                |
+| `?balances=true` (latest)          | `blockHeight` = tip, `finalizedBlockHeight` present, 109 tokens, 30 ms. Repeats cost 0 RPC calls |
+| `?finality=finalized`              | the old response shape. An invalid value gets 400                                                |
+| Network outage mid-run (ENOTFOUND) | the tail went unhealthy (lag 487) and served finalized with `tailError`, as designed             |
+| Real reorg                         | none in the window (expected about 4–8 per day)                                                  |
 
 **Cost, re-measured:** about **53–54M credits/month** steady state for 5k users, within the Build plan's 80M.
 
 **Open items:**
+
 - No real reorg observed live yet; reorgs are covered by tests only.
 - The 5k-account acceptance test took 130 s on a loaded machine (load average 15). The same test on the pre-tail commit was even slower, so this is the environment, not a regression.
 - Balances are not refreshed per block for pairs a new block touched; the 60 s sweep remains.
-- A non-leader replica doesn't report live tail health. *(Fixed in §14: freshness now comes from the shared tip.)*
+- A non-leader replica doesn't report live tail health. _(Fixed in §14: freshness now comes from the shared tip.)_
 
 ---
 
 ## 14. Audit and hardening pass (`feat/improve`, 2026-10-15 00:00–01:15)
 
 **How:**
+
 - **Audit:** the `/improve` skill ran three read-only audits in parallel:
   - Codex gpt-5.6-sol on correctness and performance.
   - Opus on correctness, concurrency and reorgs.
@@ -368,39 +389,40 @@ After the benchmark, Viktor started a Codex worker from his main session to buil
 - **Review:** every diff was reviewed before merging (done criteria re-run, scope checked, tests read). Two plans needed one revision round each.
 - **Merge:** all five were merged on an integration branch, then fast-forwarded into `feat/improve` (`850f3ed`).
 
-| Plan | Executor | Problem | Fix |
-|---|---|---|---|
-| 001 | Sonnet | Two simultaneous first requests for one address → **500** (duplicate key on `tracked_accounts`). `/v1/constructor/…` → 500 (prototype lookup). The pg pool waited **forever** when exhausted | `ON CONFLICT DO NOTHING` + re-read the winner's target (the handoff is unchanged). `Object.hasOwn` network lookup → 404. `DB_POOL_MAX` / `DB_CONNECT_TIMEOUT_MS` → 503 "Database busy" |
-| 002 | sol | A sign-up during a follower range made it **re-download the whole range** (up to 500 blocks, billed). Steady sign-ups could stall the cursor and 503 everyone. Logs outside the requested range were accepted. The leader flag stayed `true` after the lock's DB session died | Skipped logs are kept and re-folded for newly tracked accounts (no refetch, up to 8 refolds). Out-of-range logs are a transient error. `leader` = flag ∧ `lock.held()`, false when acquire throws |
-| 003 | Opus (1 revision) | Non-leader processes always reported the tail **healthy**, so a frozen tail was served as fresh `latest`. Rewind/wipe were unfenced, so two leaders during failover could delete each other's rows. The tail grew **without bound** if finality stalled. The restart re-validation never ran (leader unknown at `load()`) | `TAIL_MAX_TIP_AGE_MS` (60 s): every process judges freshness by the shared tip block's age. `lastProgressAt` = tip block time. Rewind/wipe compare the locked tip hash (`TailConflictError`). `TAIL_MAX_AHEAD_BLOCKS` (1024) caps the tail and degrades to finalized. The first leader tick validates the stored tip |
-| 004 | sol (1 revision) | After a reorg to a **shorter** chain, balances read at the orphaned block were never replaced. One failed multicall batch **discarded the whole sweep**. A first read re-fetched **all** tokens when one was missing. A malformed outer `aggregate3` result → 500, no failover | A reorg-kicked refresh may overwrite newer snapshots (`replaceNewer`). Per-batch results; failed-batch rows are marked `transient` and not saved, so old good balances survive. Revision: the first version overwrote them with errors. Only missing tokens are read. Outer decode moved into the RPC client's `validate`, so it retries and fails over |
-| 005 | Sonnet | `verifyOwnership` had no cap, cache or single-flight (~83 calls/s at 5k users, 4× the RPS cap). Queued RPC work still ran after its request had timed out. NFT grouping was O(collections × items) | `MAX_VERIFY_OWNERSHIP_ITEMS` (2000, then `ownerStatus: skipped`). Shared lookup per (account, block hash). Limiter `deadlineAt` drops expired queued jobs. Grouping via a Map |
+| Plan | Executor          | Problem                                                                                                                                                                                                                                                                                                                   | Fix                                                                                                                                                                                                                                                                                                                                                     |
+| ---- | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 001  | Sonnet            | Two simultaneous first requests for one address → **500** (duplicate key on `tracked_accounts`). `/v1/constructor/…` → 500 (prototype lookup). The pg pool waited **forever** when exhausted                                                                                                                              | `ON CONFLICT DO NOTHING` + re-read the winner's target (the handoff is unchanged). `Object.hasOwn` network lookup → 404. `DB_POOL_MAX` / `DB_CONNECT_TIMEOUT_MS` → 503 "Database busy"                                                                                                                                                                  |
+| 002  | sol               | A sign-up during a follower range made it **re-download the whole range** (up to 500 blocks, billed). Steady sign-ups could stall the cursor and 503 everyone. Logs outside the requested range were accepted. The leader flag stayed `true` after the lock's DB session died                                             | Skipped logs are kept and re-folded for newly tracked accounts (no refetch, up to 8 refolds). Out-of-range logs are a transient error. `leader` = flag ∧ `lock.held()`, false when acquire throws                                                                                                                                                       |
+| 003  | Opus (1 revision) | Non-leader processes always reported the tail **healthy**, so a frozen tail was served as fresh `latest`. Rewind/wipe were unfenced, so two leaders during failover could delete each other's rows. The tail grew **without bound** if finality stalled. The restart re-validation never ran (leader unknown at `load()`) | `TAIL_MAX_TIP_AGE_MS` (60 s): every process judges freshness by the shared tip block's age. `lastProgressAt` = tip block time. Rewind/wipe compare the locked tip hash (`TailConflictError`). `TAIL_MAX_AHEAD_BLOCKS` (1024) caps the tail and degrades to finalized. The first leader tick validates the stored tip                                    |
+| 004  | sol (1 revision)  | After a reorg to a **shorter** chain, balances read at the orphaned block were never replaced. One failed multicall batch **discarded the whole sweep**. A first read re-fetched **all** tokens when one was missing. A malformed outer `aggregate3` result → 500, no failover                                            | A reorg-kicked refresh may overwrite newer snapshots (`replaceNewer`). Per-batch results; failed-batch rows are marked `transient` and not saved, so old good balances survive. Revision: the first version overwrote them with errors. Only missing tokens are read. Outer decode moved into the RPC client's `validate`, so it retries and fails over |
+| 005  | Sonnet            | `verifyOwnership` had no cap, cache or single-flight (~83 calls/s at 5k users, 4× the RPS cap). Queued RPC work still ran after its request had timed out. NFT grouping was O(collections × items)                                                                                                                        | `MAX_VERIFY_OWNERSHIP_ITEMS` (2000, then `ownerStatus: skipped`). Shared lookup per (account, block hash). Limiter `deadlineAt` drops expired queued jobs. Grouping via a Map                                                                                                                                                                           |
 
 **Tests:** 93 → **115**, all passing; typecheck clean. One caveat: PGlite has one connection, so the race fixes are covered by contract tests and reasoning, not a reproduced race.
 
 **Live run** (Sonnet agent, Quicknode + Docker Postgres, about 450 RPC calls in total):
 
-| Check | Result |
-|---|---|
-| Startup on a 17 h-old cursor | Listening in < 12 s. The follower caught up 2,069 blocks in about 4 min (175 calls); 503 meanwhile, as designed |
-| `/erc20?balances=true` (Vitalik) | 158 tokens, all balances ok, `finality: latest`, lag 0, `lastProgressAt` = tip time (9 s old). A repeat costs 0 calls |
-| `?finality=finalized` | Old shape, 85 blocks behind |
-| `/v1/constructor/…`, `?finality=bogus` | 404, 400 |
-| `/erc721?verifyOwnership=true` | 68 items with 1 `eth_call`. A second request 2 s later: 0 calls (shared lookup) |
-| 3 simultaneous first requests (new address) | 202 ×3, no 500. Backfill done in about 3 min, then 200 with 0 calls |
-| 5 min watch | Tail lag 0 in 11/11 samples, healthy, 0 reorgs. The follower advanced one epoch on schedule. About 1.5 header calls + 1 `getLogs` per block (was 1.26; small sample, to re-measure) |
+| Check                                       | Result                                                                                                                                                                              |
+| ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Startup on a 17 h-old cursor                | Listening in < 12 s. The follower caught up 2,069 blocks in about 4 min (175 calls); 503 meanwhile, as designed                                                                     |
+| `/erc20?balances=true` (Vitalik)            | 158 tokens, all balances ok, `finality: latest`, lag 0, `lastProgressAt` = tip time (9 s old). A repeat costs 0 calls                                                               |
+| `?finality=finalized`                       | Old shape, 85 blocks behind                                                                                                                                                         |
+| `/v1/constructor/…`, `?finality=bogus`      | 404, 400                                                                                                                                                                            |
+| `/erc721?verifyOwnership=true`              | 68 items with 1 `eth_call`. A second request 2 s later: 0 calls (shared lookup)                                                                                                     |
+| 3 simultaneous first requests (new address) | 202 ×3, no 500. Backfill done in about 3 min, then 200 with 0 calls                                                                                                                 |
+| 5 min watch                                 | Tail lag 0 in 11/11 samples, healthy, 0 reorgs. The follower advanced one epoch on schedule. About 1.5 header calls + 1 `getLogs` per block (was 1.26; small sample, to re-measure) |
 
 **Second review round (Codex, verified by Opus).** Codex found three more correctness bugs after the merge. Opus confirmed each one with a failing test (`test/regressions-audit.test.ts`) and then fixed it:
 
-| Bug | Origin | Fix |
-|---|---|---|
+| Bug                                                                                                                                                                                                                                          | Origin                                                                    | Fix                                                                                                                                                                                                                                                                |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | A is tracked; B registers while the follower processes a range that contains an A→B transfer. That log is not "skipped" (A is known), so plan 002's refold never revisited it. The cursor advances and B **permanently misses** the transfer | **Introduced by plan 002** (missed in review); the old refetch handled it | The follower keeps every log it already folded and replays it for newly tracked endpoints (no double count: they were unknown at first fold). Tests: B sends and receives, a B self-transfer, two accounts tracked in different refold rounds; still one `getLogs` |
-| A late request-path balance read from an orphaned fork overwrites the corrected balance **at the same height** (writes compared only block number) | Pre-existing | A same-height write must carry the same block hash. Only the reorg-kicked refresh at the canonical tip overwrites unconditionally |
-| A failed finalized-head poll returned the cached head with `stale: true`, but the follower ignored it and cleared `lastError`, so it reported **healthy for up to ~20 min** | Pre-existing | `refreshFailed` is set on the observation; the follower ORs `head.stale` into `stale` and sets `lastError` ("Finalized head refresh failed; serving cached head") |
+| A late request-path balance read from an orphaned fork overwrites the corrected balance **at the same height** (writes compared only block number)                                                                                           | Pre-existing                                                              | A same-height write must carry the same block hash. Only the reorg-kicked refresh at the canonical tip overwrites unconditionally                                                                                                                                  |
+| A failed finalized-head poll returned the cached head with `stale: true`, but the follower ignored it and cleared `lastError`, so it reported **healthy for up to ~20 min**                                                                  | Pre-existing                                                              | `refreshFailed` is set on the observation; the follower ORs `head.stale` into `stale` and sets `lastError` ("Finalized head refresh failed; serving cached head")                                                                                                  |
 
-Tests: 115 → **120**, all passing. Lesson: a refold optimisation must replay *every* retained event for new accounts, not only the ones it skipped. A test with a transfer **between** a known and a newly tracked account would have caught it in the first review.
+Tests: 115 → **120**, all passing. Lesson: a refold optimisation must replay _every_ retained event for new accounts, not only the ones it skipped. A test with a transfer **between** a known and a newly tracked account would have caught it in the first review.
 
 **Deliberately not planned** (real, but needs a product decision or is larger; listed in `plans/README.md`):
+
 - **Backfill credit budget or denylist:** a flood of random addresses could burn the month's credits in about 2 days, and the zero address is the worst case.
 - **Account lifecycle:** untracking idle accounts.
 - **Cross-replica backfills:** a per-account lease, so two processes don't backfill the same account.
@@ -415,14 +437,15 @@ Tests: 115 → **120**, all passing. Lesson: a refold optimisation must replay *
 
 **Problem.** The steady-state bill for 5k users × 10 tokens was about 53M of the 80M credits/month, and the balance worker was most of it (the 20-credit call rate is the only lever, so the number of calls had to drop):
 
-| Item (before) | Credits/month (estimate) |
-|---|---|
-| Balances: every pair every 60 s (50k pairs / 1000 per Multicall = 50 calls/min) | about 43M |
-| Tail (`latest` header + `getLogs` per block) | about 9–11M |
-| Follower, head polling | under 0.5M |
-| **Total** | **about 53–54M** |
+| Item (before)                                                                   | Credits/month (estimate) |
+| ------------------------------------------------------------------------------- | ------------------------ |
+| Balances: every pair every 60 s (50k pairs / 1000 per Multicall = 50 calls/min) | about 43M                |
+| Tail (`latest` header + `getLogs` per block)                                    | about 9–11M              |
+| Follower, head polling                                                          | under 0.5M               |
+| **Total**                                                                       | **about 53–54M**         |
 
 **Levers considered:**
+
 1. **Change-driven refresh.** Re-read a pair only when something may have changed. Built.
 2. **Bigger or compact batches.** 2000 per batch, or `aggregate3` replaced by a state-override balance-checker contract. Not done: needs a measurement of the Quicknode `eth_call` gas cap first.
 3. **Skip zero balances.** A zero balance only becomes non-zero through a Transfer, which lever 1 already catches. Built with lever 1.
@@ -439,12 +462,12 @@ Tests: 115 → **120**, all passing. Lesson: a refold optimisation must replay *
 
 **Cost, before vs after** (all estimates; 5k users × 10 tokens, about 1% of pairs touched per minute):
 
-| Item | Before | After |
-|---|---|---|
-| Balances | about 43M (50 calls/min) | about 1.6M (about 1.8 calls/min); about 6M if every user holds WETH/stETH |
-| Tail | about 9–11M | about 9–11M |
-| Follower and heads | under 0.5M | under 0.5M |
-| **Total steady state** | **about 53–54M** | **about 12–17M** |
+| Item                   | Before                   | After                                                                     |
+| ---------------------- | ------------------------ | ------------------------------------------------------------------------- |
+| Balances               | about 43M (50 calls/min) | about 1.6M (about 1.8 calls/min); about 6M if every user holds WETH/stETH |
+| Tail                   | about 9–11M              | about 9–11M                                                               |
+| Follower and heads     | under 0.5M               | under 0.5M                                                                |
+| **Total steady state** | **about 53–54M**         | **about 12–17M**                                                          |
 
 Cold backfill is unchanged: about 172 calls per new account, one-off.
 
@@ -458,16 +481,17 @@ Cold backfill is unchanged: about 172 calls per new account, one-off.
 
 **Round 1: fit (Sonnet).** Not adopted, not even partially:
 
-| Point | Finding |
-|---|---|
+| Point         | Finding                                                                                                                                                                                                                      |
+| ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Data coverage | Transfer logs: yes (wildcard address plus topic0, split ERC-20/721 by topic count, as we do). Balances: no block-pinned state reads, so `src/balances/reader.ts` stays. Native transfers need traces, which are out of scope |
-| Discovery | We have no address set (global index), so SQD's static `where` filters do not matter |
-| RPC cost | `eth_getBlockByNumber(n, true)` for every block, plus `eth_getLogs({fromBlock, toBlock})` with no topics per stride of 5 blocks |
-| Reorgs | `hot_change_log` rollback is roughly our tail journal. It does not give the fenced leader, prune-on-finalize, repair revision or 503 readiness |
-| Storage | TypeORM plus its own status tables beside drizzle. Using SQD only as a `DataSource` gives up the hot-block store, its main addition |
-| Validation | Stronger than ours on Ethereum: block hash, tx root, tx sender, receipts root and **logs bloom**. The bloom check is what would catch silently omitted logs (REPORT "Repair runner") |
+| Discovery     | We have no address set (global index), so SQD's static `where` filters do not matter                                                                                                                                         |
+| RPC cost      | `eth_getBlockByNumber(n, true)` for every block, plus `eth_getLogs({fromBlock, toBlock})` with no topics per stride of 5 blocks                                                                                              |
+| Reorgs        | `hot_change_log` rollback is roughly our tail journal. It does not give the fenced leader, prune-on-finalize, repair revision or 503 readiness                                                                               |
+| Storage       | TypeORM plus its own status tables beside drizzle. Using SQD only as a `DataSource` gives up the hot-block store, its main addition                                                                                          |
+| Validation    | Stronger than ours on Ethereum: block hash, tx root, tx sender, receipts root and **logs bloom**. The bloom check is what would catch silently omitted logs (REPORT "Repair runner")                                         |
 
 **Round 2: can a topic filter stop the full-block fetch?** Viktor: the stub does not matter, we can iterate on it. Not by configuration:
+
 - `squid-sdk/src/evm/rpc/source/data-source.ts` hardcodes `transactions: true`, because `evm-normalization` `mapRpcBlock` asserts every transaction is a full object. `evm-rpc`'s `Rpc.getBlockBatch` already honours `transactions: false` (header-only `eth_getBlockByNumber(n, false)`).
 - `evm-rpc/src/rpc.ts` `addLogs` sends only `fromBlock`/`toBlock`. `DataRequest` carries booleans only, and filtering is client-side (`squid-sdk/src/evm/rpc/filter/filter.ts`).
 - The `eth_getLogs` range is one stride. `strideSize` is configurable, but an unfiltered 500-block call will hit provider limits, and `addLogs` has no split on too-large.
@@ -479,77 +503,80 @@ Cold backfill is unchanged: about 172 calls per new account, one-off.
 
 **Call counts for the ~265k-block window** (derived from code, not measured):
 
-| Configuration | Block calls | `eth_getLogs` |
-|---|---|---|
-| SQD unpatched (stride 5–20) | about 265k, full transactions | about 13–53k, no topic filter |
-| SQD patched (header-only, topic0, stride 500) | about 265k headers | about 530 plus splits |
-| i-see-u follower | about 265k headers (concurrency 8) | about 530 (`ETH_FOLLOWER_MAX_RANGE=500`) plus splits |
+| Configuration                                 | Block calls                        | `eth_getLogs`                                        |
+| --------------------------------------------- | ---------------------------------- | ---------------------------------------------------- |
+| SQD unpatched (stride 5–20)                   | about 265k, full transactions      | about 13–53k, no topic filter                        |
+| SQD patched (header-only, topic0, stride 500) | about 265k headers                 | about 530 plus splits                                |
+| i-see-u follower                              | about 265k headers (concurrency 8) | about 530 (`ETH_FOLLOWER_MAX_RANGE=500`) plus splits |
 
 **Decision.** i-see-u keeps its own follower and tail. The patch is speculation, not project work: its spec lives in `../disquid/SPIKE-rpc-log-pushdown.md` (counting proxy, parity check against the unpatched source), outside this repo. If it were ever built and measured at parity, the patched source (or the Portal, if RPC-only is not a hard rule) is a candidate for the pending bootstrap, appended through `appendRange`. The logs-bloom idea can also be ported into `src/chains/evm/logs.ts` without the framework, but only with unfiltered per-block logs or receipts.
 
 ## 17. Cancellation, Codex review and fixes (2026-10-16)
 
 **Trigger.** Would Effect help this codebase? Viktor's main session concluded: no migration. The one concrete gain Effect would bring is interruption, meaning abandoned work actually stops, and plain `AbortSignal` plumbing gets most of that without a new runtime. Before this change nothing passed a signal:
-- `withDeadline` only stopped *waiting*. A request past its deadline kept its RPC work running, retries and backoff sleeps included, still billed.
+
+- `withDeadline` only stopped _waiting_. A request past its deadline kept its RPC work running, retries and backoff sleeps included, still billed.
 - The limiter dropped an expired job only once it was dequeued, so a queued waiter sat in the queue until a slot freed.
 - `scanAccountChunk` stopped the second direction only between ranges, after its in-flight `eth_getLogs` finished.
 
 **What was built (Opus, `a17f93f`).**
+
 - **RpcClient:** an optional `signal` per request. viem 2.57's http transport accepts `{ signal }` per call and merges it with its own timeout signal, so the in-flight fetch really aborts. The client checks the signal before every attempt, and the token-bucket wait and backoff sleep are abortable. An abort rejects with the signal's reason and does not count against endpoint health.
 - **Limiter and `withDeadline`:** `Limiter.run` hands the job one signal (the caller's signal plus `deadlineAt`); a queued waiter whose signal aborts leaves the queue at once. `withDeadline` answers with its timeout error, then aborts the work. A deadline is still `unavailable(...)` and a 503.
 - **Log scans:** the `failed`/`shouldStop` flags became one shared `AbortController`; the first failing direction aborts the other in flight.
-- **Balance batches:** these are shared across requests, so a batch's RPC is aborted only when the *last* waiting request gives up (deadline, or client disconnect via the request's own signal). Later requests for those pairs then start a fresh read instead of joining the abandoned one.
+- **Balance batches:** these are shared across requests, so a batch's RPC is aborted only when the _last_ waiting request gives up (deadline, or client disconnect via the request's own signal). Later requests for those pairs then start a fresh read instead of joining the abandoned one.
 - **Ownership sweep:** shared through the per-block cache, so it runs under its own deadline rather than any one request's signal.
 
 **Review (Codex gpt-6-sol, read-only, high effort).** It found no listener leak, unhandled rejection or wrong deadline→503 mapping in the commit. All 8 findings were re-checked against the code:
 
-| Finding | Verdict | Fix |
-|---|---|---|
-| `wireLog` looped forever on an empty or all-null topic list | Confirmed (malformed HyperSync data only) | Loop guard (`a62c9fb`) |
-| Ownership RPC failures of kind `fatal` (e.g. 401) became a 500; balances already gave 503 | Confirmed | Wrapped as `unavailable(...)` like balances (`a62c9fb`) |
-| Owner cache kept results with transient per-item errors until the block changed | Confirmed | Single flight kept; such results are evicted (`a62c9fb`) |
-| `Limiter.run` read the clock twice; a negative `AbortSignal.timeout` throws `RangeError` → 500 | Confirmed (rare) | One clock read (`a62c9fb`) |
-| `withDeadline` leaked its timer if the work threw synchronously | Confirmed (no current caller does) | Work runs inside a promise executor (`a62c9fb`) |
-| Bootstrap imported HyperSync plumbing from the diagnostic source; log field list duplicated | Confirmed | New `src/sources/hypersync-wire.ts` with one `LOG_FIELDS` (Sonnet subagent, `6137103`) |
-| Partial multicall success hides a 401/429 in one chunk | Not changed | Plan 004's intended partial-result semantics |
-| Ownership sweep ignores client disconnects | Not changed | Deliberate: shared sweep, bounded by its deadline |
+| Finding                                                                                        | Verdict                                   | Fix                                                                                    |
+| ---------------------------------------------------------------------------------------------- | ----------------------------------------- | -------------------------------------------------------------------------------------- |
+| `wireLog` looped forever on an empty or all-null topic list                                    | Confirmed (malformed HyperSync data only) | Loop guard (`a62c9fb`)                                                                 |
+| Ownership RPC failures of kind `fatal` (e.g. 401) became a 500; balances already gave 503      | Confirmed                                 | Wrapped as `unavailable(...)` like balances (`a62c9fb`)                                |
+| Owner cache kept results with transient per-item errors until the block changed                | Confirmed                                 | Single flight kept; such results are evicted (`a62c9fb`)                               |
+| `Limiter.run` read the clock twice; a negative `AbortSignal.timeout` throws `RangeError` → 500 | Confirmed (rare)                          | One clock read (`a62c9fb`)                                                             |
+| `withDeadline` leaked its timer if the work threw synchronously                                | Confirmed (no current caller does)        | Work runs inside a promise executor (`a62c9fb`)                                        |
+| Bootstrap imported HyperSync plumbing from the diagnostic source; log field list duplicated    | Confirmed                                 | New `src/sources/hypersync-wire.ts` with one `LOG_FIELDS` (Sonnet subagent, `6137103`) |
+| Partial multicall success hides a 401/429 in one chunk                                         | Not changed                               | Plan 004's intended partial-result semantics                                           |
+| Ownership sweep ignores client disconnects                                                     | Not changed                               | Deliberate: shared sweep, bounded by its deadline                                      |
 
 **Second review (Codex gpt-6-sol, read-only, on the four commits `77e3925..fa26745`).** It again found no unhandled rejection, listener leak or deadline→500 mapping. All 5 findings were confirmed and addressed in `5212360`:
 
-| Finding | Fix |
-|---|---|
+| Finding                                                                                                                                                                                                   | Fix                                                                                                                                               |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **High:** when one of a request's balance batches failed, the request still counted as waiting on its other batches, so they kept spending RPC credits after the 503. This gap came from the first commit | `withDeadline` also aborts the work when it rejects; a test fails one batch and asserts its sibling is aborted (verified to fail without the fix) |
-| README claimed an abandoned batch saves nothing; a `saveBalances` already in progress still commits | Kept the behaviour (the read is paid for and exact at its block) and corrected the README |
-| The shared-batch test used different accounts, so joining an in-flight read for the same pair was untested | New test: two requests for one pair share one read until both leave |
-| The route deadline test passed without cancellation (`FakeChain` ignored the signal) and its name described the old behaviour | `FakeChain` records `eth_call` signals; the renamed test asserts the in-flight Multicall is aborted |
-| REPORT said every ownership RPC failure is a 503; a sweep where only some chunks fail still returns per-item errors | Reworded: a failed sweep is the 503 |
+| README claimed an abandoned batch saves nothing; a `saveBalances` already in progress still commits                                                                                                       | Kept the behaviour (the read is paid for and exact at its block) and corrected the README                                                         |
+| The shared-batch test used different accounts, so joining an in-flight read for the same pair was untested                                                                                                | New test: two requests for one pair share one read until both leave                                                                               |
+| The route deadline test passed without cancellation (`FakeChain` ignored the signal) and its name described the old behaviour                                                                             | `FakeChain` records `eth_call` signals; the renamed test asserts the in-flight Multicall is aborted                                               |
+| REPORT said every ownership RPC failure is a 503; a sweep where only some chunks fail still returns per-item errors                                                                                       | Reworded: a failed sweep is the 503                                                                                                               |
 
 **Tests:** 147 → **166**. New coverage shows aborted work makes no further RPC attempts (limiter, RpcClient, log scans, and the balance route end to end), that a shared balance batch is aborted only by its last waiter, and each review fix. Under file parallelism, `npm test` sometimes hits Vitest's 5 s timeout on PGlite-heavy files; HEAD before these changes did the same (plan 007). Serial runs pass.
-
 
 ## 18. Subsquid reimplementation, measured live (`../disquid`, 2026-10-16 to 18)
 
 **Trigger.** §16 rejected the SQD RPC source on paper. Viktor knows squid well and wanted the assignment re-implemented on the latest SDK (`@subsquid/squid-sdk` 0.6.2, the newest release): `EvmRpcDataSourceBuilder`, RPC only, no Portal, start block 26,104,555 for simplicity, GraphQL from squid, and a schema ready for ERC-721/1155. A Claude orchestrator wrote the design (`../disquid/DESIGN.md`, the schema) and split the work among parallel subagents on disjoint files:
 
-| Piece | Agent | Result |
-|---|---|---|
-| SDK survey | Opus, read-only | Confirmed §16's three cost issues. Found two more: `retryAttempts` is 0 and there is no request timeout, so one 429 exits the processor; and **a head reorg crashes the processor**, because `ForkException` carries one ref and `findRollbackIndex` returns -1 ("Unable to process fork") |
-| Processor and standards | Sonnet | A decoder registry with several decoders per topic0. A fold into one `AccountToken` row per (account, token, standard). `Block` headers kept for canonicality checks |
-| RPC layer (`src/source`) | Opus | `DiscoveryRpcSourceBuilder extends EvmRpcDataSourceBuilder`. Header-only blocks, topic0 pushdown with range splitting, block-hash membership check with refetch by hash, retries and timeouts, slot-aligned head polling, cached finalized head, and fork ancestry rebuilt by parent hash. No `node_modules` patch |
-| GraphQL API | Opus | `tokenDiscovery` reads the rows and the head block (height, hash, time) in one snapshot, with keyset pagination. Balances: Multicall3 pinned to the block hash, coalesced across requests, change-driven LRU cache |
-| Token metadata | Sonnet | name/symbol/decimals in one Multicall3 per 50 new tokens, `bytes32` symbols decoded, PENDING tokens retried and swept |
-| ERC-721 | Viktor | `NftItem` keeps the current owner per item (last `to` wins) |
-| Reviews | Opus (code), Codex gpt-6-luna (architecture) | Code: no critical defects; open items are balance-cache honesty, gas starvation in shared Multicalls, a lagging balance node and a 20 ms coalescing window that is too short. Architecture: keep the global index, fix serving, storage and spam |
+| Piece                    | Agent                                        | Result                                                                                                                                                                                                                                                                                                             |
+| ------------------------ | -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| SDK survey               | Opus, read-only                              | Confirmed §16's three cost issues. Found two more: `retryAttempts` is 0 and there is no request timeout, so one 429 exits the processor; and **a head reorg crashes the processor**, because `ForkException` carries one ref and `findRollbackIndex` returns -1 ("Unable to process fork")                         |
+| Processor and standards  | Sonnet                                       | A decoder registry with several decoders per topic0. A fold into one `AccountToken` row per (account, token, standard). `Block` headers kept for canonicality checks                                                                                                                                               |
+| RPC layer (`src/source`) | Opus                                         | `DiscoveryRpcSourceBuilder extends EvmRpcDataSourceBuilder`. Header-only blocks, topic0 pushdown with range splitting, block-hash membership check with refetch by hash, retries and timeouts, slot-aligned head polling, cached finalized head, and fork ancestry rebuilt by parent hash. No `node_modules` patch |
+| GraphQL API              | Opus                                         | `tokenDiscovery` reads the rows and the head block (height, hash, time) in one snapshot, with keyset pagination. Balances: Multicall3 pinned to the block hash, coalesced across requests, change-driven LRU cache                                                                                                 |
+| Token metadata           | Sonnet                                       | name/symbol/decimals in one Multicall3 per 50 new tokens, `bytes32` symbols decoded, PENDING tokens retried and swept                                                                                                                                                                                              |
+| ERC-721                  | Viktor                                       | `NftItem` keeps the current owner per item (last `to` wins)                                                                                                                                                                                                                                                        |
+| Reviews                  | Opus (code), Codex gpt-6-luna (architecture) | Code: no critical defects; open items are balance-cache honesty, gas starvation in shared Multicalls, a lagging balance node and a 20 ms coalescing window that is too short. Architecture: keep the global index, fix serving, storage and spam                                                                   |
 
 **Viktor: "run it first, optimize after".** The orchestrator had queued the RPC optimisation before the first live run. The processor was started on the **stock** builder instead, and it worked end to end with 0 parity mismatches over 2k blocks. It also showed that **database writes, not RPC, limited catch-up** (8–12 blocks/s, with the handler no faster than the stream). The optimised source swapped in with a one-line change and resumed from the database at 14–15 blocks/s.
 
 **Zero-value Transfers.** Measured on our raw data: they make up 8.4% of pairs and 12.6% of accounts, so they are skipped at ingest. Most spam is fake tokens moving non-zero amounts, so a verified-token list is still needed. With metadata, a fake "USDT" now displays `USDT`.
 
 **Re-index with every change (Sonnet).** 103,617 blocks in 2 h 59 min:
+
 - 106,084 RPC calls, about 2.1M credits.
 - 0 mismatches for ERC-20, ERC-721 pairs and NFT owners.
 
 It then followed the head for 34.6 h:
+
 - 18.2k calls/day.
 - **8 real reorgs**, each 1 block deep, all rolled back. This is the first live reorg evidence for either implementation.
 - A DNS outage of the RPC host, retried without a crash.
@@ -559,6 +586,7 @@ The detached processes were later killed with the agent session that started the
 **API load (localhost, one process).** About 3,000 req/s, with p50 3.2 ms and p99 5.9 ms at 10 connections. With balances and every pair a cache miss, 44 req/s at p50 104 ms. The assignment's 5k users per minute is about 83 req/s.
 
 **Scale discussion.** A million users in total means discovery cannot be per-account on demand: one global index of all Transfers is the long-term design, and its cost does not grow with the number of users. At 15 GB per 114.6k blocks, storage is the next limit. About 550 B/row (string ids, three indexes) compares with i-see-u's 240 B/row. Open items:
+
 - multi-RPC failover via `EvmFallbackDataSourceBuilder` with custom sources;
 - a verified/spam tier;
 - a balance cache shared in Postgres;
@@ -571,46 +599,46 @@ All numbers, method and caveats: [BENCHMARK.md](BENCHMARK.md).
 
 ## Mistakes and reversals (the interesting part)
 
-| What happened | What we changed |
-|---|---|
-| Recommended viem, then didn't use it, and the docs implied we did | Integrated viem honestly. Our policy stays where viem's would cost money (`-32005` retries) |
-| Hand-wrote an `.env` parser | `process.loadEnvFile()` |
-| Global ingestion in REPORT rev 2, then built per-account | Final design: tracked accounts plus a follower. Global ingestion is documented as the alternative (REPORT §1.1) |
-| "Rescan the tail per request" plan | Wrong for scale (2 calls per request). Replaced by the shared follower |
-| "No Transfer means the balance is unchanged" | False (WETH, rebasing). Balances are re-read on a cadence and carry `balanceBlock`. The cost estimate went from 19M to about 51M/month |
-| Reorg rollback by deleting pairs above the fork | Invalid (it cannot restore counts or NFT ownership). Replaced by finalized-only |
-| Overstated discovery cost ("10–15k calls/min") | Corrected to about 1.6k/min. Balances (about 5k/min) were the real problem |
-| Per-transfer journal (720 MB for one wallet) | Per-token aggregates |
-| 5 MB adaptive threshold | It cost 2.6× the calls for no gain, so 50 MB |
-| Benchmarks under a changing provider | Re-measured, and every table states the provider conditions |
-| `pkill -f src/server.ts` in benchmarks | Killed Viktor's server once. Narrow patterns only since |
-| A 46 s cold request in Viktor's own test | Contention with a parallel benchmark on the same endpoint, plus a wrong test address. Re-measured at 3.3 s |
-| Plan 005 dropped expired *queued* jobs, but work already running past its deadline kept going | Running attempts, retries and backoff kept spending credits. `AbortSignal` cancellation now stops them (§17) |
-| Parallel test timeouts after the cancellation change looked like a regression | The unchanged baseline failed the same way on one run in two; it is PGlite load (plan 007), not the change |
-| The orchestrator queued the RPC optimisation before any live run (disquid) | Viktor: run first. The stock run showed database writes, not RPC, limited catch-up |
-| Expected the zero-value skip to remove most spam | Measured 8.4% of pairs. Fake tokens with non-zero amounts dominate, so a verified list is needed |
-| Detached `nohup` processes started by a subagent | Killed with that agent's session after 34.6 h. Long runs belong to a supervisor or the main session |
+| What happened                                                                                 | What we changed                                                                                                                        |
+| --------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| Recommended viem, then didn't use it, and the docs implied we did                             | Integrated viem honestly. Our policy stays where viem's would cost money (`-32005` retries)                                            |
+| Hand-wrote an `.env` parser                                                                   | `process.loadEnvFile()`                                                                                                                |
+| Global ingestion in REPORT rev 2, then built per-account                                      | Final design: tracked accounts plus a follower. Global ingestion is documented as the alternative (REPORT §1.1)                        |
+| "Rescan the tail per request" plan                                                            | Wrong for scale (2 calls per request). Replaced by the shared follower                                                                 |
+| "No Transfer means the balance is unchanged"                                                  | False (WETH, rebasing). Balances are re-read on a cadence and carry `balanceBlock`. The cost estimate went from 19M to about 51M/month |
+| Reorg rollback by deleting pairs above the fork                                               | Invalid (it cannot restore counts or NFT ownership). Replaced by finalized-only                                                        |
+| Overstated discovery cost ("10–15k calls/min")                                                | Corrected to about 1.6k/min. Balances (about 5k/min) were the real problem                                                             |
+| Per-transfer journal (720 MB for one wallet)                                                  | Per-token aggregates                                                                                                                   |
+| 5 MB adaptive threshold                                                                       | It cost 2.6× the calls for no gain, so 50 MB                                                                                           |
+| Benchmarks under a changing provider                                                          | Re-measured, and every table states the provider conditions                                                                            |
+| `pkill -f src/server.ts` in benchmarks                                                        | Killed Viktor's server once. Narrow patterns only since                                                                                |
+| A 46 s cold request in Viktor's own test                                                      | Contention with a parallel benchmark on the same endpoint, plus a wrong test address. Re-measured at 3.3 s                             |
+| Plan 005 dropped expired _queued_ jobs, but work already running past its deadline kept going | Running attempts, retries and backoff kept spending credits. `AbortSignal` cancellation now stops them (§17)                           |
+| Parallel test timeouts after the cancellation change looked like a regression                 | The unchanged baseline failed the same way on one run in two; it is PGlite load (plan 007), not the change                             |
+| The orchestrator queued the RPC optimisation before any live run (disquid)                    | Viktor: run first. The stock run showed database writes, not RPC, limited catch-up                                                     |
+| Expected the zero-value skip to remove most spam                                              | Measured 8.4% of pairs. Fake tokens with non-zero amounts dominate, so a verified list is needed                                       |
+| Detached `nohup` processes started by a subagent                                              | Killed with that agent's session after 34.6 h. Long runs belong to a supervisor or the main session                                    |
 
 ---
 
 ## Where we stand (against ASSIGNMENT.md)
 
-| Requirement | Status | Notes |
-|---|---|---|
-| ETH mainnet from block 25,933,634 to now, "almost realtime" | ✅ | Realtime tail with reorg handling (§13): 0 blocks behind `latest` live, about 3 s after block time. `?finality=finalized` remains available |
-| Technology choice with reasons | ✅ | REPORT §6 |
-| REST endpoint: ERC-20 tokens the address interacted with | ✅ | `GET /v1/ethereum/accounts/{addr}/erc20` |
-| Balance parameter | ✅ | `?balances=true`. Each token has its own `balanceBlock` |
-| Block height the data is valid for | ✅ | `blockHeight` + `blockHash` (the tail tip with `finality=latest`, the follower cursor with `finalized`), `finalizedBlockHeight`, `balancesAtBlockHeight` |
-| Modular (adapter-style) | ✅ / ⚠️ | `ChainAdapter`, `Store` and `RpcClient` are interfaces, and a new EVM chain is a config entry. A per-account `AccountLogSource` (RPC, HyperSync, with fallback) is in progress (§12) |
-| Scales to 5k users polling every minute | ✅ / ⚠️ | 0 RPC calls per warm request. A fake-RPC acceptance test covers 5k accounts. No live HTTP load test. Multi-replica hardened in §14 (race-safe tracking, truthful leadership, shared tail freshness, fenced tail writes); still no cross-replica backfill dedupe |
-| Unreliable RPC: slow, errors, rate limits, lagging | ✅ | RpcClient classification, backoff, breaker, failover, validate. Follower lag, `stale` and 503. Work a request abandons (deadline, disconnect) is cancelled, so slow RPC does not keep billing (§17) |
-| README and documented limits | ✅ | README "Limits", REPORT §7 |
-| Not a full indexer | ✅ | Only `Transfer` logs, only for tracked accounts, aggregated per (account, token) |
-| RPC-efficient (paid per request) | ✅ | About 12–17M credits/month steady state for 5k users at 10 tokens each (estimate; Build plan has 80M, was about 53–54M before the change-driven balance refresh, §15). Balance cost now scales with Transfer activity. Cold backfill is 172 calls per account |
-| BONUS: ERC-721 discovery and endpoint | ✅ | `/erc721`: collections plus token IDs, `?verifyOwnership=true` via `ownerOf` |
-| Own repository, shared | ⚠️ | Pushed (private) to github.com/vikiival/i-see-u, including `feat/improve`; collaborators not added yet |
-| Presentation (30 min + Q&A, Thursday) | ❌ | To do. This log and REPORT are the basis |
+| Requirement                                                 | Status  | Notes                                                                                                                                                                                                                                                           |
+| ----------------------------------------------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ETH mainnet from block 25,933,634 to now, "almost realtime" | ✅      | Realtime tail with reorg handling (§13): 0 blocks behind `latest` live, about 3 s after block time. `?finality=finalized` remains available                                                                                                                     |
+| Technology choice with reasons                              | ✅      | REPORT §6                                                                                                                                                                                                                                                       |
+| REST endpoint: ERC-20 tokens the address interacted with    | ✅      | `GET /v1/ethereum/accounts/{addr}/erc20`                                                                                                                                                                                                                        |
+| Balance parameter                                           | ✅      | `?balances=true`. Each token has its own `balanceBlock`                                                                                                                                                                                                         |
+| Block height the data is valid for                          | ✅      | `blockHeight` + `blockHash` (the tail tip with `finality=latest`, the follower cursor with `finalized`), `finalizedBlockHeight`, `balancesAtBlockHeight`                                                                                                        |
+| Modular (adapter-style)                                     | ✅ / ⚠️ | `ChainAdapter`, `Store` and `RpcClient` are interfaces, and a new EVM chain is a config entry. A per-account `AccountLogSource` (RPC, HyperSync, with fallback) is in progress (§12)                                                                            |
+| Scales to 5k users polling every minute                     | ✅ / ⚠️ | 0 RPC calls per warm request. A fake-RPC acceptance test covers 5k accounts. No live HTTP load test. Multi-replica hardened in §14 (race-safe tracking, truthful leadership, shared tail freshness, fenced tail writes); still no cross-replica backfill dedupe |
+| Unreliable RPC: slow, errors, rate limits, lagging          | ✅      | RpcClient classification, backoff, breaker, failover, validate. Follower lag, `stale` and 503. Work a request abandons (deadline, disconnect) is cancelled, so slow RPC does not keep billing (§17)                                                             |
+| README and documented limits                                | ✅      | README "Limits", REPORT §7                                                                                                                                                                                                                                      |
+| Not a full indexer                                          | ✅      | Only `Transfer` logs, only for tracked accounts, aggregated per (account, token)                                                                                                                                                                                |
+| RPC-efficient (paid per request)                            | ✅      | About 12–17M credits/month steady state for 5k users at 10 tokens each (estimate; Build plan has 80M, was about 53–54M before the change-driven balance refresh, §15). Balance cost now scales with Transfer activity. Cold backfill is 172 calls per account   |
+| BONUS: ERC-721 discovery and endpoint                       | ✅      | `/erc721`: collections plus token IDs, `?verifyOwnership=true` via `ownerOf`                                                                                                                                                                                    |
+| Own repository, shared                                      | ⚠️      | Pushed (private) to github.com/vikiival/i-see-u, including `feat/improve`; collaborators not added yet                                                                                                                                                          |
+| Presentation (30 min + Q&A, Thursday)                       | ❌      | To do. This log and REPORT are the basis                                                                                                                                                                                                                        |
 
 ## Next
 

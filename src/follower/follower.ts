@@ -34,7 +34,9 @@ export function createFollower(o: FollowerOptions): Follower {
 
     for (let start = from; start <= to; start += BigInt(concurrency)) {
       const count = Number(to - start + 1n < BigInt(concurrency) ? to - start + 1n : BigInt(concurrency));
-      headers.push(...await Promise.all(Array.from({ length: count }, (_, i) => adapter.headerByNumber(start + BigInt(i)))));
+      headers.push(
+        ...(await Promise.all(Array.from({ length: count }, (_, i) => adapter.headerByNumber(start + BigInt(i))))),
+      );
     }
 
     return headers;
@@ -60,25 +62,45 @@ export function createFollower(o: FollowerOptions): Follower {
 
       const head = await adapter.finalizedHead();
 
-      if (head.stale || head.refreshFailed) throw new Error('Finalized head observation is stale');
+      if (head.stale || head.refreshFailed) {
+        throw new Error('Finalized head observation is stale');
+      }
+
       await store.observeHead(adapter.network, head.block, now());
       state = (await store.indexState(adapter.network))!;
       const target = state.head!;
 
       if (target.number === state.cursor.number && target.hash !== state.cursor.hash) {
-        await store.enqueueRepair(adapter.network, { fromBlock: target.number, toBlock: target.number }, 'Finalized head hash changed', now());
+        await store.enqueueRepair(
+          adapter.network,
+          { fromBlock: target.number, toBlock: target.number },
+          'Finalized head hash changed',
+          now(),
+        );
         throw new ChainGapError('Finalized head hash changed');
       }
 
-      for (let ranges = 0; !stopped && state.cursor.number < target.number && ranges < (o.maxRangesPerTick ?? 8); ranges += 1) {
-        if (o.lock && !o.lock.held()) throw new Error('Follower leadership lost');
+      for (
+        let ranges = 0;
+        !stopped && state.cursor.number < target.number && ranges < (o.maxRangesPerTick ?? 8);
+        ranges += 1
+      ) {
+        if (o.lock && !o.lock.held()) {
+          throw new Error('Follower leadership lost');
+        }
+
         const end = state.cursor.number + adapter.followerMaxRange;
         const range = { fromBlock: state.cursor.number + 1n, toBlock: end < target.number ? end : target.number };
         const blocks = await fetchHeaders(range.fromBlock, range.toBlock);
 
         if (blocks[0].parentHash !== state.cursor.hash) {
           const suspect = state.cursor.number < state.startBlock ? state.startBlock : state.cursor.number;
-          await store.enqueueRepair(adapter.network, { fromBlock: suspect, toBlock: suspect }, 'Next range parent hash mismatch', now());
+          await store.enqueueRepair(
+            adapter.network,
+            { fromBlock: suspect, toBlock: suspect },
+            'Next range parent hash mismatch',
+            now(),
+          );
           throw new ChainGapError('Next range parent hash mismatch');
         }
 
@@ -92,7 +114,10 @@ export function createFollower(o: FollowerOptions): Follower {
           const transfers = await adapter.transfersInRange(range, blocks);
           await store.appendRange(adapter.network, range, blocks, transfers, now());
         } catch (error) {
-          if (error instanceof ChainGapError) await store.enqueueRepair(adapter.network, range, error.message, now());
+          if (error instanceof ChainGapError) {
+            await store.enqueueRepair(adapter.network, range, error.message, now());
+          }
+
           throw error;
         }
 
@@ -108,28 +133,43 @@ export function createFollower(o: FollowerOptions): Follower {
   };
 
   const tick = (): Promise<void> => {
-    ticking ??= run().finally(() => { ticking = undefined; });
+    ticking ??= run().finally(() => {
+      ticking = undefined;
+    });
 
     return ticking;
   };
 
   return {
     tick,
-    async load() { state = await store.indexState(adapter.network); },
+    async load() {
+      state = await store.indexState(adapter.network);
+    },
     start() {
-      if (loop) return;
+      if (loop) {
+        return;
+      }
+
       stopped = false;
       loop = (async () => {
         while (!stopped) {
           kicked = false;
           await tick();
 
-          if (stopped) break;
+          if (stopped) {
+            break;
+          }
 
-          if (kicked) continue;
+          if (kicked) {
+            continue;
+          }
+
           await new Promise<void>((resolve) => {
             const timer = setTimeout(resolve, o.pollMs);
-            wake = () => { clearTimeout(timer); resolve(); };
+            wake = () => {
+              clearTimeout(timer);
+              resolve();
+            };
           });
         }
       })();
@@ -143,19 +183,40 @@ export function createFollower(o: FollowerOptions): Follower {
       leader = false;
       await o.lock?.release();
     },
-    kick() { kicked = true; wake(); },
+    kick() {
+      kicked = true;
+      wake();
+    },
     status(): FollowerStatus {
       const cursor = state?.cursor;
       const headNumber = state?.head?.number;
-      const lagBlocks = cursor && headNumber !== undefined && headNumber > cursor.number ? headNumber - cursor.number : 0n;
+
+      const lagBlocks =
+        cursor && headNumber !== undefined && headNumber > cursor.number ? headNumber - cursor.number : 0n;
+
       const lastAdvanceAt = cursor?.updatedAt ?? 0;
 
-      const unhealthy = !state?.head ? 'Global index awaits bootstrap or finalized head'
-        : state.pendingRepair ? 'Global index has pending repairs'
-        : lagBlocks > 0n ? `Global index is ${lagBlocks} blocks behind finalized`
-        : lastError ?? (now() - lastAdvanceAt > o.maxNoAdvanceMs ? 'Global index has not advanced recently enough' : undefined);
+      const unhealthy = !state?.head
+        ? 'Global index awaits bootstrap or finalized head'
+        : state.pendingRepair
+          ? 'Global index has pending repairs'
+          : lagBlocks > 0n
+            ? `Global index is ${lagBlocks} blocks behind finalized`
+            : (lastError ??
+              (now() - lastAdvanceAt > o.maxNoAdvanceMs ? 'Global index has not advanced recently enough' : undefined));
 
-      return { headStalled: adapter.headStalled?.() ?? false, ready: unhealthy === undefined, leader: leader && (o.lock?.held() ?? true), cursor, headNumber, lagBlocks, lastAdvanceAt, lastError, stale: unhealthy !== undefined, unhealthy };
+      return {
+        headStalled: adapter.headStalled?.() ?? false,
+        ready: unhealthy === undefined,
+        leader: leader && (o.lock?.held() ?? true),
+        cursor,
+        headNumber,
+        lagBlocks,
+        lastAdvanceAt,
+        lastError,
+        stale: unhealthy !== undefined,
+        unhealthy,
+      };
     },
   };
 }

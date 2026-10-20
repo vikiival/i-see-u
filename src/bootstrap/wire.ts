@@ -20,7 +20,11 @@ export interface ConfiguredBootstrap {
   stats: () => { rpc: BootstrapSourceStats; hypersync?: BootstrapSourceStats; rpcMethods: Record<string, number> };
 }
 
-export function runConfiguredBootstrap(config: Pick<AppConfig, 'bootstrap' | 'rpc'>, network: AppConfig['ethereum'], deps: { store: Store; bootstrap: BootstrapStore; log: (message: string) => void; lock?: Pick<LeaderLock, 'release'> }): ConfiguredBootstrap {
+export function runConfiguredBootstrap(
+  config: Pick<AppConfig, 'bootstrap' | 'rpc'>,
+  network: AppConfig['ethereum'],
+  deps: { store: Store; bootstrap: BootstrapStore; log: (message: string) => void; lock?: Pick<LeaderLock, 'release'> },
+): ConfiguredBootstrap {
   const b = config.bootstrap;
   const controller = new AbortController();
   const { signal } = controller;
@@ -34,19 +38,37 @@ export function runConfiguredBootstrap(config: Pick<AppConfig, 'bootstrap' | 'rp
   const adapter = createEvmAdapter(cancellableRpc, { ...network, network: network.name });
   const rpc = createRpcBootstrapSource(cancellableRpc, { logRange: b.rpcLogRange });
 
-  const hypersync = b.hypersyncApiKey === undefined ? undefined : createHypersyncBootstrapSource({
-    url: b.hypersyncUrl, apiToken: b.hypersyncApiKey, idleMs: b.hypersyncIdleMs,
-    clientFactory: () => nativeHypersyncClient(b.hypersyncUrl, b.hypersyncApiKey!, b.hypersyncIdleMs),
-    onRateLimit: (waitMs) => deps.log(`HyperSync quota exhausted; waiting ${Math.round(waitMs / 1000)} s`),
-    signal,
-  });
+  const hypersync =
+    b.hypersyncApiKey === undefined
+      ? undefined
+      : createHypersyncBootstrapSource({
+          url: b.hypersyncUrl,
+          apiToken: b.hypersyncApiKey,
+          idleMs: b.hypersyncIdleMs,
+          clientFactory: () => nativeHypersyncClient(b.hypersyncUrl, b.hypersyncApiKey!, b.hypersyncIdleMs),
+          onRateLimit: (waitMs) => deps.log(`HyperSync quota exhausted; waiting ${Math.round(waitMs / 1000)} s`),
+          signal,
+        });
 
-  if (!hypersync) deps.log('HYPERSYNC_API_KEY is not set: RPC-only bootstrap (one eth_getBlockByNumber per header)');
+  if (!hypersync) {
+    deps.log('HYPERSYNC_API_KEY is not set: RPC-only bootstrap (one eth_getBlockByNumber per header)');
+  }
 
   const done = runBootstrap({
-    network: network.name, startBlock: network.startBlock, adapter, index: deps.store, store: deps.bootstrap, hypersync, rpc,
-    segmentBlocks: b.segmentBlocks, headerChunkBlocks: b.headerChunkBlocks, rpcWorkers: b.rpcWorkers, workMem: b.workMem, maintenanceWorkMem: b.maintenanceWorkMem,
-    log: deps.log, signal,
+    network: network.name,
+    startBlock: network.startBlock,
+    adapter,
+    index: deps.store,
+    store: deps.bootstrap,
+    hypersync,
+    rpc,
+    segmentBlocks: b.segmentBlocks,
+    headerChunkBlocks: b.headerChunkBlocks,
+    rpcWorkers: b.rpcWorkers,
+    workMem: b.workMem,
+    maintenanceWorkMem: b.maintenanceWorkMem,
+    log: deps.log,
+    signal,
   }).finally(() => deps.lock?.release());
 
   return {
@@ -56,6 +78,10 @@ export function runConfiguredBootstrap(config: Pick<AppConfig, 'bootstrap' | 'rp
       await done.catch(() => {});
     },
     rpcStats: rpcClient.stats,
-    stats: () => ({ rpc: rpc.stats(), ...(hypersync && { hypersync: hypersync.stats() }), rpcMethods: rpcClient.stats().byMethod }),
+    stats: () => ({
+      rpc: rpc.stats(),
+      ...(hypersync && { hypersync: hypersync.stats() }),
+      rpcMethods: rpcClient.stats().byMethod,
+    }),
   };
 }

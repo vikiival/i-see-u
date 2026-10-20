@@ -5,7 +5,11 @@ import { assertStartBlock } from './bootstrap.ts';
 import { runConfiguredBootstrap } from './wire.ts';
 
 const log = (message: string) => console.log(`[bootstrap ${new Date().toISOString().slice(11, 19)}] ${message}`);
-const { store, bootstrap, bootstrapLock } = await openPostgresStore(config.databaseUrl, { max: config.bootstrap.rpcWorkers + 4 });
+
+const { store, bootstrap, bootstrapLock } = await openPostgresStore(config.databaseUrl, {
+  max: config.bootstrap.rpcWorkers + 4,
+});
+
 let exitCode = 0;
 
 for (const network of Object.values(config.networks)) {
@@ -14,13 +18,18 @@ for (const network of Object.values(config.networks)) {
   try {
     await assertStartBlock(store, bootstrap, network.name, network.startBlock);
 
-    if (!await lock.tryAcquire()) throw new Error(`Another bootstrap of ${network.name} is running`);
+    if (!(await lock.tryAcquire())) {
+      throw new Error(`Another bootstrap of ${network.name} is running`);
+    }
+
     log(`${network.name}: start block ${network.startBlock}`);
     const run = runConfiguredBootstrap(config, network, { store, bootstrap, log });
 
     try {
       const result = await run.done;
-      log(`${network.name}: ${result.status === 'done' ? `${result.transfers} transfers through ${result.target} in ${result.seconds}s` : 'index already initialized; nothing to do'}`);
+      log(
+        `${network.name}: ${result.status === 'done' ? `${result.transfers} transfers through ${result.target} in ${result.seconds}s` : 'index already initialized; nothing to do'}`,
+      );
     } finally {
       log(`${network.name} source stats: ${JSON.stringify(run.stats())}`);
     }

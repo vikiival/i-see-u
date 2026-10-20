@@ -31,17 +31,29 @@ const integer = (value: unknown): value is number => isNumber(value) && Number.i
  * instead of parking silently inside the native client. Completes only when `nextBlock` reaches `toBlock`, so an early
  * end can never look complete.
  */
-export async function* hypersyncPages(client: HypersyncPager, query: Query, o: PageOptions): AsyncGenerator<QueryResponse> {
-  const sleep = (ms: number) => o.sleep ? abortable(o.sleep(ms), o.signal) : delay(ms, undefined, { signal: o.signal });
+export async function* hypersyncPages(
+  client: HypersyncPager,
+  query: Query,
+  o: PageOptions,
+): AsyncGenerator<QueryResponse> {
+  const sleep = (ms: number) =>
+    o.sleep ? abortable(o.sleep(ms), o.signal) : delay(ms, undefined, { signal: o.signal });
+
   const end = query.toBlock;
 
-  if (end === undefined || !integer(query.fromBlock) || !integer(end) || end <= query.fromBlock) throw new Error('HyperSync query needs a bounded block range');
+  if (end === undefined || !integer(query.fromBlock) || !integer(end) || end <= query.fromBlock) {
+    throw new Error('HyperSync query needs a bounded block range');
+  }
+
   let next = query.fromBlock;
 
   while (next < end) {
     o.signal?.throwIfAborted();
 
-    if (o.aborted?.()) throw new Error('HyperSync pagination aborted');
+    if (o.aborted?.()) {
+      throw new Error('HyperSync pagination aborted');
+    }
+
     let timer: ReturnType<typeof setTimeout> | undefined;
     const request = client.getWithRateLimit({ ...query, fromBlock: next });
     request.catch(() => {}); // abandoned after a timeout: never awaited again, never an unhandled rejection
@@ -68,17 +80,29 @@ export async function* hypersyncPages(client: HypersyncPager, query: Query, o: P
       continue;
     }
 
-    if (!integer(response.archiveHeight) || response.archiveHeight < end - 1) throw new Error('HyperSync archive height is below the requested range');
+    if (!integer(response.archiveHeight) || response.archiveHeight < end - 1) {
+      throw new Error('HyperSync archive height is below the requested range');
+    }
 
-    if (!integer(response.nextBlock) || response.nextBlock <= next || response.nextBlock > end) throw new Error('HyperSync page did not advance');
+    if (!integer(response.nextBlock) || response.nextBlock <= next || response.nextBlock > end) {
+      throw new Error('HyperSync page did not advance');
+    }
 
-    if (!response.data || !Array.isArray(response.data.logs) || !Array.isArray(response.data.blocks)) throw new Error('HyperSync returned malformed data');
+    if (!response.data || !Array.isArray(response.data.logs) || !Array.isArray(response.data.blocks)) {
+      throw new Error('HyperSync returned malformed data');
+    }
+
     next = response.nextBlock;
 
     yield response;
 
     // Out of quota for this window: wait now rather than spend a request on a 429.
-    if (next < end && integer(rateLimit?.remaining) && integer(rateLimit.cost) && rateLimit.remaining < rateLimit.cost) {
+    if (
+      next < end &&
+      integer(rateLimit?.remaining) &&
+      integer(rateLimit.cost) &&
+      rateLimit.remaining < rateLimit.cost
+    ) {
       const waitMs = ((integer(rateLimit.resetSecs) ? rateLimit.resetSecs : 30) + 1) * 1_000;
       o.onRateLimit?.(waitMs);
       await sleep(waitMs);
@@ -90,7 +114,12 @@ export async function* hypersyncPages(client: HypersyncPager, query: Query, o: P
 export const redactSecrets = (raw: string, secrets: string[]): string => {
   let message = raw;
 
-  for (const secret of secrets) if (secret) message = message.split(secret).join('[redacted]');
+  for (const secret of secrets) {
+    if (secret) {
+      message = message.split(secret).join('[redacted]');
+    }
+  }
+
   message = message
     .replace(/(api[-_ ]?key|api[-_ ]?token|authorization)\s*[:=]\s*\S+/gi, '$1=[redacted]')
     .replace(/(https?:\/\/[^\s/]+)\/\S+/gi, '$1/***');

@@ -26,13 +26,18 @@ export interface EvmAdapterOptions {
 
 /** Any EVM chain with a plain JSON-RPC endpoint: differs only by options. */
 export function createEvmAdapter(rpc: RpcClient, o: EvmAdapterOptions): ChainAdapter {
-  const head = createHeadTracker(rpc, { cacheMs: o.headCacheMs ?? HEAD_CACHE_MS, maxNoProgressMs: o.finalizedMaxNoProgressMs, chain: o.chain, headStallMs: o.headStallMs });
+  const head = createHeadTracker(rpc, {
+    cacheMs: o.headCacheMs ?? HEAD_CACHE_MS,
+    maxNoProgressMs: o.finalizedMaxNoProgressMs,
+    chain: o.chain,
+    headStallMs: o.headStallMs,
+  });
 
   return {
     network: o.network,
     startBlock: o.startBlock,
     followerMaxRange: o.followerMaxRange,
-    normalizeAddress: (input) => isAddress(input, { strict: false }) ? toLowerHex(input) : undefined,
+    normalizeAddress: (input) => (isAddress(input, { strict: false }) ? toLowerHex(input) : undefined),
     finalizedHead: head.finalizedHead,
     cachedLatestBlockNumber: head.latestBlockNumber,
     latestHeader: head.latestHeader,
@@ -40,7 +45,9 @@ export function createEvmAdapter(rpc: RpcClient, o: EvmAdapterOptions): ChainAda
     headerByNumber: head.blockByNumber,
     transfersInBlock: (blockHash) => transfersInBlock(rpc, blockHash),
     transfersInRange: (range, headers) => transfersInRange(rpc, range, headers),
-    erc20BalancePairs: (pairs, blockHash, signal) => readErc20BalancePairs(rpc, pairs, blockHash, o.multicallBatch, o.multicall3, signal),
-    erc721Owners: (items, blockHash, signal) => readErc721Owners(rpc, items, blockHash, o.multicallBatch, o.multicall3, signal),
+    erc20BalancePairs: (pairs, blockHash, signal) =>
+      readErc20BalancePairs(rpc, pairs, blockHash, o.multicallBatch, o.multicall3, signal),
+    erc721Owners: (items, blockHash, signal) =>
+      readErc721Owners(rpc, items, blockHash, o.multicallBatch, o.multicall3, signal),
   };
 }

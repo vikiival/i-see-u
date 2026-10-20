@@ -31,19 +31,19 @@ Runtime config loads `.env` with Node; already exported environment variables ta
 
 ## API
 
-| Endpoint | Behavior |
-|---|---|
-| `GET /v1/ethereum/accounts/{address}/erc20` | All ERC-20 contracts with a Transfer in or out from the start block to the served block |
-| `…/erc20?balances=true` | Same discovery plus balances pinned to the served block hash (tail tip, or finalized cursor) |
-| `…?finality=latest` (default) / `…?finality=finalized` | Any account endpoint: tip view with unfinalized overlay, or the finalized index only |
-| `GET /v1/ethereum/accounts/{address}/erc721` | Interacted collections and currently owned token IDs according to indexed logs |
-| `…/erc721?verifyOwnership=true` | Optional pinned `ownerOf` checks for held items, subject to the configured cap |
-| `GET /v1/ethereum/accounts/{address}/transfers?limit=50` | Raw ERC-20/ERC-721 transfers newest first; `limit` is 1–200 |
-| `…/transfers?limit=50&before={next}` | Next keyset page; use the previous response's `next` unchanged |
-| `GET /health` | Shared database readiness per network, local follower and tail diagnostics (tip, lag, reorgs, errors) and redacted RPC stats; `serving` per network; 503 only on a failed database probe |
-| `GET /livez` | Always 200 `{ "status": "ok" }`; no database or RPC access |
-| `GET /readyz` | 200 when every network meets `READYZ_ALLOW` (default `full`), otherwise 503; per-network serving mode and reason |
-| `GET /metrics` | Prometheus text exposition (`text/plain; version=0.0.4`); shared DB progress and local process diagnostics |
+| Endpoint                                                 | Behavior                                                                                                                                                                                 |
+| -------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET /v1/ethereum/accounts/{address}/erc20`              | All ERC-20 contracts with a Transfer in or out from the start block to the served block                                                                                                  |
+| `…/erc20?balances=true`                                  | Same discovery plus balances pinned to the served block hash (tail tip, or finalized cursor)                                                                                             |
+| `…?finality=latest` (default) / `…?finality=finalized`   | Any account endpoint: tip view with unfinalized overlay, or the finalized index only                                                                                                     |
+| `GET /v1/ethereum/accounts/{address}/erc721`             | Interacted collections and currently owned token IDs according to indexed logs                                                                                                           |
+| `…/erc721?verifyOwnership=true`                          | Optional pinned `ownerOf` checks for held items, subject to the configured cap                                                                                                           |
+| `GET /v1/ethereum/accounts/{address}/transfers?limit=50` | Raw ERC-20/ERC-721 transfers newest first; `limit` is 1–200                                                                                                                              |
+| `…/transfers?limit=50&before={next}`                     | Next keyset page; use the previous response's `next` unchanged                                                                                                                           |
+| `GET /health`                                            | Shared database readiness per network, local follower and tail diagnostics (tip, lag, reorgs, errors) and redacted RPC stats; `serving` per network; 503 only on a failed database probe |
+| `GET /livez`                                             | Always 200 `{ "status": "ok" }`; no database or RPC access                                                                                                                               |
+| `GET /readyz`                                            | 200 when every network meets `READYZ_ALLOW` (default `full`), otherwise 503; per-network serving mode and reason                                                                         |
+| `GET /metrics`                                           | Prometheus text exposition (`text/plain; version=0.0.4`); shared DB progress and local process diagnostics                                                                               |
 
 Published-index discovery responses identify `blockHeight`, `blockHash`, `blockTimestamp`, `finality` and the network start block. **`finality=latest` (default)** serves the tail tip: `blockHeight`/`blockHash` are the tip, `finalizedBlockHeight`/`finalizedBlockHash` the finalized cursor below it. Counts include unfinalized Transfers and name that part as `unfinalizedSentCount`/`unfinalizedReceivedCount`; NFTs received in tail blocks carry `unfinalized: true`, NFTs sent in tail blocks disappear. If the finalized index is stale, or the tail is unhealthy, empty, or its tip is older than `TAIL_MAX_TIP_AGE_MS`, the response is the finalized view with `finality: "finalized"` and a `tailError` explaining why; index readiness never causes a 503. A disabled tail serves finalized only. **`finality=finalized`** always serves the cursor without overlay and without `tailError`. `lastProgressAt` is the tip's block time (latest) or the cursor commit time (finalized); `lagBlocks` is the latest-head distance. Blocks, uint256 values, token IDs and **sent/received counts are decimal strings**. Historical NFT movements live in `/transfers`; the NFT endpoint no longer stores one historical held flag per account/item. Burned NFTs have no current holder.
 
@@ -51,14 +51,14 @@ History merges two bounded indexed scans per table (finalized `transfers`, and w
 
 Readiness and serving mode are shared by every replica. Like a Subsquid GraphQL API, account reads always expose what the database holds with honest metadata; clients decide whether it is fresh enough. `/health` returns HTTP 200 whenever its database probes succeed, exposes `networks[].serving`, and retains `ready: false` and `status: "not_ready"` for stale/partial data. A failed database status probe returns 503 with `Retry-After: 5` and a reason, without a serving mode for that network.
 
-| Mode/state | HTTP | Account data |
-|---|---|---|
-| `full` | 200 | `status: "ready"`, `complete: true`, current finalized cursor or usable latest tail |
-| `stale`: any lag, old/missing observation, stalled progress | 200 | `status: "ready"`, `complete: true`, `stale: true`, `staleReason`; stored snapshot at cursor height/hash, no tail |
-| `stale`: pending repair | 200 | Same cursor snapshot, `repairPending: true` and `note` that repaired rows and derived counts/ownership may change |
-| `stale`: cursor/head hash mismatch at the same height | 200 | Same cursor snapshot, `headHashMismatch: true`; `staleReason: "Global index head hash mismatch"` means the finalized cursor block disagrees with the observed head |
-| `partial`: bootstrap or no run/index | 200 | `status: "partial"`, `complete: false`; applied bootstrap segments only, or empty data before a run, no tail |
-| DB/RPC/queue/deadline failure | 503 + `Retry-After` | Genuine inability to answer; no readiness-based rejection |
+| Mode/state                                                  | HTTP                | Account data                                                                                                                                                       |
+| ----------------------------------------------------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `full`                                                      | 200                 | `status: "ready"`, `complete: true`, current finalized cursor or usable latest tail                                                                                |
+| `stale`: any lag, old/missing observation, stalled progress | 200                 | `status: "ready"`, `complete: true`, `stale: true`, `staleReason`; stored snapshot at cursor height/hash, no tail                                                  |
+| `stale`: pending repair                                     | 200                 | Same cursor snapshot, `repairPending: true` and `note` that repaired rows and derived counts/ownership may change                                                  |
+| `stale`: cursor/head hash mismatch at the same height       | 200                 | Same cursor snapshot, `headHashMismatch: true`; `staleReason: "Global index head hash mismatch"` means the finalized cursor block disagrees with the observed head |
+| `partial`: bootstrap or no run/index                        | 200                 | `status: "partial"`, `complete: false`; applied bootstrap segments only, or empty data before a run, no tail                                                       |
+| DB/RPC/queue/deadline failure                               | 503 + `Retry-After` | Genuine inability to answer; no readiness-based rejection                                                                                                          |
 
 Stale reasons, in priority order: `Global index has pending repairs`, `Global index head hash mismatch`, `Global index awaits finalized head observation`, `Global index has not reached the finalized head`, `Finalized head observation is too old`, or `Global index has not advanced recently enough`. Repair and mismatch flags are independent, so both may appear. `blockHeight`/`blockHash` stay at the follower cursor; `followerLagBlocks` is the last observed finalized-head distance (0 if unknown) and `lagBlocks` the cached latest-head distance (0 if unknown). There is no maximum serving lag or age. Account requests do not refresh heads or schedule ingestion. A latest request degraded for index staleness reports the same reason in `tailError`; explicit finalized reads omit `tailError`.
 
@@ -125,13 +125,13 @@ Balances are read **only when a request asks for them**; nothing refreshes accou
 
 **Cost at 1M accounts** (assumptions: every account polls once a minute, 20 ERC-20 holdings each, 1,000 pairs per call, 20 credits per `eth_call`, finalized cursor advancing once per 6.4-minute epoch, ~5M Transfers/day, 10% of accounts holding one always-refresh token). The table is for `finality=finalized`; with the default latest view, Transfer-touched pairs are the same, but always-refresh pairs are re-read on every poll (each minute sees a new tip): 100k × 1,440 = 144M pairs/day (~144k full calls, ~2.9M credits), and a reorg adds re-reads of pairs whose snapshot block was orphaned. The tail itself costs one `latest` header poll + one `eth_getLogs({ blockHash })` per block (~7,200 of each per day, independent of users), plus at most two extra polls in a slot whose block is late.
 
-| | Pairs/day | Calls/day | Credits/day |
-|---|---|---|---|
-| Re-read on every request, perfectly batched | 28.8B | 28.8M | 576M |
-| Reuse: Transfer-touched pairs (≤ 2 × 5M) | ≤ 10M | | |
-| Reuse: always-refresh (100k × 225 epochs) | 22.5M | | |
-| Reuse total, batches full | ~32.5M | ~33k | ~0.65M |
-| Reuse total, 25 ms window (~9 pairs per batch at ~376 pairs/s) | ~32.5M | ≤ 3.5M | ≤ 69M |
+|                                                                | Pairs/day | Calls/day | Credits/day |
+| -------------------------------------------------------------- | --------- | --------- | ----------- |
+| Re-read on every request, perfectly batched                    | 28.8B     | 28.8M     | 576M        |
+| Reuse: Transfer-touched pairs (≤ 2 × 5M)                       | ≤ 10M     |           |             |
+| Reuse: always-refresh (100k × 225 epochs)                      | 22.5M     |           |             |
+| Reuse total, batches full                                      | ~32.5M    | ~33k      | ~0.65M      |
+| Reuse total, 25 ms window (~9 pairs per batch at ~376 pairs/s) | ~32.5M    | ≤ 3.5M    | ≤ 69M       |
 
 Unchanged polls cost no RPC, so cost follows real balance changes. At this load the window, not the pair count, bounds calls: 250 ms gives ≤ 346k calls (≤ 7M credits) per day for ≤ 250 ms extra latency. One-time first reads add 20M pairs (≈ 0.4M credits batched). Each replica batches independently, so multiply the window bound by the replica count.
 
@@ -159,40 +159,40 @@ All database conversions are in `src/store/columns.ts` plus the name-to-ID regis
 
 ## Configuration
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `RPC_URL`, `RPC_FALLBACK_URLS` | required, empty | Primary and comma-separated fallback RPC endpoints |
-| `DATABASE_URL` | local `iseeu` PostgreSQL database | Connection string |
-| `START_BLOCK` | 25933634 | Network start block S (plain number); must match the stored index or bootstrap run |
-| `BOOTSTRAP_ON_START` | false | Run the bootstrap inside `npm start` when the index is missing |
-| `BOOTSTRAP_RPC_WORKERS`, `BOOTSTRAP_RPC_LOG_RANGE`, `BOOTSTRAP_RPC_TIMEOUT_MS` | 4, 100, 60000 | Quicknode segment workers, blocks per `eth_getLogs`, bulk call timeout |
-| `BOOTSTRAP_SEGMENT_BLOCKS`, `BOOTSTRAP_HEADER_CHUNK_BLOCKS` | 1000, 5000 | Segment (commit/resume unit) and header-request sizes |
-| `BOOTSTRAP_MAINTENANCE_WORK_MEM` | 1GB | `maintenance_work_mem` for the finalize index builds |
-| `HYPERSYNC_API_KEY`, `HYPERSYNC_URL`, `HYPERSYNC_TIMEOUT_MS` | unset, `https://eth.hypersync.xyz`, 120000 | Optional bootstrap source; per-request idle timeout |
-| `PORT` | 3000 | HTTP port |
-| `SERVE_ONLY` | false | API replica only; skip background indexing/bootstrap and leader locks |
-| `READYZ_ALLOW` | full | Minimum accepted readiness: `full`, `stale` (also full), or `partial` (all modes) |
-| `HEAD_STALL_MS` | 60000 | Leader latest-head watchdog threshold; penalize the returning endpoint if no higher head appears |
-| `RPC_TIMEOUT_MS`, `RPC_MAX_ATTEMPTS`, `RPC_MAX_RPS` | 15000, 6, 20 | Timeout, retry budget, shared outgoing rate cap |
-| `ETH_FOLLOWER_MAX_RANGE` | 500 (maximum 1000) | Unfiltered log range; large responses require bounded memory |
-| `FOLLOWER_POLL_MS` | 30000 | Finalized-head poll interval |
-| `FOLLOWER_MAX_RANGES_PER_TICK` | 8 | Bounded catch-up per tick |
-| `FOLLOWER_HEADER_CONCURRENCY` | 8 | Concurrent block-header reads |
-| `MAX_HEAD_OBSERVATION_AGE_MS` | 120000 | Mark published reads stale after shared head observation expiry |
-| `TAIL_ENABLED` | true | Run the tail and serve `finality=latest` by default; false serves finalized only |
-| `TAIL_MAX_DEPTH` | 64 | Deepest reorg rewound in place; deeper ones wipe the tail |
-| `TAIL_POLL_OFFSETS_MS` | 2500,5000,9000 | `latest` poll offsets within each 12 s slot |
-| `TAIL_MAX_AHEAD_BLOCKS` | 1024 | Stop appending this far above the finalized cursor (finality stall, ~3.4 h) |
-| `TAIL_MAX_TIP_AGE_MS` | 60000 | Serve finalized with `tailError` when the shared tail tip block is older |
-| `FINALIZED_MAX_NO_PROGRESS_MS` | 1200000 | Head tracker stops trusting a non-advancing head |
-| `MAX_HEAD_AGE_MS` | 1800000 | Mark reads stale after index progress stops this long |
-| `ETH_MULTICALL_BATCH` | 1000 | Calls per Multicall3 batch; also the shared balance batch size |
-| `BALANCE_ALWAYS_REFRESH_TOKENS` | `src/networks.ts` list | Comma-separated tokens re-read at every new cursor; replaces the defaults |
-| `BALANCE_BATCH_WINDOW_MS` | 25 | Wait for other requests' pairs before sending a partial Multicall |
-| `REQUEST_DEADLINE_MS` | 10000 | On-request RPC budget; past it the request gets 503 and its RPC work is aborted |
-| `REQUEST_RPC_CONCURRENCY`, `REQUEST_RPC_QUEUE` | 16, 256 | Concurrent and queued request-path Multicalls (balance batches, ownership) |
-| `MAX_VERIFY_OWNERSHIP_ITEMS` | 2000 | Cap on optional ownership verification |
-| `DB_POOL_MAX`, `DB_CONNECT_TIMEOUT_MS` | 20, 5000 | Pool size and acquisition timeout; one connection per follower leader lock |
+| Variable                                                                       | Default                                    | Purpose                                                                                          |
+| ------------------------------------------------------------------------------ | ------------------------------------------ | ------------------------------------------------------------------------------------------------ |
+| `RPC_URL`, `RPC_FALLBACK_URLS`                                                 | required, empty                            | Primary and comma-separated fallback RPC endpoints                                               |
+| `DATABASE_URL`                                                                 | local `iseeu` PostgreSQL database          | Connection string                                                                                |
+| `START_BLOCK`                                                                  | 25933634                                   | Network start block S (plain number); must match the stored index or bootstrap run               |
+| `BOOTSTRAP_ON_START`                                                           | false                                      | Run the bootstrap inside `npm start` when the index is missing                                   |
+| `BOOTSTRAP_RPC_WORKERS`, `BOOTSTRAP_RPC_LOG_RANGE`, `BOOTSTRAP_RPC_TIMEOUT_MS` | 4, 100, 60000                              | Quicknode segment workers, blocks per `eth_getLogs`, bulk call timeout                           |
+| `BOOTSTRAP_SEGMENT_BLOCKS`, `BOOTSTRAP_HEADER_CHUNK_BLOCKS`                    | 1000, 5000                                 | Segment (commit/resume unit) and header-request sizes                                            |
+| `BOOTSTRAP_MAINTENANCE_WORK_MEM`                                               | 1GB                                        | `maintenance_work_mem` for the finalize index builds                                             |
+| `HYPERSYNC_API_KEY`, `HYPERSYNC_URL`, `HYPERSYNC_TIMEOUT_MS`                   | unset, `https://eth.hypersync.xyz`, 120000 | Optional bootstrap source; per-request idle timeout                                              |
+| `PORT`                                                                         | 3000                                       | HTTP port                                                                                        |
+| `SERVE_ONLY`                                                                   | false                                      | API replica only; skip background indexing/bootstrap and leader locks                            |
+| `READYZ_ALLOW`                                                                 | full                                       | Minimum accepted readiness: `full`, `stale` (also full), or `partial` (all modes)                |
+| `HEAD_STALL_MS`                                                                | 60000                                      | Leader latest-head watchdog threshold; penalize the returning endpoint if no higher head appears |
+| `RPC_TIMEOUT_MS`, `RPC_MAX_ATTEMPTS`, `RPC_MAX_RPS`                            | 15000, 6, 20                               | Timeout, retry budget, shared outgoing rate cap                                                  |
+| `ETH_FOLLOWER_MAX_RANGE`                                                       | 500 (maximum 1000)                         | Unfiltered log range; large responses require bounded memory                                     |
+| `FOLLOWER_POLL_MS`                                                             | 30000                                      | Finalized-head poll interval                                                                     |
+| `FOLLOWER_MAX_RANGES_PER_TICK`                                                 | 8                                          | Bounded catch-up per tick                                                                        |
+| `FOLLOWER_HEADER_CONCURRENCY`                                                  | 8                                          | Concurrent block-header reads                                                                    |
+| `MAX_HEAD_OBSERVATION_AGE_MS`                                                  | 120000                                     | Mark published reads stale after shared head observation expiry                                  |
+| `TAIL_ENABLED`                                                                 | true                                       | Run the tail and serve `finality=latest` by default; false serves finalized only                 |
+| `TAIL_MAX_DEPTH`                                                               | 64                                         | Deepest reorg rewound in place; deeper ones wipe the tail                                        |
+| `TAIL_POLL_OFFSETS_MS`                                                         | 2500,5000,9000                             | `latest` poll offsets within each 12 s slot                                                      |
+| `TAIL_MAX_AHEAD_BLOCKS`                                                        | 1024                                       | Stop appending this far above the finalized cursor (finality stall, ~3.4 h)                      |
+| `TAIL_MAX_TIP_AGE_MS`                                                          | 60000                                      | Serve finalized with `tailError` when the shared tail tip block is older                         |
+| `FINALIZED_MAX_NO_PROGRESS_MS`                                                 | 1200000                                    | Head tracker stops trusting a non-advancing head                                                 |
+| `MAX_HEAD_AGE_MS`                                                              | 1800000                                    | Mark reads stale after index progress stops this long                                            |
+| `ETH_MULTICALL_BATCH`                                                          | 1000                                       | Calls per Multicall3 batch; also the shared balance batch size                                   |
+| `BALANCE_ALWAYS_REFRESH_TOKENS`                                                | `src/networks.ts` list                     | Comma-separated tokens re-read at every new cursor; replaces the defaults                        |
+| `BALANCE_BATCH_WINDOW_MS`                                                      | 25                                         | Wait for other requests' pairs before sending a partial Multicall                                |
+| `REQUEST_DEADLINE_MS`                                                          | 10000                                      | On-request RPC budget; past it the request gets 503 and its RPC work is aborted                  |
+| `REQUEST_RPC_CONCURRENCY`, `REQUEST_RPC_QUEUE`                                 | 16, 256                                    | Concurrent and queued request-path Multicalls (balance batches, ownership)                       |
+| `MAX_VERIFY_OWNERSHIP_ITEMS`                                                   | 2000                                       | Cap on optional ownership verification                                                           |
+| `DB_POOL_MAX`, `DB_CONNECT_TIMEOUT_MS`                                         | 20, 5000                                   | Pool size and acquisition timeout; one connection per follower leader lock                       |
 
 `scripts/compare-sources.ts` with `src/sources/hypersync.ts`, `rpc-logs.ts` and `fallback.ts` remains a per-account RPC/HyperSync comparison diagnostic, not wired into discovery or ingestion. The bootstrap has its own global sources in `src/bootstrap/sources.ts` and shares the HyperSync pager.
 

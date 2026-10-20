@@ -23,14 +23,18 @@ const account: Address = '0x675265996dfa20c9a21c31bcdf32ddbbf865f68a';
 for (const kind of ['fatal', 'transient', 'rate_limited'] as const) {
   test(`getLogs does not split the range on non-timeout ${kind} errors`, async () => {
     const { rpc, calls } = failingRpc(kind);
-    await expect(
-      scanTransfers(rpc, account, 'to', { fromBlock: 0n, toBlock: 9_999n }, () => {}),
-    ).rejects.toMatchObject({ kind });
+    await expect(scanTransfers(rpc, account, 'to', { fromBlock: 0n, toBlock: 9_999n }, () => {})).rejects.toMatchObject(
+      { kind },
+    );
     expect(calls()).toBe(1);
   });
 }
 
-for (const [kind, message] of [['fatal', 'HTTP 401'], ['transient', 'HTTP 503'], ['rate_limited', 'HTTP 429']] as const) {
+for (const [kind, message] of [
+  ['fatal', 'HTTP 401'],
+  ['transient', 'HTTP 503'],
+  ['rate_limited', 'HTTP 429'],
+] as const) {
   test(`multicall does not halve the batch on ${kind} errors (${message})`, async () => {
     const { rpc, calls } = failingRpc(kind, message);
     const tokens = Array.from({ length: 1000 }, (_, i): Address => `0x${(i + 1).toString(16).padStart(40, '0')}`);

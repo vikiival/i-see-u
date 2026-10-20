@@ -2,12 +2,24 @@ import { decodeEventLog, encodeEventTopics, isAddress, isHex, pad, parseAbiItem 
 
 import { ChainGapError } from '../../core/errors.ts';
 import { addTransfer, aggregateLogCount, emptyAggregate } from '../../core/aggregate.ts';
-import type { Address, BlockRange, ChunkScan, Hex, RpcClient, TransferDirection, TransferEvent } from '../../core/types.ts';
+import type {
+  Address,
+  BlockRange,
+  ChunkScan,
+  Hex,
+  RpcClient,
+  TransferDirection,
+  TransferEvent,
+} from '../../core/types.ts';
 import { RpcError, rpcErrorOf } from '../../rpc/errors.ts';
 import { isString, toLowerHex } from '../../core/parse.ts';
 
 const erc20Transfer = parseAbiItem('event Transfer(address indexed from, address indexed to, uint256 value)');
-const erc721Transfer = parseAbiItem('event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)');
+
+const erc721Transfer = parseAbiItem(
+  'event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)',
+);
+
 export const TRANSFER_TOPIC = encodeEventTopics({ abi: [erc20Transfer] })[0];
 
 /** A response above this many bytes marks the chunk heavy. */
@@ -35,21 +47,32 @@ export interface WireLog {
 const quantity = (log: WireLog, field: 'blockNumber' | 'logIndex'): bigint => {
   const value = log[field];
 
-  if (!isHex(value)) throw new Error('not a hex quantity');
+  if (!isHex(value)) {
+    throw new Error('not a hex quantity');
+  }
 
   return BigInt(value);
 };
 
 /** Decode and normalize an eth_getLogs Transfer entry strictly; malformed/non-Transfer logs are skipped. */
 export function decodeTransferLog(log: WireLog): TransferEvent | undefined {
-  if (log.removed === true) return undefined;
+  if (log.removed === true) {
+    return undefined;
+  }
+
   const { topics } = log;
 
-  if (!Array.isArray(topics) || (topics.length !== 3 && topics.length !== 4)) return undefined;
+  if (!Array.isArray(topics) || (topics.length !== 3 && topics.length !== 4)) {
+    return undefined;
+  }
 
-  if (!isString(log.address) || !isAddress(log.address, { strict: false })) return undefined;
+  if (!isString(log.address) || !isAddress(log.address, { strict: false })) {
+    return undefined;
+  }
 
-  if (!isHex(log.transactionHash) || !isHex(log.blockHash) || !isHex(log.data)) return undefined;
+  if (!isHex(log.transactionHash) || !isHex(log.blockHash) || !isHex(log.data)) {
+    return undefined;
+  }
 
   try {
     const standard = topics.length === 3 ? 'erc20' : 'erc721';
@@ -67,7 +90,9 @@ export function decodeTransferLog(log: WireLog): TransferEvent | undefined {
     const value = 'value' in args ? args.value : args.tokenId;
     const logIndex = quantity(log, 'logIndex');
 
-    if (logIndex > BigInt(Number.MAX_SAFE_INTEGER)) return undefined;
+    if (logIndex > BigInt(Number.MAX_SAFE_INTEGER)) {
+      return undefined;
+    }
 
     return {
       standard,
@@ -98,16 +123,39 @@ const QUANTITY = /^0x[0-9a-fA-F]{1,13}$/;
 export function decodeTransferLogFast(log: WireLog): TransferEvent | undefined {
   const { topics, data } = log;
 
-  if (log.removed === true || !Array.isArray(topics) || (topics.length !== 3 && topics.length !== 4) || topics[0] !== TRANSFER_TOPIC) return decodeTransferLog(log);
+  if (
+    log.removed === true ||
+    !Array.isArray(topics) ||
+    (topics.length !== 3 && topics.length !== 4) ||
+    topics[0] !== TRANSFER_TOPIC
+  ) {
+    return decodeTransferLog(log);
+  }
+
   const erc20 = topics.length === 3;
   const [, from, to, id] = topics;
 
   const { address, transactionHash, blockHash, blockNumber, logIndex } = log;
 
-  if (!isString(address) || !ADDRESS.test(address) || !isString(transactionHash) || !HEX.test(transactionHash)
-    || !isString(blockHash) || !HEX.test(blockHash) || !isString(blockNumber) || !QUANTITY.test(blockNumber)
-    || !isString(logIndex) || !QUANTITY.test(logIndex) || !isString(from) || !WORD.test(from) || !isString(to) || !WORD.test(to)
-    || (erc20 ? !isString(data) || !WORD.test(data) : data !== '0x' || !isString(id) || !WORD.test(id))) return decodeTransferLog(log);
+  if (
+    !isString(address) ||
+    !ADDRESS.test(address) ||
+    !isString(transactionHash) ||
+    !HEX.test(transactionHash) ||
+    !isString(blockHash) ||
+    !HEX.test(blockHash) ||
+    !isString(blockNumber) ||
+    !QUANTITY.test(blockNumber) ||
+    !isString(logIndex) ||
+    !QUANTITY.test(logIndex) ||
+    !isString(from) ||
+    !WORD.test(from) ||
+    !isString(to) ||
+    !WORD.test(to) ||
+    (erc20 ? !isString(data) || !WORD.test(data) : data !== '0x' || !isString(id) || !WORD.test(id))
+  ) {
+    return decodeTransferLog(log);
+  }
 
   return {
     standard: erc20 ? 'erc20' : 'erc721',
@@ -122,9 +170,10 @@ export function decodeTransferLogFast(log: WireLog): TransferEvent | undefined {
   };
 }
 
-const getLogs = (rpc: RpcClient, filter: { blockHash: Hex; topics: Hex[] }): Promise<WireLog[]> => rpc.request('eth_getLogs', [filter], {
-  validate: Array.isArray,
-});
+const getLogs = (rpc: RpcClient, filter: { blockHash: Hex; topics: Hex[] }): Promise<WireLog[]> =>
+  rpc.request('eth_getLogs', [filter], {
+    validate: Array.isArray,
+  });
 
 /** EIP-234 block-hash query: one canonical block, never a same-height block from another backend. */
 export async function transfersInBlock(rpc: RpcClient, blockHash: Hex): Promise<TransferEvent[]> {
@@ -132,7 +181,9 @@ export async function transfersInBlock(rpc: RpcClient, blockHash: Hex): Promise<
   const events: TransferEvent[] = [];
 
   for (const log of raw) {
-    if (log.removed === true) continue;
+    if (log.removed === true) {
+      continue;
+    }
 
     if (!isHex(log.blockHash) || log.blockHash.toLowerCase() !== blockHash) {
       throw new RpcError('transient', 'Log block hash does not match requested block');
@@ -140,7 +191,9 @@ export async function transfersInBlock(rpc: RpcClient, blockHash: Hex): Promise<
 
     const event = decodeTransferLog(log);
 
-    if (event) events.push(event);
+    if (event) {
+      events.push(event);
+    }
   }
 
   return events;
@@ -158,7 +211,10 @@ export async function transfersInRange(
   const expected = new Map(headers.map((header) => [header.number, header.hash]));
   const events: TransferEvent[] = [];
   await scanLogs(rpc, [TRANSFER_TOPIC], range, (log) => {
-    if (log.removed === true) return;
+    if (log.removed === true) {
+      return;
+    }
+
     let number: bigint;
 
     try {
@@ -173,7 +229,9 @@ export async function transfersInRange(
 
     const event = decodeTransferLog(log);
 
-    if (event) events.push(event);
+    if (event) {
+      events.push(event);
+    }
   });
 
   return events;
@@ -211,34 +269,50 @@ async function scanLogs(
     let raw: WireLog[];
 
     try {
-      raw = await rpc.request<WireLog[]>('eth_getLogs', [{
-          fromBlock: `0x${part.fromBlock.toString(16)}`,
-          toBlock: `0x${part.toBlock.toString(16)}`,
-          topics,
-        }], {
-        validate: Array.isArray,
-        failFastOnTimeout: part.fromBlock < part.toBlock,
-        onAttempt: (attempt) => {
-          if (!attempt.ok) return;
-          bytes = attempt.bytes;
-          ms = attempt.durationMs;
+      raw = await rpc.request<WireLog[]>(
+        'eth_getLogs',
+        [
+          {
+            fromBlock: `0x${part.fromBlock.toString(16)}`,
+            toBlock: `0x${part.toBlock.toString(16)}`,
+            topics,
+          },
+        ],
+        {
+          validate: Array.isArray,
+          failFastOnTimeout: part.fromBlock < part.toBlock,
+          onAttempt: (attempt) => {
+            if (!attempt.ok) {
+              return;
+            }
+
+            bytes = attempt.bytes;
+            ms = attempt.durationMs;
+          },
+          signal,
         },
-        signal,
-      });
+      );
     } catch (error) {
       const rpcError = rpcErrorOf(error);
-      const splittable = rpcError?.kind === 'too_large' || (rpcError?.kind === 'transient' && rpcError.timeout === true);
 
-      if (!splittable) throw rpcError ?? error;
+      const splittable =
+        rpcError?.kind === 'too_large' || (rpcError?.kind === 'transient' && rpcError.timeout === true);
 
-      if (part.fromBlock === part.toBlock) throw rpcError;
+      if (!splittable) {
+        throw rpcError ?? error;
+      }
+
+      if (part.fromBlock === part.toBlock) {
+        throw rpcError;
+      }
 
       stats.split = true;
       const suggested = rpcError.suggestedRange;
 
-      const splitAt = suggested && suggested.fromBlock === part.fromBlock && suggested.toBlock < part.toBlock
-        ? suggested.toBlock
-        : part.fromBlock + (part.toBlock - part.fromBlock) / 2n;
+      const splitAt =
+        suggested && suggested.fromBlock === part.fromBlock && suggested.toBlock < part.toBlock
+          ? suggested.toBlock
+          : part.fromBlock + (part.toBlock - part.fromBlock) / 2n;
 
       await fetchRange({ fromBlock: part.fromBlock, toBlock: splitAt });
       await fetchRange({ fromBlock: splitAt + 1n, toBlock: part.toBlock });
@@ -250,7 +324,10 @@ async function scanLogs(
     stats.maxMs = Math.max(stats.maxMs, ms);
 
     for (const log of raw) {
-      if (log.removed === true) continue;
+      if (log.removed === true) {
+        continue;
+      }
+
       let number: bigint;
 
       try {
@@ -260,11 +337,16 @@ async function scanLogs(
       }
 
       if (number < part.fromBlock || number > part.toBlock) {
-        throw new RpcError('transient', `Log block ${number} outside requested range ${part.fromBlock}-${part.toBlock}`);
+        throw new RpcError(
+          'transient',
+          `Log block ${number} outside requested range ${part.fromBlock}-${part.toBlock}`,
+        );
       }
     }
 
-    for (const log of raw) onLog(log);
+    for (const log of raw) {
+      onLog(log);
+    }
   };
 
   await fetchRange(range);
@@ -283,15 +365,21 @@ export async function scanTransfers(
 ): Promise<LogsScanStats> {
   const accountTopic = pad(account, { size: 32 });
 
-  const topics = direction === 'from'
-    ? [TRANSFER_TOPIC, accountTopic, null]
-    : [TRANSFER_TOPIC, null, accountTopic];
+  const topics = direction === 'from' ? [TRANSFER_TOPIC, accountTopic, null] : [TRANSFER_TOPIC, null, accountTopic];
 
-  return scanLogs(rpc, topics, range, (log) => {
-    const event = decodeTransferLog(log);
+  return scanLogs(
+    rpc,
+    topics,
+    range,
+    (log) => {
+      const event = decodeTransferLog(log);
 
-    if (event) onTransfer(event);
-  }, signal);
+      if (event) {
+        onTransfer(event);
+      }
+    },
+    signal,
+  );
 }
 
 /** All decoded Transfer logs, unfiltered by account (the bootstrap's RPC source; it verifies them against its headers). */
@@ -303,7 +391,9 @@ export async function scanAllTransfers(
   const { calls } = await scanLogs(rpc, [TRANSFER_TOPIC], range, (log) => {
     const event = decodeTransferLogFast(log);
 
-    if (event) onTransfer(event);
+    if (event) {
+      onTransfer(event);
+    }
   });
 
   return { calls };
@@ -316,21 +406,26 @@ export async function scanAccountChunk(rpc: RpcClient, account: Address, range: 
   const failed = new AbortController();
   const onTransfer = (event: TransferEvent): void => addTransfer(aggregate, account, event);
 
-  const run = (direction: TransferDirection) => scanTransfers(rpc, account, direction, range, onTransfer, failed.signal)
-    .catch((error) => {
+  const run = (direction: TransferDirection) =>
+    scanTransfers(rpc, account, direction, range, onTransfer, failed.signal).catch((error) => {
       failed.abort(error); // no-op after the first
       throw error;
     });
 
   const [sent, received] = await Promise.allSettled([run('from'), run('to')]);
 
-  if (sent.status === 'rejected' || received.status === 'rejected') throw failed.signal.reason;
+  if (sent.status === 'rejected' || received.status === 'rejected') {
+    throw failed.signal.reason;
+  }
+
   const a = sent.value;
   const b = received.value;
   // Slowness only counts for a non-trivial response: provider latency is mostly per-request overhead,
   // and shrinking a slow small request would only add requests.
   const bytes = Math.max(a.maxBytes, b.maxBytes);
-  const heavy = a.split || b.split || bytes > HEAVY_BYTES || (bytes > HEAVY_BYTES / 10 && Math.max(a.maxMs, b.maxMs) > HEAVY_MS);
+
+  const heavy =
+    a.split || b.split || bytes > HEAVY_BYTES || (bytes > HEAVY_BYTES / 10 && Math.max(a.maxMs, b.maxMs) > HEAVY_MS);
 
   return { aggregate, calls: a.calls + b.calls, logs: aggregateLogCount(aggregate), heavy };
 }

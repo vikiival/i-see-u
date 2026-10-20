@@ -14,40 +14,65 @@ test('first and repeated discoveries are pure DB reads for any account, includin
     await s.follower.tick();
     const calls = chain.total;
     expect(await s.discovery.discover('ethereum', `0x${account.slice(2).toUpperCase()}`)).toMatchObject({
-      status: 'ready', account, blockHeight: 102n, holdings: [{ token: address(3), receivedCount: 1n }],
+      status: 'ready',
+      account,
+      blockHeight: 102n,
+      holdings: [{ token: address(3), receivedCount: 1n }],
     });
     expect((await s.discovery.discover('ethereum', address(99))).holdings).toEqual([]);
     await s.discovery.discover('ethereum', account);
     expect(chain.total).toBe(calls);
-  } finally { await s.close(); }
+  } finally {
+    await s.close();
+  }
 });
 
 test('one network serving mode applies to all accounts during catch-up', async () => {
   const s = await stack(new FakeChain(103n), { range: 2n, maxRanges: 1 });
 
   try {
-    for (const who of [account, address(2)]) expect(await s.discovery.discover('ethereum', who)).toMatchObject({ stale: true, holdings: [] });
+    for (const who of [account, address(2)]) {
+      expect(await s.discovery.discover('ethereum', who)).toMatchObject({ stale: true, holdings: [] });
+    }
+
     await s.follower.tick();
-    expect(await s.discovery.discover('ethereum', account)).toMatchObject({ status: 'ready', stale: true, staleReason: 'Global index has not reached the finalized head' });
+    expect(await s.discovery.discover('ethereum', account)).toMatchObject({
+      status: 'ready',
+      stale: true,
+      staleReason: 'Global index has not reached the finalized head',
+    });
     await s.follower.tick();
     expect((await s.discovery.discover('ethereum', account)).status).toBe('ready');
-  } finally { await s.close(); }
+  } finally {
+    await s.close();
+  }
 });
 
 test('unobserved heads, expired observations and stalled progress serve stale snapshots', async () => {
   const s = await stack();
 
   try {
-    expect(await s.discovery.discover('ethereum', account)).toMatchObject({ stale: true, staleReason: 'Global index awaits finalized head observation' });
+    expect(await s.discovery.discover('ethereum', account)).toMatchObject({
+      stale: true,
+      staleReason: 'Global index awaits finalized head observation',
+    });
     await s.follower.tick();
     s.clock.at += 120_001;
-    expect(await s.discovery.discover('ethereum', account)).toMatchObject({ stale: true, staleReason: 'Finalized head observation is too old' });
+    expect(await s.discovery.discover('ethereum', account)).toMatchObject({
+      stale: true,
+      staleReason: 'Finalized head observation is too old',
+    });
     await s.follower.tick();
     expect((await s.discovery.discover('ethereum', account)).status).toBe('ready');
     s.clock.at += 1_800_001;
     await s.follower.tick();
-    expect(await s.discovery.discover('ethereum', account)).toMatchObject({ stale: true, staleReason: 'Global index has not advanced recently enough' });
-  } finally { await s.close(); }
+    expect(await s.discovery.discover('ethereum', account)).toMatchObject({
+      stale: true,
+      staleReason: 'Global index has not advanced recently enough',
+    });
+  } finally {
+    await s.close();
+  }
 });
 
 test('pending repairs mark discovery stale until replacement resolves the suspect range', async () => {
@@ -59,17 +84,24 @@ test('pending repairs mark discovery stale until replacement resolves the suspec
     expect(await s.discovery.discover('ethereum', account)).toMatchObject({ stale: true, repairPending: true });
     await s.store.replaceRange('ethereum', blockRange(101n), headersFor(101n), []);
     expect(await s.discovery.discover('ethereum', account)).toMatchObject({ revision: 1n });
-  } finally { await s.close(); }
+  } finally {
+    await s.close();
+  }
 });
 
 test('network and account validation precede database reads, including prototype names', async () => {
   const s = await stack();
 
   try {
-    for (const name of ['missing', 'constructor', '__proto__', 'toString']) await expect(s.discovery.discover(name, account)).rejects.toMatchObject({ statusCode: 404 });
+    for (const name of ['missing', 'constructor', '__proto__', 'toString']) {
+      await expect(s.discovery.discover(name, account)).rejects.toMatchObject({ statusCode: 404 });
+    }
+
     await expect(s.discovery.discover('ethereum', 'bad')).rejects.toMatchObject({ statusCode: 400 });
     expect(s.chain.total).toBe(0);
-  } finally { await s.close(); }
+  } finally {
+    await s.close();
+  }
 });
 
 test('a newly observed target makes all API replicas stale, without waiting for their follower poll', async () => {
@@ -79,9 +111,15 @@ test('a newly observed target makes all API replicas stale, without waiting for 
     await s.follower.tick();
     expect(s.follower.status().ready).toBe(true);
     await s.store.observeHead('ethereum', header(103n), s.clock.at);
-    expect(await s.discovery.discover('ethereum', account)).toMatchObject({ status: 'ready', stale: true, staleReason: 'Global index has not reached the finalized head' });
+    expect(await s.discovery.discover('ethereum', account)).toMatchObject({
+      status: 'ready',
+      stale: true,
+      staleReason: 'Global index has not reached the finalized head',
+    });
     s.chain.finalized = 103n;
     await s.follower.tick();
     expect(await s.discovery.discover('ethereum', account)).toMatchObject({ blockHeight: 103n });
-  } finally { await s.close(); }
+  } finally {
+    await s.close();
+  }
 });

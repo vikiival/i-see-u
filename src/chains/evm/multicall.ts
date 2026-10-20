@@ -19,10 +19,16 @@ const shortReason = (message: string): string =>
 
 /** Only size/gas/revert failures shrink the batch; auth, rate limits, outages and malformed responses propagate. */
 const splittable = (error: RpcError | undefined): error is RpcError =>
-  error?.kind === 'too_large'
-  || (error?.kind === 'fatal' && /revert|out of gas|gas required|exceeds|too large|entity too large/i.test(error.message));
+  error?.kind === 'too_large' ||
+  (error?.kind === 'fatal' && /revert|out of gas|gas required|exceeds|too large|entity too large/i.test(error.message));
 
-async function aggregateChunk(rpc: RpcClient, calls: EncodedCall[], blockHash: Hex, multicall3: Address, signal?: AbortSignal): Promise<CallOutcome[]> {
+async function aggregateChunk(
+  rpc: RpcClient,
+  calls: EncodedCall[],
+  blockHash: Hex,
+  multicall3: Address,
+  signal?: AbortSignal,
+): Promise<CallOutcome[]> {
   try {
     const data = encodeFunctionData({
       abi: multicall3Abi,
@@ -33,7 +39,9 @@ async function aggregateChunk(rpc: RpcClient, calls: EncodedCall[], blockHash: H
     // EIP-1898: pinned to the exact block hash, never re-resolved against another block at the same height.
     const response = await rpc.request<Hex>('eth_call', [{ to: multicall3, data }, { blockHash }], {
       validate: (value) => {
-        if (!isString(value) || !isHex(value)) return false;
+        if (!isString(value) || !isHex(value)) {
+          return false;
+        }
 
         try {
           const decoded = decodeFunctionResult({ abi: multicall3Abi, functionName: 'aggregate3', data: value });
@@ -49,13 +57,19 @@ async function aggregateChunk(rpc: RpcClient, calls: EncodedCall[], blockHash: H
     const decoded = decodeFunctionResult({ abi: multicall3Abi, functionName: 'aggregate3', data: response });
 
     return decoded.map((result) =>
-      result.success ? { ok: true, returnData: result.returnData } : { ok: false, error: 'inner call failed' });
+      result.success ? { ok: true, returnData: result.returnData } : { ok: false, error: 'inner call failed' },
+    );
   } catch (error) {
     const rpcError = rpcErrorOf(error);
 
-    if (!splittable(rpcError)) throw rpcError ?? error;
+    if (!splittable(rpcError)) {
+      throw rpcError ?? error;
+    }
 
-    if (calls.length === 1) return [{ ok: false, error: shortReason(rpcError.message) }];
+    if (calls.length === 1) {
+      return [{ ok: false, error: shortReason(rpcError.message) }];
+    }
+
     const middle = Math.floor(calls.length / 2);
     const left = await aggregateChunk(rpc, calls.slice(0, middle), blockHash, multicall3, signal);
     const right = await aggregateChunk(rpc, calls.slice(middle), blockHash, multicall3, signal);
@@ -77,7 +91,10 @@ async function readCalls<T>(
 ): Promise<({ status: 'ok'; value: T } | { status: 'error'; error: string; transient?: true })[]> {
   const chunks: EncodedCall[][] = [];
 
-  for (let i = 0; i < calls.length; i += batchSize) chunks.push(calls.slice(i, i + batchSize));
+  for (let i = 0; i < calls.length; i += batchSize) {
+    chunks.push(calls.slice(i, i + batchSize));
+  }
+
   const chunksResults: ({ outcomes: CallOutcome[] } | { error: unknown })[] = Array.from({ length: chunks.length });
   let next = 0;
 
@@ -98,18 +115,30 @@ async function readCalls<T>(
   signal?.throwIfAborted();
   const failures = chunksResults.filter((result): result is { error: unknown } => 'error' in result);
 
-  if (failures.length > 0 && failures.length === chunks.length) throw failures[0].error;
+  if (failures.length > 0 && failures.length === chunks.length) {
+    throw failures[0].error;
+  }
 
-  const results = chunksResults.flatMap((result, index) => 'outcomes' in result
-    ? result.outcomes
-    : chunks[index].map((): CallOutcome => ({ ok: false, error: shortReason(thrownMessage(result.error)), transient: true })));
+  const results = chunksResults.flatMap((result, index) =>
+    'outcomes' in result
+      ? result.outcomes
+      : chunks[index].map((): CallOutcome => ({
+          ok: false,
+          error: shortReason(thrownMessage(result.error)),
+          transient: true,
+        })),
+  );
 
   return results.map((outcome) => {
-    if (!outcome.ok) return outcome.transient
-      ? { status: 'error', error: outcome.error, transient: true }
-      : { status: 'error', error: outcome.error };
+    if (!outcome.ok) {
+      return outcome.transient
+        ? { status: 'error', error: outcome.error, transient: true }
+        : { status: 'error', error: outcome.error };
+    }
 
-    if (!/^0x[0-9a-fA-F]{64}$/.test(outcome.returnData)) return { status: 'error', error: `invalid ${label} return data` };
+    if (!/^0x[0-9a-fA-F]{64}$/.test(outcome.returnData)) {
+      return { status: 'error', error: `invalid ${label} return data` };
+    }
 
     try {
       return { status: 'ok', value: decode(outcome.returnData) };
@@ -133,15 +162,25 @@ export async function readErc20BalancePairs(
   const calls = pairs.map(({ account, token }) => {
     let data = callData.get(account);
 
-    if (!data) callData.set(account, data = encodeFunctionData({ abi: erc20Abi, functionName: 'balanceOf', args: [account] }));
+    if (!data) {
+      callData.set(account, (data = encodeFunctionData({ abi: erc20Abi, functionName: 'balanceOf', args: [account] })));
+    }
 
     return { target: token, callData: data };
   });
 
-  const results = await readCalls(rpc, calls, blockHash, batchSize, 'balanceOf',
-    (data) => decodeFunctionResult({ abi: erc20Abi, functionName: 'balanceOf', data }), multicall3, signal);
+  const results = await readCalls(
+    rpc,
+    calls,
+    blockHash,
+    batchSize,
+    'balanceOf',
+    (data) => decodeFunctionResult({ abi: erc20Abi, functionName: 'balanceOf', data }),
+    multicall3,
+    signal,
+  );
 
-  return results.map((r) => r.status === 'ok' ? { status: 'ok', balance: r.value } : r);
+  return results.map((r) => (r.status === 'ok' ? { status: 'ok', balance: r.value } : r));
 }
 
 export const readErc20Balances = (
@@ -150,7 +189,13 @@ export const readErc20Balances = (
   tokens: Address[],
   blockHash: Hex,
   batchSize: number,
-): Promise<BalanceResult[]> => readErc20BalancePairs(rpc, tokens.map((token) => ({ account, token })), blockHash, batchSize);
+): Promise<BalanceResult[]> =>
+  readErc20BalancePairs(
+    rpc,
+    tokens.map((token) => ({ account, token })),
+    blockHash,
+    batchSize,
+  );
 
 export async function readErc721Owners(
   rpc: RpcClient,
@@ -165,8 +210,16 @@ export async function readErc721Owners(
     callData: encodeFunctionData({ abi: erc721Abi, functionName: 'ownerOf', args: [item.tokenId] }),
   }));
 
-  const results = await readCalls(rpc, calls, blockHash, batchSize, 'ownerOf',
-    (data) => toLowerHex(decodeFunctionResult({ abi: erc721Abi, functionName: 'ownerOf', data })), multicall3, signal);
+  const results = await readCalls(
+    rpc,
+    calls,
+    blockHash,
+    batchSize,
+    'ownerOf',
+    (data) => toLowerHex(decodeFunctionResult({ abi: erc721Abi, functionName: 'ownerOf', data })),
+    multicall3,
+    signal,
+  );
 
-  return results.map((r) => r.status === 'ok' ? { status: 'ok', owner: r.value } : r);
+  return results.map((r) => (r.status === 'ok' ? { status: 'ok', owner: r.value } : r));
 }

@@ -1,9 +1,15 @@
 import { thrownMessage } from '../core/parse.ts';
 import { scanAccountChunk } from '../chains/evm/logs.ts';
-import type { AccountLogSource, AccountLogSourceStats, Address, BlockRange, RpcClient, RpcRequestOptions } from '../core/types.ts';
+import type {
+  AccountLogSource,
+  AccountLogSourceStats,
+  Address,
+  BlockRange,
+  RpcClient,
+  RpcRequestOptions,
+} from '../core/types.ts';
 
-const shortError = (message: string): string =>
-  message.trim().replace(/\s+/g, ' ').slice(0, 200);
+const shortError = (message: string): string => message.trim().replace(/\s+/g, ' ').slice(0, 200);
 
 /** Two-direction source retained for the standalone source comparison diagnostic. */
 export function createRpcLogSource(

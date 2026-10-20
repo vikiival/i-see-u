@@ -1,12 +1,4 @@
-import type {
-  BlockHeader,
-  ChainAdapter,
-  Follower,
-  Store,
-  Tail,
-  TailBlock,
-  TailStatus,
-} from '../core/types.ts';
+import type { BlockHeader, ChainAdapter, Follower, Store, Tail, TailBlock, TailStatus } from '../core/types.ts';
 import { thrownMessage } from '../core/parse.ts';
 
 /** Fetched headers do not link into one chain from the anchor: handled as a reorg. */
@@ -49,11 +41,16 @@ export function nextPollDelay(at: number, offsets: number[], tip?: BlockHeader):
   const slot = Math.floor((at - GENESIS_MS) / SLOT_MS);
   const start = GENESIS_MS + slot * SLOT_MS;
 
-  if (!tip || slotOf(tip) < slot) for (const offset of offsets) if (start + offset > at) return start + offset - at;
+  if (!tip || slotOf(tip) < slot) {
+    for (const offset of offsets) {
+      if (start + offset > at) {
+        return start + offset - at;
+      }
+    }
+  }
 
   return start + SLOT_MS + offsets[0] - at;
 }
-
 
 /**
  * Persistent unfinalized journal of every Transfer above the finalized cursor. Reorgs only replace these rows; the
@@ -91,11 +88,13 @@ export function createTail(o: TailOptions): Tail {
   };
 
   const append = async (anchor: BlockHeader, head: BlockHeader, cursorNumber: bigint, reorg = false): Promise<void> => {
-    let end = anchor.number + adapter.followerMaxRange < head.number
-      ? anchor.number + adapter.followerMaxRange
-      : head.number;
+    let end =
+      anchor.number + adapter.followerMaxRange < head.number ? anchor.number + adapter.followerMaxRange : head.number;
 
-    if (end > cursorNumber + maxAheadBlocks) end = cursorNumber + maxAheadBlocks; // never past the finality-stall bound
+    if (end > cursorNumber + maxAheadBlocks) {
+      end = cursorNumber + maxAheadBlocks;
+    } // never past the finality-stall bound
+
     const headers: BlockHeader[] = [];
     let parent = anchor;
 
@@ -110,7 +109,10 @@ export function createTail(o: TailOptions): Tail {
       parent = header;
     }
 
-    if (headers.length === 0) return;
+    if (headers.length === 0) {
+      return;
+    }
+
     let blocks: TailBlock[];
 
     if (headers.length === 1) {
@@ -123,7 +125,10 @@ export function createTail(o: TailOptions): Tail {
       for (const transfer of transfers) {
         let rows = byBlock.get(transfer.blockNumber);
 
-        if (!rows) byBlock.set(transfer.blockNumber, rows = []);
+        if (!rows) {
+          byBlock.set(transfer.blockNumber, (rows = []));
+        }
+
         rows.push(transfer);
       }
 
@@ -137,12 +142,16 @@ export function createTail(o: TailOptions): Tail {
     o.onAdvance?.(tip, reorg);
     const slot = slotOf(tip);
 
-    if (epoch !== undefined && epochOf(tip) > epoch) wakeFollower(slot);
-    else if (finality) {
+    if (epoch !== undefined && epochOf(tip) > epoch) {
+      wakeFollower(slot);
+    } else if (finality) {
       const head = o.follower.status().headNumber;
 
-      if (head !== undefined && (finality.head === undefined || head > finality.head)) finality = undefined;
-      else if (slot - finality.slot >= retrySlots) wakeFollower(slot);
+      if (head !== undefined && (finality.head === undefined || head > finality.head)) {
+        finality = undefined;
+      } else if (slot - finality.slot >= retrySlots) {
+        wakeFollower(slot);
+      }
     }
 
     epoch = epochOf(tip);
@@ -167,7 +176,10 @@ export function createTail(o: TailOptions): Tail {
     }
 
     // The old tip is still canonical: a header changed mid catch-up (load-balanced nodes), not a reorg of ours.
-    if (ancestor?.number === oldTip.number) throw new Error(`Header chain changed above ${oldTip.number}; retrying`);
+    if (ancestor?.number === oldTip.number) {
+      throw new Error(`Header chain changed above ${oldTip.number}; retrying`);
+    }
+
     reorgs += 1;
     lastReorgDepth = oldTip.number - (ancestor?.number ?? cursor.number);
 
@@ -186,14 +198,19 @@ export function createTail(o: TailOptions): Tail {
     tip = ancestor;
     lastAdvanceAt = now();
 
-    if (head.number > ancestor.number) await append(ancestor, head, cursor.number, true);
-    else if (tip) o.onAdvance?.(tip, true);
+    if (head.number > ancestor.number) {
+      await append(ancestor, head, cursor.number, true);
+    } else if (tip) {
+      o.onAdvance?.(tip, true);
+    }
   };
 
   const run = async (): Promise<void> => {
     const follower = o.follower.status();
 
-    if (!follower.leader) return;
+    if (!follower.leader) {
+      return;
+    }
 
     try {
       const state = await store.indexState(network);
@@ -214,10 +231,19 @@ export function createTail(o: TailOptions): Tail {
         return;
       }
 
-      const anchor: BlockHeader = { number: cursor.number, hash: cursor.hash, timestamp: cursor.timestamp, parentHash: cursor.hash };
+      const anchor: BlockHeader = {
+        number: cursor.number,
+        hash: cursor.hash,
+        timestamp: cursor.timestamp,
+        parentHash: cursor.hash,
+      };
+
       const head = await adapter.latestHeader();
 
-      if (latestNumber === undefined || head.number > latestNumber) latestNumber = head.number;
+      if (latestNumber === undefined || head.number > latestNumber) {
+        latestNumber = head.number;
+      }
+
       tip = await store.tailTip(network);
       const ahead = (tip?.number ?? cursor.number) - cursor.number;
 
@@ -229,22 +255,33 @@ export function createTail(o: TailOptions): Tail {
         return;
       }
 
-      if (head.number <= cursor.number) return; // lagging fallback endpoint
+      if (head.number <= cursor.number) {
+        return;
+      } // lagging fallback endpoint
 
       if (!tip) {
-        if (head.number > cursor.number) await append(anchor, head, cursor.number);
+        if (head.number > cursor.number) {
+          await append(anchor, head, cursor.number);
+        }
       } else if (head.number < tip.number) {
         const stored = (await store.tailBlocks(network)).find((block) => block.number === head.number);
 
-        if (stored?.hash !== head.hash) await handleReorg(head, anchor);
+        if (stored?.hash !== head.hash) {
+          await handleReorg(head, anchor);
+        }
       } else if (head.number === tip.number) {
-        if (head.hash !== tip.hash) await handleReorg(head, anchor);
+        if (head.hash !== tip.hash) {
+          await handleReorg(head, anchor);
+        }
       } else {
         try {
           await append(tip, head, cursor.number);
         } catch (error) {
-          if (error instanceof ChainMismatchError) await handleReorg(head, anchor);
-          else throw error;
+          if (error instanceof ChainMismatchError) {
+            await handleReorg(head, anchor);
+          } else {
+            throw error;
+          }
         }
       }
 
@@ -259,7 +296,9 @@ export function createTail(o: TailOptions): Tail {
   };
 
   const tick = (): Promise<void> => {
-    ticking ??= run().finally(() => { ticking = undefined; });
+    ticking ??= run().finally(() => {
+      ticking = undefined;
+    });
 
     return ticking;
   };
@@ -267,7 +306,9 @@ export function createTail(o: TailOptions): Tail {
   const schedule = (): void => {
     clearTimeout(timer);
 
-    if (!stopped) timer = setTimeout(() => void cycle(), nextPollDelay(now(), offsets, tip));
+    if (!stopped) {
+      timer = setTimeout(() => void cycle(), nextPollDelay(now(), offsets, tip));
+    }
   };
 
   const cycle = async (): Promise<void> => {
@@ -286,7 +327,10 @@ export function createTail(o: TailOptions): Tail {
       // No re-validation here: leadership is not known yet at startup; the first leader tick checks the stored tip.
     },
     start() {
-      if (!stopped) return;
+      if (!stopped) {
+        return;
+      }
+
       stopped = false;
       schedule();
     },
@@ -315,7 +359,11 @@ export function createTail(o: TailOptions): Tail {
         lastAdvanceAt,
         lastError,
         healthy,
-        tailError: healthy ? undefined : tailError ?? lastError ?? (headStalled ? 'Latest head is stalled' : 'Tail has not advanced recently enough'),
+        tailError: healthy
+          ? undefined
+          : (tailError ??
+            lastError ??
+            (headStalled ? 'Latest head is stalled' : 'Tail has not advanced recently enough')),
       };
     },
   };

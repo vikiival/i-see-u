@@ -37,10 +37,15 @@ function random(seed: number): Random {
 
 const pick = <T>(rng: Random, values: readonly T[]): T => values[Math.floor(rng() * values.length)];
 
-const ordered = (events: TransferEvent[]) => events.toSorted((a, b) => a.blockNumber === b.blockNumber
-  ? a.logIndex - b.logIndex : a.blockNumber < b.blockNumber ? -1 : 1);
+const ordered = (events: TransferEvent[]) =>
+  events.toSorted((a, b) =>
+    a.blockNumber === b.blockNumber ? a.logIndex - b.logIndex : a.blockNumber < b.blockNumber ? -1 : 1,
+  );
 
-const inRange = (chain: FakeChain, range: BlockRange) => ordered(chain.transfers.filter((event) => event.blockNumber >= range.fromBlock && event.blockNumber <= range.toBlock));
+const inRange = (chain: FakeChain, range: BlockRange) =>
+  ordered(
+    chain.transfers.filter((event) => event.blockNumber >= range.fromBlock && event.blockNumber <= range.toBlock),
+  );
 
 function shuffled<T>(rng: Random, values: T[]): T[] {
   const result = [...values];
@@ -58,7 +63,9 @@ function generate(chain: FakeChain, rng: Random, from: bigint, to: bigint): Inpu
   const owners = new Map<string, Address>();
 
   for (const event of ordered(chain.transfers)) {
-    if (event.blockNumber < from && event.standard === 'erc721') owners.set(`${event.token}:${event.value}`, event.to);
+    if (event.blockNumber < from && event.standard === 'erc721') {
+      owners.set(`${event.token}:${event.value}`, event.to);
+    }
   }
 
   const events: Input[] = [];
@@ -70,7 +77,10 @@ function generate(chain: FakeChain, rng: Random, from: bigint, to: bigint): Inpu
   };
 
   for (let block = from; block <= to; block += 1n) {
-    if (block % 11n === 0n || rng() < 0.2) continue;
+    if (block % 11n === 0n || rng() < 0.2) {
+      continue;
+    }
+
     const count = 1 + Math.floor(rng() * 4);
 
     for (let i = 0; i < count; i += 1) {
@@ -81,8 +91,13 @@ function generate(chain: FakeChain, rng: Random, from: bigint, to: bigint): Inpu
         nft(block, token, value, pick(rng, [ZERO, owner, ...ACCOUNTS]));
       } else {
         const sender = pick(rng, [ZERO, ...ACCOUNTS]);
-        events.push({ token: pick(rng, ERC20), from: sender, to: pick(rng, [ZERO, sender, ...ACCOUNTS]),
-          value: pick(rng, [0n, 1n, 17n, 2n ** 255n]), blockNumber: block });
+        events.push({
+          token: pick(rng, ERC20),
+          from: sender,
+          to: pick(rng, [ZERO, sender, ...ACCOUNTS]),
+          value: pick(rng, [0n, 1n, 17n, 2n ** 255n]),
+          blockNumber: block,
+        });
       }
     }
 
@@ -103,7 +118,10 @@ function generate(chain: FakeChain, rng: Random, from: bigint, to: bigint): Inpu
 async function fixture(chain: FakeChain, tail = false): Promise<Stack> {
   const options: NonNullable<Parameters<typeof stack>[1]> = { initialize: false, range: 37n, maxRanges: 100 };
 
-  if (tail) options.tail = { maxDepth: 8n };
+  if (tail) {
+    options.tail = { maxDepth: 8n };
+  }
+
   const s = await stack(chain, options);
   s.clock.at = AT;
 
@@ -114,22 +132,37 @@ async function fixture(chain: FakeChain, tail = false): Promise<Stack> {
 async function linear(s: Stack, end: bigint): Promise<void> {
   const headers = [];
 
-  for (let number = START - 1n; number <= end; number += 1n) headers.push(await s.adapter.headerByNumber(number));
+  for (let number = START - 1n; number <= end; number += 1n) {
+    headers.push(await s.adapter.headerByNumber(number));
+  }
+
   await s.store.initialize('ethereum', START, headers[0], AT);
   await s.store.observeHead('ethereum', headers.at(-1)!, AT);
-  await s.store.appendRange('ethereum', { fromBlock: START, toBlock: end }, headers.slice(1), inRange(s.chain, { fromBlock: START, toBlock: end }), AT);
+  await s.store.appendRange(
+    'ethereum',
+    { fromBlock: START, toBlock: end },
+    headers.slice(1),
+    inRange(s.chain, { fromBlock: START, toBlock: end }),
+    AT,
+  );
 }
 
 async function dump(s: Stack) {
   return {
-    holdings: (await s.db.execute(sql`SELECT network, encode(holder, 'hex') holder, encode(token, 'hex') token,
+    holdings: (
+      await s.db.execute(sql`SELECT network, encode(holder, 'hex') holder, encode(token, 'hex') token,
       standard, first_block::text first, last_block::text last, sent_count::text sent, received_count::text received
-      FROM holdings ORDER BY network, holder, token`)).rows,
-    nfts: (await s.db.execute(sql`SELECT network, encode(token, 'hex') token, token_id::text id, encode(owner, 'hex') owner,
-      last_block::text block, last_log_index FROM nft_ownership ORDER BY network, token, token_id`)).rows,
+      FROM holdings ORDER BY network, holder, token`)
+    ).rows,
+    nfts: (
+      await s.db.execute(sql`SELECT network, encode(token, 'hex') token, token_id::text id, encode(owner, 'hex') owner,
+      last_block::text block, last_log_index FROM nft_ownership ORDER BY network, token, token_id`)
+    ).rows,
     transfers: await transferRows(s),
-    headers: (await s.db.execute(sql`SELECT network, number::text number, encode(hash, 'hex') hash,
-      encode(parent_hash, 'hex') parent, timestamp::text timestamp FROM block_headers ORDER BY network, block_headers.number`)).rows,
+    headers: (
+      await s.db.execute(sql`SELECT network, number::text number, encode(hash, 'hex') hash,
+      encode(parent_hash, 'hex') parent, timestamp::text timestamp FROM block_headers ORDER BY network, block_headers.number`)
+    ).rows,
   };
 }
 
@@ -137,16 +170,26 @@ async function dump(s: Stack) {
 async function transferRows(s: Stack, tail = false) {
   const source = tail ? sql`(SELECT * FROM transfers UNION ALL SELECT * FROM tail_transfers)` : sql`transfers`;
 
-  return (await s.db.execute(sql`SELECT network, block_number::text block, log_index, encode(block_hash, 'hex') hash,
+  return (
+    await s.db.execute(sql`SELECT network, block_number::text block, log_index, encode(block_hash, 'hex') hash,
     encode(transaction_hash, 'hex') tx, encode(token, 'hex') token, standard, encode("from", 'hex') sender,
-    encode("to", 'hex') recipient, value::text value FROM ${source} t ORDER BY network, block_number, log_index`)).rows;
+    encode("to", 'hex') recipient, value::text value FROM ${source} t ORDER BY network, block_number, log_index`)
+  ).rows;
 }
 
-const expectedRows = (chain: FakeChain, through: bigint) => inRange(chain, { fromBlock: START, toBlock: through }).map((event) => ({
-  network: 1, block: String(event.blockNumber), log_index: event.logIndex, hash: event.blockHash.slice(2),
-  tx: event.transactionHash.slice(2), token: event.token.slice(2), standard: event.standard === 'erc20' ? 20 : 721,
-  sender: event.from.slice(2), recipient: event.to.slice(2), value: String(event.value),
-}));
+const expectedRows = (chain: FakeChain, through: bigint) =>
+  inRange(chain, { fromBlock: START, toBlock: through }).map((event) => ({
+    network: 1,
+    block: String(event.blockNumber),
+    log_index: event.logIndex,
+    hash: event.blockHash.slice(2),
+    tx: event.transactionHash.slice(2),
+    token: event.token.slice(2),
+    standard: event.standard === 'erc20' ? 20 : 721,
+    sender: event.from.slice(2),
+    recipient: event.to.slice(2),
+    value: String(event.value),
+  }));
 
 interface ApiTransfer extends Omit<TransferEvent, 'value' | 'blockNumber'> {
   value: string;
@@ -203,7 +246,9 @@ async function compareApis(actual: Stack, reference: Stack, rng: Random): Promis
   for (const account of READERS) {
     for (const endpoint of ['erc20', 'erc721']) {
       const path = `/v1/ethereum/accounts/${account}/${endpoint}?finality=finalized`;
-      expect(stable(await response(actual, path)), `${account}/${endpoint}`).toEqual(stable(await response(reference, path)));
+      expect(stable(await response(actual, path)), `${account}/${endpoint}`).toEqual(
+        stable(await response(reference, path)),
+      );
     }
 
     const limit = pick(rng, [19, 37, 61]);
@@ -211,7 +256,8 @@ async function compareApis(actual: Stack, reference: Stack, rng: Random): Promis
     expect(actualPages, `${account}/transfers`).toEqual(await history(reference, account, 'finalized', limit));
     const transfers = actualPages.flatMap((page) => page.transfers ?? []);
 
-    const expected = inRange(actual.chain, { fromBlock: START, toBlock: END }).toReversed()
+    const expected = inRange(actual.chain, { fromBlock: START, toBlock: END })
+      .toReversed()
       .filter((event) => event.from === account || event.to === account)
       .map((event) => ({ ...event, blockNumber: String(event.blockNumber), value: String(event.value) }));
 
@@ -239,33 +285,57 @@ async function publish(s: Stack, rng: Random, end: bigint, injectFailures: boole
     const events = inRange(s.chain, segment);
     const pageSize = 1 + Math.floor(rng() * 11);
 
-    const commit = (crash: boolean) => bootstrap.commitSegment('ethereum', segment, 'seeded-replay', async (insert) => {
-      for (let i = 0; i < events.length; i += pageSize) {
-        await insert(events.slice(i, i + pageSize));
+    const commit = (crash: boolean) =>
+      bootstrap.commitSegment(
+        'ethereum',
+        segment,
+        'seeded-replay',
+        async (insert) => {
+          for (let i = 0; i < events.length; i += pageSize) {
+            await insert(events.slice(i, i + pageSize));
 
-        if (crash) throw new Error('injected mid-segment failure');
-      }
+            if (crash) {
+              throw new Error('injected mid-segment failure');
+            }
+          }
 
-      return { logs: events.length, requests: Math.ceil(events.length / pageSize) };
-    }, AT);
+          return { logs: events.length, requests: Math.ceil(events.length / pageSize) };
+        },
+        AT,
+      );
 
     if (injectFailures && index % 3 === 0 && events.length > pageSize) {
       const before = await dump(s);
       const status = await bootstrap.status('ethereum', AT);
       await expect(commit(true)).rejects.toThrow('injected mid-segment failure');
       expect(await dump(s), `rollback segment ${segment.fromBlock}`).toEqual(before);
-      expect(await bootstrap.status('ethereum', AT), 'failed transaction must not publish coverage/counts').toEqual(status);
+      expect(await bootstrap.status('ethereum', AT), 'failed transaction must not publish coverage/counts').toEqual(
+        status,
+      );
       failures += 1;
     }
 
     await commit(false);
     // A committed segment can be retried without invoking fill or adding counts again.
-    await bootstrap.commitSegment('ethereum', segment, 'retry', async () => { throw new Error('committed segment replayed'); }, AT);
+    await bootstrap.commitSegment(
+      'ethereum',
+      segment,
+      'retry',
+      async () => {
+        throw new Error('committed segment replayed');
+      },
+      AT,
+    );
   }
 
-  if (injectFailures) expect(failures).toBeGreaterThanOrEqual(3);
+  if (injectFailures) {
+    expect(failures).toBeGreaterThanOrEqual(3);
+  }
+
   expect(await s.store.indexState('ethereum')).toBeUndefined();
-  expect(await bootstrap.finalize('ethereum', { at: AT })).toMatchObject({ transfers: inRange(s.chain, { fromBlock: START, toBlock: end }).length });
+  expect(await bootstrap.finalize('ethereum', { at: AT })).toMatchObject({
+    transfers: inRange(s.chain, { fromBlock: START, toBlock: end }).length,
+  });
   expect(await bootstrap.status('ethereum', AT)).toMatchObject({ status: 'done', segmentsApplied: segments.length });
 }
 
@@ -274,7 +344,10 @@ for (const seed of SEEDS) {
     const rng = random(seed);
     const chain = new FakeChain(END);
 
-    for (const event of generate(chain, rng, START, END)) chain.addTransfer(event);
+    for (const event of generate(chain, rng, START, END)) {
+      chain.addTransfer(event);
+    }
+
     const actual = await fixture(chain);
     let reference: Stack | undefined;
 
@@ -285,7 +358,10 @@ for (const seed of SEEDS) {
       expect(await dump(actual)).toEqual(await dump(reference));
       expect(await transferRows(actual)).toEqual(expectedRows(chain, END));
       await compareApis(actual, reference, rng);
-    } finally { await reference?.close(); await actual.close(); }
+    } finally {
+      await reference?.close();
+      await actual.close();
+    }
   }, 30_000);
 
   it(`follower and reorging tail converge through finalization (seed=${seed})`, async () => {
@@ -294,7 +370,10 @@ for (const seed of SEEDS) {
     let latest = chain.finalized;
     chain.latest = latest;
 
-    for (const event of generate(chain, rng, START, chain.finalized)) chain.addTransfer(event);
+    for (const event of generate(chain, rng, START, chain.finalized)) {
+      chain.addTransfer(event);
+    }
+
     const actual = await fixture(chain, true);
     let reference: Stack | undefined;
 
@@ -309,10 +388,15 @@ for (const seed of SEEDS) {
         latest = next < END ? next : END;
         chain.latest = latest;
 
-        for (const event of generate(chain, rng, from, latest)) chain.addTransfer(event);
+        for (const event of generate(chain, rng, from, latest)) {
+          chain.addTransfer(event);
+        }
 
         // Bounded catch-up may take two ticks; duplicate ticks must be harmless.
-        for (let i = 0; i < 3; i += 1) await actual.tail!.tick();
+        for (let i = 0; i < 3; i += 1) {
+          await actual.tail!.tick();
+        }
+
         expect((await actual.store.tailTip('ethereum'))?.number).toBe(latest);
 
         const forks = 1 + Math.floor(rng() * 2);
@@ -321,7 +405,13 @@ for (const seed of SEEDS) {
           const depth = 1 + Math.floor(rng() * 8);
           const replacements = generate(chain, rng, latest - BigInt(depth) + 1n, latest);
           // Ensure every fork has different Transfers, even if the random suffix was empty.
-          replacements.push({ token: ERC20[2], from: ACCOUNTS[5], to: ACCOUNTS[4], value: BigInt(1000 + rounds * 10 + fork), blockNumber: latest });
+          replacements.push({
+            token: ERC20[2],
+            from: ACCOUNTS[5],
+            to: ACCOUNTS[4],
+            value: BigInt(1000 + rounds * 10 + fork),
+            blockNumber: latest,
+          });
           chain.reorg(depth, replacements);
 
           // Sometimes the follower prunes the surviving prefix before the tail notices the fork.
@@ -332,7 +422,11 @@ for (const seed of SEEDS) {
           }
 
           await actual.tail!.tick();
-          expect(actual.tail!.status()).toMatchObject({ healthy: true, lastReorgDepth: BigInt(depth), lastError: undefined });
+          expect(actual.tail!.status()).toMatchObject({
+            healthy: true,
+            lastReorgDepth: BigInt(depth),
+            lastError: undefined,
+          });
           expect(await transferRows(actual, true)).toEqual(expectedRows(chain, latest));
         }
 
@@ -343,20 +437,33 @@ for (const seed of SEEDS) {
         expect(before.finality).toBe('latest');
         const beforePages = await history(actual, account, 'latest', 37);
         await actual.follower.tick();
-        expect(actual.follower.status()).toMatchObject({ ready: true, lastError: undefined, cursor: { number: chain.finalized } });
-        expect(await transferRows(actual, true), 'handoff preserves every canonical row exactly once').toEqual(expectedRows(chain, latest));
+        expect(actual.follower.status()).toMatchObject({
+          ready: true,
+          lastError: undefined,
+          cursor: { number: chain.finalized },
+        });
+        expect(await transferRows(actual, true), 'handoff preserves every canonical row exactly once').toEqual(
+          expectedRows(chain, latest),
+        );
         expect((await actual.store.tailBlocks('ethereum')).every((block) => block.number > chain.finalized)).toBe(true);
         const after = await actual.discovery.discover('ethereum', account);
-        const counts = (view: typeof before) => view.holdings.map(({ unfinalizedSentCount: _sent, unfinalizedReceivedCount: _received, ...holding }) => holding);
+
+        const counts = (view: typeof before) =>
+          view.holdings.map(
+            ({ unfinalizedSentCount: _sent, unfinalizedReceivedCount: _received, ...holding }) => holding,
+          );
+
         expect(counts(after), 'handoff preserves discovery totals').toEqual(counts(before));
         const items = (view: typeof before) => view.nftItems.map(({ unfinalized: _tail, ...item }) => item);
 
         expect(items(after), 'handoff preserves NFT ownership').toEqual(items(before));
 
-        const flatten = (pages: Awaited<ReturnType<typeof history>>) => pages.flatMap((page) => page.transfers ?? [])
-          .map(({ unfinalized: _unfinalized, ...event }) => event);
+        const flatten = (pages: Awaited<ReturnType<typeof history>>) =>
+          pages.flatMap((page) => page.transfers ?? []).map(({ unfinalized: _unfinalized, ...event }) => event);
 
-        expect(flatten(await history(actual, account, 'latest', 37)), 'handoff preserves paginated history').toEqual(flatten(beforePages));
+        expect(flatten(await history(actual, account, 'latest', 37)), 'handoff preserves paginated history').toEqual(
+          flatten(beforePages),
+        );
         rounds += 1;
       }
 
@@ -367,20 +474,39 @@ for (const seed of SEEDS) {
       await actual.follower.tick(); // Retry after complete finalization.
       expect(actual.follower.status()).toMatchObject({ ready: true, cursor: { number: END } });
       expect(await actual.store.tailBlocks('ethereum')).toEqual([]);
-      expect((await actual.db.execute(sql`SELECT count(*)::int count FROM tail_transfers`)).rows).toEqual([{ count: 0 }]);
+      expect((await actual.db.execute(sql`SELECT count(*)::int count FROM tail_transfers`)).rows).toEqual([
+        { count: 0 },
+      ]);
       reference = await fixture(chain);
       await linear(reference, END); // Only the surviving canonical chain; no orphaned events.
       expect(await dump(actual)).toEqual(await dump(reference));
       await compareApis(actual, reference, rng);
-    } finally { await reference?.close(); await actual.close(); }
+    } finally {
+      await reference?.close();
+      await actual.close();
+    }
   }, 30_000);
 }
 
 it('tail NFT burns must not become zero-address ownership before finalization', async () => {
   const chain = new FakeChain(100n);
   chain.latest = 101n;
-  chain.addTransfer({ token: ERC721[0], standard: 'erc721', from: ZERO, to: ACCOUNTS[0], value: 7n, blockNumber: 100n });
-  chain.addTransfer({ token: ERC721[0], standard: 'erc721', from: ACCOUNTS[0], to: ZERO, value: 7n, blockNumber: 101n });
+  chain.addTransfer({
+    token: ERC721[0],
+    standard: 'erc721',
+    from: ZERO,
+    to: ACCOUNTS[0],
+    value: 7n,
+    blockNumber: 100n,
+  });
+  chain.addTransfer({
+    token: ERC721[0],
+    standard: 'erc721',
+    from: ACCOUNTS[0],
+    to: ZERO,
+    value: 7n,
+    blockNumber: 101n,
+  });
   const s = await stack(chain, { tail: { maxDepth: 8n } });
   s.clock.at = AT;
 
@@ -395,5 +521,7 @@ it('tail NFT burns must not become zero-address ownership before finalization', 
     const after = await s.discovery.discover('ethereum', ZERO, { finality: 'finalized' });
     expect(after.nftItems).toEqual([]);
     expect(before.nftItems, 'burned NFTs have no current holder, including in the tail').toEqual(after.nftItems);
-  } finally { await s.close(); }
+  } finally {
+    await s.close();
+  }
 }, 30_000);

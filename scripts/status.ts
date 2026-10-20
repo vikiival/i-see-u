@@ -9,22 +9,47 @@ import type { Store } from '../src/core/types.ts';
 let store: Store | undefined;
 
 try {
-  ({ store } = await openPostgresStore(config.databaseUrl, { max: 1, connectionTimeoutMillis: config.db.connectTimeoutMs, migrate: false }));
+  ({ store } = await openPostgresStore(config.databaseUrl, {
+    max: 1,
+    connectionTimeoutMillis: config.db.connectTimeoutMs,
+    migrate: false,
+  }));
   const rpc = createRpcClient(config.rpc);
 
-  const adapters = Object.fromEntries(Object.values(config.networks).map((network) =>
-    [network.name, createEvmAdapter(rpc, { ...network, network: network.name })]));
+  const adapters = Object.fromEntries(
+    Object.values(config.networks).map((network) => [
+      network.name,
+      createEvmAdapter(rpc, { ...network, network: network.name }),
+    ]),
+  );
 
-  const discovery = createDiscoveryService({ adapters, store, maxHeadAgeMs: config.maxHeadAgeMs, maxNoAdvanceMs: config.maxHeadProgressAgeMs });
+  const discovery = createDiscoveryService({
+    adapters,
+    store,
+    maxHeadAgeMs: config.maxHeadAgeMs,
+    maxNoAdvanceMs: config.maxHeadProgressAgeMs,
+  });
 
   for (const network of Object.keys(adapters)) {
     const snapshot = await store.opsSnapshot(network);
     const status = await discovery.status(network, snapshot);
-    console.log(JSON.stringify({
-      network, cursor: snapshot.state?.cursor.number.toString() ?? null, head: snapshot.state?.head?.number.toString() ?? null,
-      tailTip: snapshot.tipNumber?.toString() ?? null, serving: status.serving, reason: status.reason,
-      bootstrap: snapshot.bootstrap ? { ...snapshot.bootstrap, startBlock: snapshot.bootstrap.startBlock.toString(), targetBlock: snapshot.bootstrap.targetBlock.toString() } : null,
-    }));
+    console.log(
+      JSON.stringify({
+        network,
+        cursor: snapshot.state?.cursor.number.toString() ?? null,
+        head: snapshot.state?.head?.number.toString() ?? null,
+        tailTip: snapshot.tipNumber?.toString() ?? null,
+        serving: status.serving,
+        reason: status.reason,
+        bootstrap: snapshot.bootstrap
+          ? {
+              ...snapshot.bootstrap,
+              startBlock: snapshot.bootstrap.startBlock.toString(),
+              targetBlock: snapshot.bootstrap.targetBlock.toString(),
+            }
+          : null,
+      }),
+    );
   }
 } catch {
   // Drivers and invalid URL errors can embed credentials; never print the raw failure.

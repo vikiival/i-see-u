@@ -38,42 +38,65 @@ export type BootstrapResult =
 
 export class StartBlockMismatchError extends Error {}
 
-const mismatch = (stored: bigint, configured: bigint, what: string) => new StartBlockMismatchError(
-  `START_BLOCK is ${configured} but the ${what} starts at ${stored}; a different start block needs a fresh database`,
-);
+const mismatch = (stored: bigint, configured: bigint, what: string) =>
+  new StartBlockMismatchError(
+    `START_BLOCK is ${configured} but the ${what} starts at ${stored}; a different start block needs a fresh database`,
+  );
 
 /** Startup guard: the configured start block must match the initialized index and any bootstrap in progress. */
-export async function assertStartBlock(index: Pick<Store, 'indexState'>, store: BootstrapStore, network: string, startBlock: bigint): Promise<void> {
+export async function assertStartBlock(
+  index: Pick<Store, 'indexState'>,
+  store: BootstrapStore,
+  network: string,
+  startBlock: bigint,
+): Promise<void> {
   const state = await index.indexState(network);
 
-  if (state && state.startBlock !== startBlock) throw mismatch(state.startBlock, startBlock, `${network} index`);
+  if (state && state.startBlock !== startBlock) {
+    throw mismatch(state.startBlock, startBlock, `${network} index`);
+  }
+
   const run = await store.run(network);
 
-  if (run && run.startBlock !== startBlock) throw mismatch(run.startBlock, startBlock, `${network} bootstrap run`);
+  if (run && run.startBlock !== startBlock) {
+    throw mismatch(run.startBlock, startBlock, `${network} bootstrap run`);
+  }
 }
 
 /** Contiguous numbers, linked parents, joined to `parentHash`, optionally ending at `lastHash`. */
 function verifyHeaders(range: BlockRange, headers: BootstrapHeader[], parentHash: Hex, lastHash?: Hex): void {
-  if (BigInt(headers.length) !== range.toBlock - range.fromBlock + 1n) throw new VerificationError(`Expected ${range.toBlock - range.fromBlock + 1n} headers, got ${headers.length}`);
+  if (BigInt(headers.length) !== range.toBlock - range.fromBlock + 1n) {
+    throw new VerificationError(`Expected ${range.toBlock - range.fromBlock + 1n} headers, got ${headers.length}`);
+  }
+
   let parent = parentHash;
 
   for (const [i, header] of headers.entries()) {
-    if (header.number !== range.fromBlock + BigInt(i)) throw new VerificationError(`Header ${header.number} out of order`);
+    if (header.number !== range.fromBlock + BigInt(i)) {
+      throw new VerificationError(`Header ${header.number} out of order`);
+    }
 
-    if (header.parentHash !== parent) throw new VerificationError(`Parent-hash chain breaks at ${header.number}`);
+    if (header.parentHash !== parent) {
+      throw new VerificationError(`Parent-hash chain breaks at ${header.number}`);
+    }
+
     parent = header.hash;
   }
 
-  if (lastHash !== undefined && parent !== lastHash) throw new VerificationError('Header chain does not end at the pinned finalized block');
+  if (lastHash !== undefined && parent !== lastHash) {
+    throw new VerificationError('Header chain does not end at the pinned finalized block');
+  }
 }
 
 const describe = (status: BootstrapStatus): string => {
   const eta = status.etaS === undefined ? '' : `, ETA ${Math.floor(status.etaS / 60)}m${status.etaS % 60}s`;
   const rate = status.logsPerS === undefined ? '' : `, ${status.logsPerS} logs/s`;
 
-  return `${status.status}: headers ${status.headersLoaded}/${status.headersTotal}, segments ${status.segmentsDone}/${status.segmentsTotal}, applied ${status.segmentsApplied}/${status.segmentsTotal}`
-    + (status.indexesTotal ? `, index ${status.indexesDone}/${status.indexesTotal}` : '')
-    + `${status.segmentsFailed ? ` (${status.segmentsFailed} failed)` : ''}, ${status.logs} logs${rate}${eta}`;
+  return (
+    `${status.status}: headers ${status.headersLoaded}/${status.headersTotal}, segments ${status.segmentsDone}/${status.segmentsTotal}, applied ${status.segmentsApplied}/${status.segmentsTotal}` +
+    (status.indexesTotal ? `, index ${status.indexesDone}/${status.indexesTotal}` : '') +
+    `${status.segmentsFailed ? ` (${status.segmentsFailed} failed)` : ''}, ${status.logs} logs${rate}${eta}`
+  );
 };
 
 /**
@@ -92,41 +115,79 @@ export async function runBootstrap(o: BootstrapOptions): Promise<BootstrapResult
   o.signal?.throwIfAborted();
 
   if (state) {
-    if (state.startBlock !== o.startBlock) throw mismatch(state.startBlock, o.startBlock, `${network} index`);
+    if (state.startBlock !== o.startBlock) {
+      throw mismatch(state.startBlock, o.startBlock, `${network} index`);
+    }
 
     return { status: 'already-initialized' };
   }
 
-  if (o.startBlock < 1n) throw new Error('START_BLOCK must be at least 1');
+  if (o.startBlock < 1n) {
+    throw new Error('START_BLOCK must be at least 1');
+  }
+
   let run = await store.run(network);
 
-  if (run && run.startBlock !== o.startBlock) throw mismatch(run.startBlock, o.startBlock, `${network} bootstrap run`);
+  if (run && run.startBlock !== o.startBlock) {
+    throw mismatch(run.startBlock, o.startBlock, `${network} bootstrap run`);
+  }
 
   if (!run) {
     const head = await o.adapter.finalizedHead();
     o.signal?.throwIfAborted();
 
-    if (head.stale || head.refreshFailed) throw new Error('Finalized head observation is stale');
+    if (head.stale || head.refreshFailed) {
+      throw new Error('Finalized head observation is stale');
+    }
 
-    if (head.block.number < o.startBlock) throw new Error(`START_BLOCK ${o.startBlock} is above the finalized head ${head.block.number}`);
-    const [target, anchor] = await Promise.all([o.adapter.headerByNumber(head.block.number), o.adapter.headerByNumber(o.startBlock - 1n)]);
+    if (head.block.number < o.startBlock) {
+      throw new Error(`START_BLOCK ${o.startBlock} is above the finalized head ${head.block.number}`);
+    }
+
+    const [target, anchor] = await Promise.all([
+      o.adapter.headerByNumber(head.block.number),
+      o.adapter.headerByNumber(o.startBlock - 1n),
+    ]);
+
     o.signal?.throwIfAborted();
 
-    if (target.hash !== head.block.hash) throw new Error('Finalized header changed while pinning the target');
-    run = await store.createRun(network, { startBlock: o.startBlock, target, anchor, segmentBlocks: o.segmentBlocks ?? 1_000n }, now());
-    log(`pinned finalized target ${run.targetBlock} (${run.targetBlock - run.startBlock + 1n} blocks from ${run.startBlock})`);
+    if (target.hash !== head.block.hash) {
+      throw new Error('Finalized header changed while pinning the target');
+    }
+
+    run = await store.createRun(
+      network,
+      { startBlock: o.startBlock, target, anchor, segmentBlocks: o.segmentBlocks ?? 1_000n },
+      now(),
+    );
+    log(
+      `pinned finalized target ${run.targetBlock} (${run.targetBlock - run.startBlock + 1n} blocks from ${run.startBlock})`,
+    );
   }
 
-  if (run.status === 'done') throw new Error('Bootstrap run is done but the index is missing');
+  if (run.status === 'done') {
+    throw new Error('Bootstrap run is done but the index is missing');
+  }
+
   const { reset } = await store.resume(network, now());
 
-  if (reset) log('UNLOGGED staging rows were lost (PostgreSQL crash?); reloading unapplied legacy segments');
+  if (reset) {
+    log('UNLOGGED staging rows were lost (PostgreSQL crash?); reloading unapplied legacy segments');
+  }
+
   const target = run.targetBlock;
   const sources = [o.hypersync, o.rpc].filter((source) => source !== undefined);
   const other = (source: BootstrapSource) => sources.find((candidate) => candidate !== source);
 
   const timer = setInterval(() => {
-    store.status(network, now()).then((status) => { if (status) log(describe(status)); }, () => {});
+    store.status(network, now()).then(
+      (status) => {
+        if (status) {
+          log(describe(status));
+        }
+      },
+      () => {},
+    );
   }, o.progressMs ?? 10_000);
 
   try {
@@ -138,10 +199,16 @@ export async function runBootstrap(o: BootstrapOptions): Promise<BootstrapResult
       o.signal?.throwIfAborted();
       const range = { fromBlock: from, toBlock: from + chunk - 1n < target ? from + chunk - 1n : target };
 
-      if (await store.headerCount(network, range) === Number(range.toBlock - range.fromBlock + 1n)) continue;
+      if ((await store.headerCount(network, range)) === Number(range.toBlock - range.fromBlock + 1n)) {
+        continue;
+      }
+
       const parent = await store.headerAt(network, from - 1n);
 
-      if (!parent) throw new Error(`Missing staged header ${from - 1n}`);
+      if (!parent) {
+        throw new Error(`Missing staged header ${from - 1n}`);
+      }
+
       let saved = false;
       const errors: string[] = [];
 
@@ -160,7 +227,9 @@ export async function runBootstrap(o: BootstrapOptions): Promise<BootstrapResult
         }
       }
 
-      if (!saved) throw new Error(`Headers ${range.fromBlock}-${range.toBlock} failed on every source: ${errors.join('; ')}`);
+      if (!saved) {
+        throw new Error(`Headers ${range.fromBlock}-${range.toBlock} failed on every source: ${errors.join('; ')}`);
+      }
     }
 
     // 2. Segments: HyperSync takes the low end, RPC workers the high end; each verified segment commits atomically.
@@ -172,7 +241,10 @@ export async function runBootstrap(o: BootstrapOptions): Promise<BootstrapResult
     const load = async (segment: Segment, first: BootstrapSource): Promise<void> => {
       const headers = await store.headers(network, segment);
 
-      if (BigInt(headers.length) !== segment.toBlock - segment.fromBlock + 1n) throw new Error(`Missing staged headers for ${segment.fromBlock}-${segment.toBlock}`);
+      if (BigInt(headers.length) !== segment.toBlock - segment.fromBlock + 1n) {
+        throw new Error(`Missing staged headers for ${segment.fromBlock}-${segment.toBlock}`);
+      }
+
       const byNumber = new Map(headers.map((header) => [header.number, header]));
       const order = [first, ...sources.filter((source) => source !== first)];
       let lastError = '';
@@ -181,58 +253,83 @@ export async function runBootstrap(o: BootstrapOptions): Promise<BootstrapResult
         o.signal?.throwIfAborted();
 
         try {
-          await store.commitSegment(network, segment, source.name, async (insert) => {
-            o.signal?.throwIfAborted();
-            const counts = new Map<bigint, number>();
-            let previous = { block: -1n, index: -1 };
-            let logs = 0;
+          await store.commitSegment(
+            network,
+            segment,
+            source.name,
+            async (insert) => {
+              o.signal?.throwIfAborted();
+              const counts = new Map<bigint, number>();
+              let previous = { block: -1n, index: -1 };
+              let logs = 0;
 
-            const { requests } = await source.transfers({ fromBlock: segment.fromBlock, toBlock: segment.toBlock }, async (events) => {
+              const { requests } = await source.transfers(
+                { fromBlock: segment.fromBlock, toBlock: segment.toBlock },
+                async (events) => {
+                  o.signal?.throwIfAborted();
+
+                  for (const event of events) {
+                    const header = byNumber.get(event.blockNumber);
+
+                    if (!header) {
+                      throw new VerificationError(`Log at block ${event.blockNumber} is outside the segment`);
+                    }
+
+                    if (header.hash !== event.blockHash) {
+                      throw new VerificationError(`Log block hash does not match header at ${event.blockNumber}`);
+                    }
+
+                    if (
+                      event.blockNumber < previous.block ||
+                      (event.blockNumber === previous.block && event.logIndex <= previous.index)
+                    ) {
+                      throw new VerificationError(
+                        `Logs out of order or duplicated at ${event.blockNumber}:${event.logIndex}`,
+                      );
+                    }
+
+                    previous = { block: event.blockNumber, index: event.logIndex };
+                    counts.set(event.blockNumber, (counts.get(event.blockNumber) ?? 0) + 1);
+                  }
+
+                  logs += events.length;
+                  await insert(events);
+                  o.signal?.throwIfAborted();
+                },
+              );
+
               o.signal?.throwIfAborted();
 
-              for (const event of events) {
-                const header = byNumber.get(event.blockNumber);
+              // A block without decoded Transfers whose bloom may contain the topic is re-asked (other source first).
+              const probe = other(source) ?? source;
 
-                if (!header) throw new VerificationError(`Log at block ${event.blockNumber} is outside the segment`);
-
-                if (header.hash !== event.blockHash) throw new VerificationError(`Log block hash does not match header at ${event.blockNumber}`);
-
-                if (event.blockNumber < previous.block || (event.blockNumber === previous.block && event.logIndex <= previous.index)) {
-                  throw new VerificationError(`Logs out of order or duplicated at ${event.blockNumber}:${event.logIndex}`);
+              for (const header of headers) {
+                if (counts.has(header.number) || !header.transferBloom) {
+                  continue;
                 }
 
-                previous = { block: event.blockNumber, index: event.logIndex };
-                counts.set(event.blockNumber, (counts.get(event.blockNumber) ?? 0) + 1);
+                const again = await probe.blockTransfers(header);
+                o.signal?.throwIfAborted();
+
+                if (again.some((event) => event.blockHash !== header.hash || event.blockNumber !== header.number)) {
+                  throw new VerificationError(
+                    `Block ${header.number}: ${probe.name} cross-check returned logs with a different block hash or number`,
+                  );
+                }
+
+                if (again.length > 0) {
+                  throw new VerificationError(
+                    `Block ${header.number}: logsBloom has Transfer and ${probe.name} returned ${again.length} logs, ${source.name} none`,
+                  );
+                }
               }
 
-              logs += events.length;
-              await insert(events);
               o.signal?.throwIfAborted();
-            });
 
-            o.signal?.throwIfAborted();
-
-            // A block without decoded Transfers whose bloom may contain the topic is re-asked (other source first).
-            const probe = other(source) ?? source;
-
-            for (const header of headers) {
-              if (counts.has(header.number) || !header.transferBloom) continue;
-              const again = await probe.blockTransfers(header);
-              o.signal?.throwIfAborted();
-
-              if (again.some((event) => event.blockHash !== header.hash || event.blockNumber !== header.number)) {
-                throw new VerificationError(`Block ${header.number}: ${probe.name} cross-check returned logs with a different block hash or number`);
-              }
-
-              if (again.length > 0) {
-                throw new VerificationError(`Block ${header.number}: logsBloom has Transfer and ${probe.name} returned ${again.length} logs, ${source.name} none`);
-              }
-            }
-
-            o.signal?.throwIfAborted();
-
-            return { logs, requests };
-          }, now());
+              return { logs, requests };
+            },
+            now(),
+          );
 
           return;
         } catch (error) {
@@ -251,7 +348,10 @@ export async function runBootstrap(o: BootstrapOptions): Promise<BootstrapResult
       while (!o.signal?.aborted) {
         const segment = fromLowEnd ? queue.shift() : queue.pop();
 
-        if (!segment) return;
+        if (!segment) {
+          return;
+        }
+
         await load(segment, source);
       }
     };
@@ -263,26 +363,40 @@ export async function runBootstrap(o: BootstrapOptions): Promise<BootstrapResult
 
     const failed = workers.find((worker) => worker.status === 'rejected');
 
-    if (failed) throw failed.reason;
+    if (failed) {
+      throw failed.reason;
+    }
+
     o.signal?.throwIfAborted();
 
-    if (failedSegments > 0) throw new Error(`${failedSegments} segments failed on every source; rerun to resume the remaining segments`);
+    if (failedSegments > 0) {
+      throw new Error(`${failedSegments} segments failed on every source; rerun to resume the remaining segments`);
+    }
 
     // 3. Replay any old staged segments independently, then publish atomically.
     await store.setPhase(network, 'materializing', now());
     log('all segments loaded; applying any legacy staged segments, then publishing');
-    const finalized = await store.finalize(network, { at: now(), workMem: o.workMem, maintenanceWorkMem: o.maintenanceWorkMem });
 
-    if (o.analyze ?? true) await store.analyze();
+    const finalized = await store.finalize(network, {
+      at: now(),
+      workMem: o.workMem,
+      maintenanceWorkMem: o.maintenanceWorkMem,
+    });
+
+    if (o.analyze ?? true) {
+      await store.analyze();
+    }
+
     const seconds = Math.round((now() - started) / 1_000);
     log(`done: ${finalized.transfers} transfers, ${finalized.headers} headers, cursor at ${target} in ${seconds}s`);
 
     return { status: 'done', target, ...finalized, failedAttempts, seconds };
   } catch (error) {
-    await store.setPhase(network, (await store.run(network))?.status ?? 'headers', now(), thrownMessage(error).slice(0, 500)).catch(() => {});
+    await store
+      .setPhase(network, (await store.run(network))?.status ?? 'headers', now(), thrownMessage(error).slice(0, 500))
+      .catch(() => {});
     throw error;
   } finally {
     clearInterval(timer);
   }
 }
-

@@ -29,12 +29,16 @@ export function createHypersyncLogSource(options: HypersyncSourceOptions): Accou
   let client: Promise<HypersyncFactoryResult> | undefined;
   let closed = false;
   const secrets = [options.apiToken, options.url];
-  const factory = options.clientFactory ?? (() => nativeHypersyncClient(options.url, options.apiToken, options.timeoutMs));
+
+  const factory =
+    options.clientFactory ?? (() => nativeHypersyncClient(options.url, options.apiToken, options.timeoutMs));
 
   const getClient = (): Promise<HypersyncFactoryResult> => {
-    if (closed) throw new Error('HyperSync source is closed');
+    if (closed) {
+      throw new Error('HyperSync source is closed');
+    }
 
-    return client ??= factory();
+    return (client ??= factory());
   };
 
   return {
@@ -46,7 +50,10 @@ export function createHypersyncLogSource(options: HypersyncSourceOptions): Accou
       try {
         const exclusive = range.toBlock + 1n;
 
-        if (range.fromBlock < 0n || exclusive > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error('HyperSync block range is not safely representable');
+        if (range.fromBlock < 0n || exclusive > BigInt(Number.MAX_SAFE_INTEGER)) {
+          throw new Error('HyperSync block range is not safely representable');
+        }
+
         const { client: hs, joinNothing } = await getClient();
         const paddedAccount = pad(account, { size: 32 }).toLowerCase();
 
@@ -65,15 +72,26 @@ export function createHypersyncLogSource(options: HypersyncSourceOptions): Accou
         let calls = 0;
 
         const pages = hypersyncPages(hs, query, {
-          idleMs: options.timeoutMs, sleep: options.sleep, aborted: () => closed, onRequest: () => { calls += 1; state.requests += 1; },
+          idleMs: options.timeoutMs,
+          sleep: options.sleep,
+          aborted: () => closed,
+          onRequest: () => {
+            calls += 1;
+            state.requests += 1;
+          },
         });
 
         for await (const response of pages) {
           for (const raw of response.data.logs) {
-            if (!isObject(raw) || !Array.isArray(raw.topics)) throw new Error('HyperSync returned a malformed log');
+            if (!isObject(raw) || !Array.isArray(raw.topics)) {
+              throw new Error('HyperSync returned a malformed log');
+            }
+
             const event = decodeTransferLog(wireLog(raw));
 
-            if (event) addTransfer(aggregate, account, event);
+            if (event) {
+              addTransfer(aggregate, account, event);
+            }
           }
         }
 

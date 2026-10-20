@@ -11,18 +11,37 @@ export interface HypersyncFactoryResult {
 
 /** The log fields every HyperSync query selects. */
 export const LOG_FIELDS: NonNullable<NonNullable<Query['fieldSelection']>['log']> = [
-  'BlockNumber', 'BlockHash', 'LogIndex', 'TransactionHash', 'Address', 'Topic0', 'Topic1', 'Topic2', 'Topic3', 'Data',
+  'BlockNumber',
+  'BlockHash',
+  'LogIndex',
+  'TransactionHash',
+  'Address',
+  'Topic0',
+  'Topic1',
+  'Topic2',
+  'Topic3',
+  'Data',
 ];
 
 const integer = (value: unknown): value is number => isNumber(value) && Number.isSafeInteger(value) && value >= 0;
 const quantity = (value: number): `0x${string}` => `0x${value.toString(16)}`;
 
 /** The native client, configured to report 429s to us instead of sleeping silently inside a request. */
-export async function nativeHypersyncClient(url: string, apiToken: string, timeoutMs: number): Promise<HypersyncFactoryResult> {
+export async function nativeHypersyncClient(
+  url: string,
+  apiToken: string,
+  timeoutMs: number,
+): Promise<HypersyncFactoryResult> {
   const { HypersyncClient, JoinMode } = await import('@envio-dev/hypersync-client');
 
   return {
-    client: new HypersyncClient({ url, apiToken, httpReqTimeoutMillis: timeoutMs, proactiveRateLimitSleep: false, maxNumRetries: 3 }),
+    client: new HypersyncClient({
+      url,
+      apiToken,
+      httpReqTimeoutMillis: timeoutMs,
+      proactiveRateLimitSleep: false,
+      maxNumRetries: 3,
+    }),
     joinNothing: JoinMode.JoinNothing,
   };
 }
@@ -31,7 +50,9 @@ export async function nativeHypersyncClient(url: string, apiToken: string, timeo
 export const wireLog = (log: Log): WireLog => {
   const topics = [...log.topics];
 
-  while (topics.length > 0 && topics.at(-1) == null) topics.pop();
+  while (topics.length > 0 && topics.at(-1) == null) {
+    topics.pop();
+  }
 
   return {
     address: log.address,

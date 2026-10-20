@@ -1,6 +1,14 @@
 import { afterEach, expect, test, vi } from 'vitest';
 import { pad } from 'viem';
-import type { Address, Hex, RpcClient, RpcRequestOptions, RpcStats, TransferDirection, TransferEvent } from '../src/core/types.ts';
+import type {
+  Address,
+  Hex,
+  RpcClient,
+  RpcRequestOptions,
+  RpcStats,
+  TransferDirection,
+  TransferEvent,
+} from '../src/core/types.ts';
 import { decodeTransferLog, scanAccountChunk, scanTransfers, TRANSFER_TOPIC } from '../src/chains/evm/logs.ts';
 import { RpcError } from '../src/rpc/errors.ts';
 import { createRpcClient } from '../src/rpc/client.ts';
@@ -18,7 +26,11 @@ const hash = (value: bigint): Hex => `0x${value.toString(16).padStart(64, '0')}`
 const topic = (value: Address): Hex => pad(value, { size: 32 });
 const stats = (): RpcStats => ({ requests: 0, attempts: 0, byMethod: {}, errors: {}, endpoints: [] });
 
-const wireLog = (block: bigint, topics = [TRANSFER_TOPIC, topic(OTHER), topic(ACCOUNT)], data = `0x${123n.toString(16).padStart(64, '0')}`) => ({
+const wireLog = (
+  block: bigint,
+  topics = [TRANSFER_TOPIC, topic(OTHER), topic(ACCOUNT)],
+  data = `0x${123n.toString(16).padStart(64, '0')}`,
+) => ({
   address: TOKEN.toUpperCase().replace('0X', '0x'),
   topics,
   data,
@@ -63,12 +75,17 @@ test('a wrapped too_large RpcError drives suggested range splitting through the 
       requested.push([from, to]);
 
       if (to - from + 1n > 2n) {
-        throw new RpcError('too_large', `query returned more than 10000 results. Try with this block range [0x${from.toString(16)}, 0x${(from + 1n).toString(16)}]`);
+        throw new RpcError(
+          'too_large',
+          `query returned more than 10000 results. Try with this block range [0x${from.toString(16)}, 0x${(from + 1n).toString(16)}]`,
+        );
       }
 
       const logs = [];
 
-      for (let block = from; block <= to; block += 1n) logs.push(wireLog(block));
+      for (let block = from; block <= to; block += 1n) {
+        logs.push(wireLog(block));
+      }
 
       return staged<T>(logs);
     },
@@ -76,10 +93,16 @@ test('a wrapped too_large RpcError drives suggested range splitting through the 
   };
 
   const events: TransferEvent[] = [];
-  const result = await scanTransfers(rpc, ACCOUNT, 'to', { fromBlock: 1n, toBlock: 5n }, event => events.push(event));
+  const result = await scanTransfers(rpc, ACCOUNT, 'to', { fromBlock: 1n, toBlock: 5n }, (event) => events.push(event));
   expect(result).toMatchObject({ calls: 5, split: true });
-  expect(requested).toEqual([[1n, 5n], [1n, 2n], [3n, 5n], [3n, 4n], [5n, 5n]]);
-  expect(events.map(event => event.blockNumber)).toEqual([1n, 2n, 3n, 4n, 5n]);
+  expect(requested).toEqual([
+    [1n, 5n],
+    [1n, 2n],
+    [3n, 5n],
+    [3n, 4n],
+    [5n, 5n],
+  ]);
+  expect(events.map((event) => event.blockNumber)).toEqual([1n, 2n, 3n, 4n, 5n]);
 });
 
 test('fetchTransfers halves without a usable suggestion and stops at one block', async () => {
@@ -93,15 +116,18 @@ test('fetchTransfers halves without a usable suggestion and stops at one block',
       const from = BigInt(filter.fromBlock);
       const to = BigInt(filter.toBlock);
 
-      if (from === to) throw new RpcError('too_large', 'response size exceeded');
+      if (from === to) {
+        throw new RpcError('too_large', 'response size exceeded');
+      }
+
       throw new RpcError('too_large', 'response size exceeded');
     },
     stats,
   };
 
-  await expect(
-    scanTransfers(rpc, ACCOUNT, 'from', { fromBlock: 10n, toBlock: 12n }, () => {}),
-  ).rejects.toMatchObject({ kind: 'too_large' });
+  await expect(scanTransfers(rpc, ACCOUNT, 'from', { fromBlock: 10n, toBlock: 12n }, () => {})).rejects.toMatchObject({
+    kind: 'too_large',
+  });
   expect(calls, '3-block range halves to 2 blocks, then reaches the failing single block').toBe(3);
 });
 
@@ -115,7 +141,9 @@ test('a timeout on a multi-block range splits it in half; a single block retries
       const to = BigInt(filter.toBlock);
       requested.push([from, to, opts?.failFastOnTimeout]);
 
-      if (to - from + 1n > 2n) throw new RpcError('transient', 'RPC request timed out', { timeout: true });
+      if (to - from + 1n > 2n) {
+        throw new RpcError('transient', 'RPC request timed out', { timeout: true });
+      }
 
       return staged<T>([wireLog(from)]);
     },
@@ -123,12 +151,18 @@ test('a timeout on a multi-block range splits it in half; a single block retries
   };
 
   const events: TransferEvent[] = [];
-  const result = await scanTransfers(rpc, ACCOUNT, 'to', { fromBlock: 1n, toBlock: 8n }, event => events.push(event));
+  const result = await scanTransfers(rpc, ACCOUNT, 'to', { fromBlock: 1n, toBlock: 8n }, (event) => events.push(event));
   expect(result).toMatchObject({ calls: 7, split: true });
   expect(requested).toEqual([
-    [1n, 8n, true], [1n, 4n, true], [1n, 2n, true], [3n, 4n, true], [5n, 8n, true], [5n, 6n, true], [7n, 8n, true],
+    [1n, 8n, true],
+    [1n, 4n, true],
+    [1n, 2n, true],
+    [3n, 4n, true],
+    [5n, 8n, true],
+    [5n, 6n, true],
+    [7n, 8n, true],
   ]);
-  expect(events.map(event => event.blockNumber)).toEqual([1n, 3n, 5n, 7n]);
+  expect(events.map((event) => event.blockNumber)).toEqual([1n, 3n, 5n, 7n]);
 
   requested.length = 0;
   await scanTransfers(rpc, ACCOUNT, 'to', { fromBlock: 9n, toBlock: 9n }, () => {});
@@ -136,7 +170,10 @@ test('a timeout on a multi-block range splits it in half; a single block retries
 });
 
 test('scanAccountChunk folds both directions into one aggregate and flags heavy chunks', async () => {
-  const self = (block: bigint, logIndex: string) => ({ ...wireLog(block, [TRANSFER_TOPIC, topic(ACCOUNT), topic(ACCOUNT)]), logIndex });
+  const self = (block: bigint, logIndex: string) => ({
+    ...wireLog(block, [TRANSFER_TOPIC, topic(ACCOUNT), topic(ACCOUNT)]),
+    logIndex,
+  });
 
   const responses = {
     from: [self(5n, '0x1'), self(5n, '0x2'), wireLog(4n, [TRANSFER_TOPIC, topic(ACCOUNT), topic(OTHER)])],
@@ -151,7 +188,7 @@ test('scanAccountChunk folds both directions into one aggregate and flags heavy 
       const filter = rpcParam<{ topics: unknown[] }>(params, 0);
       opts?.onAttempt?.({ ok: true, durationMs, bytes });
 
-      return staged<T>((filter.topics[1] === null ? responses.to : responses.from));
+      return staged<T>(filter.topics[1] === null ? responses.to : responses.from);
     },
     stats,
   };
@@ -160,7 +197,13 @@ test('scanAccountChunk folds both directions into one aggregate and flags heavy 
   const light = await scanAccountChunk(rpc, ACCOUNT, range);
   expect(light.calls).toBe(2);
   expect(light.heavy).toBe(false);
-  expect(light.aggregate.tokens.get(TOKEN)).toEqual({ standard: 'erc20', firstBlock: 4n, lastBlock: 6n, sentCount: 3, receivedCount: 3 });
+  expect(light.aggregate.tokens.get(TOKEN)).toEqual({
+    standard: 'erc20',
+    firstBlock: 4n,
+    lastBlock: 6n,
+    sentCount: 3,
+    receivedCount: 3,
+  });
 
   bytes = 60_000_000; // above the 50 MB threshold
   expect((await scanAccountChunk(rpc, ACCOUNT, range)).heavy).toBe(true);
@@ -178,29 +221,33 @@ test('scanAccountChunk rejects with the failing direction error', async () => {
     async request<T>(_method: string, params: unknown[]): Promise<T> {
       const filter = rpcParam<{ topics: unknown[] }>(params, 0);
 
-      if (filter.topics[1] === null) throw new RpcError('fatal', 'received side failed');
+      if (filter.topics[1] === null) {
+        throw new RpcError('fatal', 'received side failed');
+      }
 
       return staged<T>([]);
     },
     stats,
   };
 
-  await expect(scanAccountChunk(rpc, ACCOUNT, { fromBlock: 1n, toBlock: 2n }))
-    .rejects.toThrow('received side failed');
+  await expect(scanAccountChunk(rpc, ACCOUNT, { fromBlock: 1n, toBlock: 2n })).rejects.toThrow('received side failed');
 });
 
 test('a non-array eth_getLogs result fails over through RpcClient', async () => {
   const urls: string[] = [];
   vi.spyOn(Math, 'random').mockReturnValue(0);
-  vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
-    urls.push(String(input));
-    const result = String(input).startsWith('https://primary.example') ? null : [wireLog(7n)];
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: string | URL | Request) => {
+      urls.push(String(input));
+      const result = String(input).startsWith('https://primary.example') ? null : [wireLog(7n)];
 
-    return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result }), {
-      status: 200,
-      headers: { 'content-type': 'application/json' },
-    });
-  }));
+      return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }),
+  );
 
   const rpc = createRpcClient({
     urls: ['https://primary.example/key', 'https://fallback.example/key'],
@@ -210,9 +257,9 @@ test('a non-array eth_getLogs result fails over through RpcClient', async () => 
   });
 
   const events: TransferEvent[] = [];
-  await scanTransfers(rpc, ACCOUNT, 'to', { fromBlock: 7n, toBlock: 7n }, event => events.push(event));
-  expect(events.map(event => event.blockNumber)).toEqual([7n]);
-  expect(urls.map(url => new URL(url).host)).toEqual(['primary.example', 'fallback.example']);
+  await scanTransfers(rpc, ACCOUNT, 'to', { fromBlock: 7n, toBlock: 7n }, (event) => events.push(event));
+  expect(events.map((event) => event.blockNumber)).toEqual([7n]);
+  expect(urls.map((url) => new URL(url).host)).toEqual(['primary.example', 'fallback.example']);
   expect(rpc.stats().errors).toEqual({ transient: 1 });
 });
 
@@ -225,8 +272,9 @@ test('an out-of-range eth_getLogs response is rejected before any log is folded'
   };
 
   const events: TransferEvent[] = [];
-  await expect(scanTransfers(rpc, ACCOUNT, 'to', { fromBlock: 7n, toBlock: 7n }, event => events.push(event)))
-    .rejects.toMatchObject({ kind: 'transient', message: 'Log block 8 outside requested range 7-7' });
+  await expect(
+    scanTransfers(rpc, ACCOUNT, 'to', { fromBlock: 7n, toBlock: 7n }, (event) => events.push(event)),
+  ).rejects.toMatchObject({ kind: 'transient', message: 'Log block 8 outside requested range 7-7' });
   expect(events).toEqual([]);
 });
 
@@ -240,14 +288,20 @@ test('scanAccountChunk aborts the other direction in flight when one fails, and 
       requests.push({ direction, signal: opts?.signal });
 
       // The received side fails once the sent side is in flight; a too_large answer would split it into more requests.
-      if (direction === 'to') throw new RpcError('fatal', 'received side failed');
+      if (direction === 'to') {
+        throw new RpcError('fatal', 'received side failed');
+      }
 
-      return new Promise<never>((_resolve, reject) => opts?.signal?.addEventListener('abort', () => reject(new RpcError('too_large', 'split me'))));
+      return new Promise<never>((_resolve, reject) =>
+        opts?.signal?.addEventListener('abort', () => reject(new RpcError('too_large', 'split me'))),
+      );
     },
     stats,
   };
 
-  await expect(scanAccountChunk(rpc, ACCOUNT, { fromBlock: 1n, toBlock: 100n })).rejects.toThrow('received side failed');
+  await expect(scanAccountChunk(rpc, ACCOUNT, { fromBlock: 1n, toBlock: 100n })).rejects.toThrow(
+    'received side failed',
+  );
   expect(requests.map((request) => request.direction)).toEqual(['from', 'to']);
   expect(requests[0].signal?.aborted).toBe(true);
 });
@@ -262,7 +316,10 @@ test('scanTransfers stops before the next range once its signal aborts', async (
       requested.push(`${filter.fromBlock}-${filter.toBlock}`);
 
       // The whole range splits in two; the caller gives up while the first half is in flight.
-      if (requested.length === 1) throw new RpcError('too_large', 'too many results');
+      if (requested.length === 1) {
+        throw new RpcError('too_large', 'too many results');
+      }
+
       controller.abort(new Error('caller gave up'));
 
       return staged<T>([]);
@@ -270,6 +327,8 @@ test('scanTransfers stops before the next range once its signal aborts', async (
     stats,
   };
 
-  await expect(scanTransfers(rpc, ACCOUNT, 'to', { fromBlock: 1n, toBlock: 100n }, () => {}, controller.signal)).rejects.toThrow('caller gave up');
+  await expect(
+    scanTransfers(rpc, ACCOUNT, 'to', { fromBlock: 1n, toBlock: 100n }, () => {}, controller.signal),
+  ).rejects.toThrow('caller gave up');
   expect(requested).toEqual(['0x1-0x64', '0x1-0x32']);
 });
