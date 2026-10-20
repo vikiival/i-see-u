@@ -2,6 +2,8 @@
 
 The Subsquid reimplementation in `../disquid` was run live against Ethereum mainnet over JSON-RPC only, from block **26,104,555** to the head, and kept following it for 34.6 hours. Everything below is **measured**, unless it is marked *derived* (computed from code or from other measurements). The design is in `../disquid/DESIGN.md`; how it came about is in [PROGRESS.md §18](PROGRESS.md).
 
+> **Update after these runs.** i-see-u no longer answers 503 `not_ready` because of index state (commits `2268cbd`, `5cccd13`). The finalized-epoch window and any other lag now return 200 with `stale: true` and a `staleReason`, holding exact data at the follower cursor. A running bootstrap returns 200 `status: "partial"` with the covered ranges. 503 remains only for database, RPC, queue or deadline failures. The 503 figures below were measured before that change. The load tests were not re-run.
+
 ## Setup
 
 | | |
@@ -37,7 +39,24 @@ Both systems index the same blocks from the same start block, 26,104,555. Every 
 | Speed | **about 18 blocks/s**: 34 on cold indexes, falling as `transfers` and `holdings` grew | **9.7 blocks/s** |
 | Quicknode calls | **982**, 0.008 per block (headers from HyperSync, logs in 100-block ranges) | **106,084**, 1.02 per block (RPC only) |
 | Rows written | 65.66M raw Transfers plus 30.1M `holdings` | 28.1M `account_token` (aggregates only) |
-| Afterwards, to the head | 3,667 blocks in about 19 min by the follower (about 3.2 blocks/s). The API answers 503 until this finishes | 6.4k blocks in about 20 min |
+| Afterwards, to the head | 3,667 blocks in about 19 min by the follower (about 3.2 blocks/s). At the time the API answered 503 until this finished; it now serves stale data at the cursor | 6.4k blocks in about 20 min |
+
+### Squid catch-up without per-block headers (2026-10-19, after the fair run)
+
+The squid's 1.02 calls per block were almost all `eth_getBlockByNumber`, one per block. Since disquid `95851d9`, blocks below the finalized head are built from the filtered `eth_getLogs` alone: each log carries `blockNumber`, `blockHash` and `blockTimestamp`.
+- **When it still reads a header:** only for a block with no matching log (checked against the bloom), for logs without a timestamp, or for logs that disagree on the hash.
+- **Near the head:** it hands over to the normal stream, after checking the first block's real parent hash. A hot head replaced during downtime still shows up as a fork.
+- **Not changed:** the write path and the database.
+
+| | Before (header + logs) | After (logs only) |
+|---|---|---|
+| Same 2,000 blocks from 26,104,555, fetch only | 2,041 calls (2,000 headers, 40 `eth_getLogs`, 1 `eth_chainId`) in 241 HTTP requests, 63 s | **20 calls** (20 `eth_getLogs` of 100 blocks) in 20 HTTP requests, **17 s** |
+| Same data? | — | **Yes:** 838,808 logs; 0 mismatches in block hash, timestamp or logs |
+| Live catch-up, 3,201 blocks (26,225,769–26,228,969), through the counting proxy | 1.02 per block, so about 3,270 (*derived*) | **83 calls, about 0.026 per block**: 33 `eth_getLogs` plus 50 head and finalized polls (time-driven, about 4 per minute). 0 errors, then a clean hand-off to the head |
+| Full re-index, 103,617 blocks (*derived*) | 106,084 (measured, §1) | **about 1.7k**: about 1,040 `eth_getLogs` plus about 4 polls per minute for the run. About 60× fewer, against i-see-u's 982 with HyperSync |
+
+- **Not counted above:** token metadata `eth_call`s (73 in the live run), which are unchanged.
+- **Speed is unchanged:** the live run did about 4 blocks/s on a just-started database container, so writes are the limit. Fetching alone runs at about 118 blocks/s, sequentially.
 
 ### API without balances
 
@@ -86,8 +105,8 @@ Both need about 0.19 `eth_call` per request. i-see-u packs about 2× more balanc
 | Dimension | Winner | Why |
 |---|---|---|
 | Catch-up speed | **i-see-u**, about 1.9× | Bulk segment writes. The squid reads, merges and upserts per batch |
-| Catch-up RPC cost | **i-see-u**, about 120× fewer calls per block | HyperSync supplies the headers. The squid is RPC-only, so one header call per block |
-| API throughput and latency | **Squid**, 1.6–1.8× the req/s and about 40% lower p50 | One indexed lookup in one GraphQL process. i-see-u also overlays the tail and returns 503 for 13–18 s every 6.4 min |
+| Catch-up RPC cost | **i-see-u**, about 2× fewer calls per block since the squid's header-less catch-up (0.008 against about 0.016, *derived*); about 120× before it | i-see-u takes its headers from HyperSync. Below the finalized head the squid now reads none; it makes about one `eth_getLogs` per 100 blocks, plus head polls |
+| API throughput and latency | **Squid**, 1.6–1.8× the req/s and about 40% lower p50 | One indexed lookup in one GraphQL process. i-see-u also overlays the tail. At the time it also returned 503 for 13–18 s every 6.4 min; that window now serves stale 200s |
 | Balance reads | Mixed | Squid has lower latency. i-see-u makes about 2× fewer `eth_call`s per balance read |
 | Storage | **Squid** in total (2.3× smaller); **i-see-u** per aggregate row (about 2× leaner) | i-see-u keeps raw history (history endpoint, repair). Squid entities need string ids |
 | Head RPC cost | **Squid**, about 1.6× cheaper | i-see-u's finalized follower re-fetches headers the tail already has |
@@ -97,7 +116,7 @@ Both need about 0.19 `eth_call` per request. i-see-u packs about 2× more balanc
 | Metric | Result |
 |---|---|
 | Catch-up, 103,617 blocks | **2 h 59 min**, 9.7 blocks/s on average (30 at the start, 17–18 on busy blocks) |
-| RPC calls for catch-up | **106,084** (1.02 per block) in 13,263 HTTP requests, about **2.1M credits** |
+| RPC calls for catch-up | **106,084** (1.02 per block) in 13,263 HTTP requests, about **2.1M credits**. Since disquid `95851d9` (header-less catch-up): **about 0.026 per block**, measured live on 3,201 blocks. That is about 1.7k calls (about 34k credits) for the same range, *derived* |
 | i-see-u bootstrap, same range (fair run) | 117,402 blocks in about **109 min** of active time, **about 18 blocks/s**, **982 Quicknode calls** (0.008 per block, against the squid's 1.02) |
 | RPC calls at the head | **18.2k/day** (p50 12/min, p95 17/min), about **11M credits/month** |
 | i-see-u, RPC calls at the head (global-index tail plus finalized follower, 45 min on 2026-10-18) | **29.5k/day** (p50 15/min, p95 50/min), about **17.7M credits/month**, 4.1 calls per block, 0 errors |
@@ -106,7 +125,7 @@ Both need about 0.19 `eth_call` per request. i-see-u packs about 2× more balanc
 | Parity with i-see-u | **0 mismatches**: ERC-20 386,213 pairs, ERC-721 5,627 pairs, 12,381 NFT owners |
 | API without balances, one process, same data (fair run) | **3,816 req/s** at 10 connections (p50 2.5 ms, p99 4.5 ms), up to 4,091 at 50, 0 errors |
 | API with balances, cold cache (fair run) | 72 req/s at 5 connections, p50 69 ms, 276 `eth_call`s for 1,446 requests, 0 errors |
-| i-see-u API without balances, same data (fair run) | **2,365 req/s** at 10 connections (p50 4.2 ms, p99 6.0 ms), about 2,300 at 50–100. A **503 `not_ready` window of 13–18 s** at every finalized epoch (6.4 min); one 50-connection run had 28% 503s |
+| i-see-u API without balances, same data (fair run) | **2,365 req/s** at 10 connections (p50 4.2 ms, p99 6.0 ms), about 2,300 at 50–100. A **503 `not_ready` window of 13–18 s** at every finalized epoch (6.4 min); one 50-connection run had 28% 503s. That was before the always-serve change; the window now serves stale 200s |
 | i-see-u API with balances, cold cache (fair run) | 52 req/s at 5 connections, p50 89 ms, **198 `eth_call`s** for 1,036 requests (about 2× more balance reads per call than the squid) |
 | Storage, same range (fair run, about 121k blocks) | Squid **16 GB** (`account_token` 28.10M rows, 593 B/row). i-see-u **37 GB** (`holdings` 30.12M rows at 309 B/row, plus 65.58M raw Transfers, 28 GB) |
 
@@ -146,7 +165,7 @@ Both need about 0.19 `eth_call` per request. i-see-u packs about 2× more balanc
   - Postgres `COPY`: 724k rows/s into an unindexed unlogged table, 126k rows/s with indexes.
 - **Not yet run live:** the current indexed-segment path (a Codex rework that commits raw rows and aggregates per segment and publishes in minutes) has **not** been benchmarked end to end. At 126k rows/s, raw inserts alone would take about 18 min for 138.5M rows (*derived*).
 
-**Squid against i-see-u on catch-up.** On the same range (fair comparison above), i-see-u's current bootstrap ran at about 18 blocks/s with 982 Quicknode calls, against the squid's 9.7 blocks/s and 106,084 calls. The speed gap comes from the write path: i-see-u bulk-writes per segment, while the squid reads, merges and upserts per batch. The cost gap comes from HyperSync supplying the headers. i-see-u's **follower**, the path after the bootstrap, is slower: about 3.2–3.7 blocks/s, because it writes every raw Transfer plus the aggregate upserts. For cost, the squid can only match i-see-u by leaving RPC-only: a Portal source, or a custom HyperSync source in `EvmFallbackDataSourceBuilder` (§10).
+**Squid against i-see-u on catch-up.** On the same range (fair comparison above), i-see-u's current bootstrap ran at about 18 blocks/s with 982 Quicknode calls, against the squid's 9.7 blocks/s and 106,084 calls. The speed gap comes from the write path: i-see-u bulk-writes per segment, while the squid reads, merges and upserts per batch. The cost gap came from the squid's one header call per block, which HyperSync spared i-see-u. i-see-u's **follower**, the path after the bootstrap, is slower: about 3.2–3.7 blocks/s, because it writes every raw Transfer plus the aggregate upserts. Since disquid `95851d9` the squid reads no headers below the finalized head ([details](#squid-catch-up-without-per-block-headers-2026-10-19-after-the-fair-run)). That brings it to about 1.7k calls for this range (*derived*), within about 2× of i-see-u's 982, and it stays RPC-only.
 
 ## 2. Following the head
 
@@ -174,7 +193,7 @@ The squid's window is 34.6 hours, from 2026-10-17 00:45 to 2026-10-18 11:19 CEST
 | Readiness | One of the 46 samples (16:21:49 CEST) answered `not_ready`, consistent with the epoch window below |
 
 - **Shape of the cost.** Most minutes make about 10 headers and 5 `eth_getLogs` (about 2 header calls per block, plus the one `eth_getLogs`). The 2 header calls per block are *derived*: the README polls `latest` at slot +2.5/+5/+9 s, and the first poll often still sees the previous block. Every **6.4 min** (7 times in the window) one minute shows about +33 headers and +1 `eth_getLogs`: the finalized follower fetches the 32 new finalized blocks as headers again, though the tail has them. That is about **25%** of the calls (235 of 923).
-- **Epoch window.** At each finalized epoch the observed finalized head moves 32 blocks ahead of the cursor, and the service answers **503 `not_ready`** until the follower has appended them: **13.5 s** unloaded (16:59:40 CEST) and **18.3 s** with 100 connections hitting it (17:06:04 CEST). That is 3.5-4.8% of the time, every 6.4 min. The README says the tail never makes the service not ready, and that holds, but the follower does (§5).
+- **Epoch window.** At each finalized epoch the observed finalized head moves 32 blocks ahead of the cursor, and the service answers **503 `not_ready`** until the follower has appended them: **13.5 s** unloaded (16:59:40 CEST) and **18.3 s** with 100 connections hitting it (17:06:04 CEST). That is 3.5-4.8% of the time, every 6.4 min. The README says the tail never makes the service not ready, and that holds, but the follower does (§5). *Since `2268cbd`/`5cccd13` the window answers 200 with `stale: true` and `staleReason: "Global index has not reached the finalized head"` instead; not re-measured.*
 - **Squid, for comparison:** 18.2k calls per day, p50 12 and p95 17 per minute. i-see-u makes about 1.6× the calls: it polls `latest` about twice per block, and its follower re-fetches finalized headers.
 
 ## 3. Reorgs and robustness
@@ -243,7 +262,7 @@ i-see-u stores every raw Transfer (139.8M rows from 25,933,634), so it is an ind
 - **Assignment target:** 5k users polling every minute is about 83 req/s, so about 3% of one process.
 - **1M users each polling every minute** (the worst case, not the expected load) is about 16.7k req/s, roughly 6 API processes. Database read capacity at that rate was **not tested**.
 - **i-see-u, earlier single requests (after its full-window bootstrap, not a load test):** vitalik.eth with 163 tokens in 77 ms, the Binance hot wallet with 393 tokens in 56 ms, and vitalik.eth with all 163 balances in 0.3 s.
-- **i-see-u against the squid:** one process serves about 1,800-2,000 req/s against the squid's 3,000-3,200, but each i-see-u response carries about 3× the tokens (57-66 against 18.4; the history starts earlier, zero-value Transfers are kept and there is no `first` limit, *derived* reasons), so per token it moves about 2× more, about 107k tokens/s at 10 connections against about 56k. At 1 connection it is slower (160 against 456 req/s, p50 2.3 ms against 1.3 ms). Its p99 at 100 connections (90 ms) is twice the squid's (46 ms). The 503 window at each epoch (§2) has no squid counterpart in this data.
+- **i-see-u against the squid:** one process serves about 1,800-2,000 req/s against the squid's 3,000-3,200, but each i-see-u response carries about 3× the tokens (57-66 against 18.4; the history starts earlier, zero-value Transfers are kept and there is no `first` limit, *derived* reasons), so per token it moves about 2× more, about 107k tokens/s at 10 connections against about 56k. At 1 connection it is slower (160 against 456 req/s, p50 2.3 ms against 1.3 ms). Its p99 at 100 connections (90 ms) is twice the squid's (46 ms). The 503 window at each epoch (§2, since replaced by stale 200s) had no squid counterpart in this data.
 - **With balances:** the squid run is RPC-bound, because every pair was a cache miss (random accounts, cold cache). Its number of `eth_call`s was not recorded. i-see-u's was (above): 210 for 1,005 requests. With the change-driven cache, repeat polls of the same account make no RPC calls until a Transfer touches it.
 
 ## 6. Storage
@@ -295,9 +314,9 @@ Most spam is fake tokens moving non-zero amounts, which this skip doesn't catch.
 | Metadata | about 1 call per batch with new tokens, *derived*: under 0.1M | — (not fetched) |
 | Balances | On request only. A pair is re-read only after its own Transfer or once its cache entry ages out. Not measured live | On request only, same reuse rule (README, Balances). One cold run measured: 210 `eth_call`s (about 4.2k credits) for 1,005 requests, about 91.7k pairs (*derived*) |
 | **Steady state** | **about 11M + balances** | **about 17.7M + balances** |
-| One-off catch-up (global index) | about 2.1M credits per 100k blocks (measured, RPC only) | RPC only: about 2.1M per 100k blocks (measured on the follower, 1.04 calls per block; 2.0M *derived* for the bootstrap). With HyperSync: about 15k per 100k blocks (from the 2,001-block smoke run) |
+| One-off catch-up (global index) | about 2.1M credits per 100k blocks, measured RPC-only before `95851d9`. About **33k** per 100k with the header-less catch-up (*derived* from the live 0.026 calls per block) | RPC only: about 2.1M per 100k blocks (measured on the follower, 1.04 calls per block; 2.0M *derived* for the bootstrap). With HyperSync: about 15k per 100k blocks (from the 2,001-block smoke run) |
 
-Balance cost follows account activity in both implementations; the README's Balances section has the math for 1M accounts. At the head, i-see-u costs about 1.6× the squid (§2). The real gap is catch-up: with HyperSync, i-see-u's bootstrap uses about 130× fewer Quicknode credits.
+Balance cost follows account activity in both implementations; the README's Balances section has the math for 1M accounts. At the head, i-see-u costs about 1.6× the squid (§2). The real gap used to be catch-up, where i-see-u with HyperSync used about 130× fewer Quicknode credits. With the squid's header-less catch-up, both now spend tens of thousands of credits per 100k blocks: the squid about 33k (*derived*, RPC only), i-see-u about 15k (with HyperSync).
 
 ## 10. Speculation: HyperSync as the squid's history source
 
@@ -314,14 +333,14 @@ Nothing in this section has been built for the squid. The HyperSync fetch figure
 
 **Expected impact:**
 
-| | Today, RPC-only (measured) | HyperSync for history (*derived*) |
+| | RPC-only (measured) | HyperSync for history (*derived*) |
 |---|---|---|
-| Quicknode credits, 100k-block catch-up | about 2.1M | about 0 (head and finalized lookups only) |
+| Quicknode credits, 100k-block catch-up | about 2.1M with per-block headers; about 33k (*derived*) logs-only since `95851d9` | about 0 (head and finalized lookups only) |
 | HyperSync requests, 100k blocks | — | **660 requests, 41.5 min, 53.78M logs** (measured by i-see-u, free tier, fetch only) |
 | Time, 100k blocks | 2 h 59 min | **Still about 1.5–2 h.** Fetching takes about 42 min (measured), but the squid handler writes 15–20 blocks/s |
-| Full history from genesis (about 24M blocks) | about 24M header calls ≈ 480M credits, not feasible on 80M/month | Feasible on credits, but about **2–3 weeks** of writes at 15–20 blocks/s |
+| Full history from genesis (about 24M blocks) | With per-block headers: about 24M header calls ≈ 480M credits, not feasible on 80M/month. Logs-only (*derived*): about 240k `eth_getLogs` (about 4.8M credits), plus one header for every block without a Transfer, which is common in early history (not measured) | Feasible on credits, but about **2–3 weeks** of writes at 15–20 blocks/s |
 
-**HyperSync fixes the squid's catch-up cost, not its speed.** The speed limit is the write path, so it needs:
+**HyperSync no longer changes much for the squid.** The header-less catch-up already brought its catch-up cost down to about 33k credits per 100k blocks, and HyperSync does not fix its speed. The speed limit is the write path, so it needs:
 - insert-only writes for finalized ranges;
 - a larger fold per batch;
 - possibly `COPY`.
@@ -366,7 +385,7 @@ i-see-u's bootstrap loaded about 105 blocks/s on its old staging path, measured 
   - Two different databases: 60 GB with 140M raw rows against 15 GB. The squid's pool is 10, i-see-u's is 20.
   - Both runs share the host with the load generator, the processor or follower, and the tail. The i-see-u run also overlapped with a busy macOS (load average about 10 at one check).
   - Single 30 s runs, no repeats except the 100-connection one. Run-to-run noise was not measured.
-- **Epoch 503 windows** hit the 100-connection runs twice. A load test that avoids them overstates availability; one that includes them overstates the error rate (503s are cheap, so they pile up in a closed loop). The window is 13.5-18.3 s per 6.4 min.
+- **Epoch 503 windows** hit the 100-connection runs twice. A load test that avoids them overstates availability; one that includes them overstates the error rate (503s are cheap, so they pile up in a closed loop). The window is 13.5-18.3 s per 6.4 min. It has since been replaced by stale 200 responses, so a rerun would show neither effect.
 - **The follower catch-up is one run** on a database that was 1.9 days behind and had a concurrent autovacuum, and the host slept for part of it (about 42 min without progress). The 3.7 blocks/s, excluding that gap, is not a tuned figure and was not repeated.
 
 ## Reproduce
