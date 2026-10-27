@@ -1,0 +1,15 @@
+{
+  "$schema": "./node_modules/oxfmt/configuration_schema.json",
+  "singleQuote": true,
+  "printWidth": 120,
+  "ignorePatterns": [
+    "drizzle/**",
+    "data/**",
+    "out/**",
+    "tools/oxlint/**",
+    "package-lock.json",
+    "plans/**",
+    ".agents/**",
+    ".claude/**"
+  ]
+}

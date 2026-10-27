@@ -1,6 +1,19 @@
 services:
   postgres:
     image: postgres:18-alpine
+    # Development defaults for a host with at least 16 GB RAM; lower these on smaller machines.
+    command:
+      [
+        'postgres',
+        '-c',
+        'shared_buffers=2GB',
+        '-c',
+        'work_mem=32MB',
+        '-c',
+        'maintenance_work_mem=1GB',
+        '-c',
+        'max_wal_size=8GB',
+      ]
     ports:
       - '127.0.0.1:${POSTGRES_PORT:-5432}:5432'
     environment:

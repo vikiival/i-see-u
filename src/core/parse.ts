@@ -13,7 +13,7 @@ export const isObject = (value: unknown): value is object => typeof value === 'o
 
 /** The message of a thrown value: an Error's message, otherwise the value's string form. */
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- boundary parser: `catch` and promise rejections bind unknown
-export const thrownMessage = (error: unknown): string => error instanceof Error ? error.message : String(error);
+export const thrownMessage = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
 /** Lowercase a 0x-prefixed value. Equal to `value.toLowerCase()`, since the prefix lowercases to `0x`. */
 export const toLowerHex = (value: `0x${string}`): `0x${string}` => `0x${value.slice(2).toLowerCase()}`;

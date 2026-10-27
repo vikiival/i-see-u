@@ -1,78 +1,75 @@
 import { expect, test } from 'vitest';
 
-import { createApp } from '../src/api/routes.ts';
-import { createBalanceWorker } from '../src/balances/worker.ts';
-import { createLimiter } from '../src/core/limiter.ts';
-import { addTransfer, emptyAggregate } from '../src/core/aggregate.ts';
-import type { Address, BlockHeader, ChunkAggregate, FollowerStatus, Hex } from '../src/core/types.ts';
+import type { BlockHeader, Tail } from '../src/core/types.ts';
 import { createDiscoveryService } from '../src/discovery/service.ts';
+import type { DiscoveryDependencies } from '../src/discovery/service.ts';
 import { RpcError } from '../src/rpc/errors.ts';
 import { createTail, nextPollDelay } from '../src/tail/tail.ts';
 import { address, blockHash, blockRef, FakeChain } from './fake-chain.ts';
-import { createTestStore } from './store-fixture.ts';
+import { stack } from './stack.ts';
 
-const account = address(1);
-const peer = address(2);
-const token = address(10);
-const nft = address(11);
+const [account, peer, token, nft] = [1, 2, 10, 11].map(address);
 
-async function stack(chain: FakeChain, maxDepth = 64n) {
-  const { store } = await createTestStore();
-  await store.initFollowerCursor('ethereum', blockRef(chain.finalized), 1_800_000_000_000);
-  const adapter = chain.adapter({ startBlock: chain.finalized + 1n });
+type Stack = Awaited<ReturnType<typeof stack>>;
 
-  const followerStatus = (): FollowerStatus => ({
-    ready: true,
-    leader: true,
-    cursor: { ...blockRef(chain.finalized), updatedAt: 1_800_000_000_000 },
-    headNumber: chain.finalized,
-    lagBlocks: 0n,
-    lastAdvanceAt: 1_800_000_000_000,
-    stale: false,
-  });
+/** Finalized index at chain.finalized (100), tail wired into discovery and the API. */
+async function tailStack(chain: FakeChain, tail: NonNullable<Parameters<typeof stack>[1]>['tail'] = {}) {
+  const s = await stack(chain, { tail });
+  await s.follower.tick();
+  expect(s.follower.status()).toMatchObject({ ready: true, leader: true });
 
-  const follower = { status: followerStatus, track() {} };
-  const tail = createTail({ adapter, store, follower, maxDepth, now: () => 1_800_000_010_000 });
-  await tail.load();
-
-  const discovery = createDiscoveryService({
-    adapters: { ethereum: adapter }, store, followers: { ethereum: follower }, tails: { ethereum: tail }, requestDeadlineMs: 1_000,
-  });
-
-  return { store, adapter, follower, tail, discovery, close: () => store.close() };
+  return { ...s, tail: s.tail! };
 }
 
-const ready = async (s: Awaited<ReturnType<typeof stack>>, finality?: 'latest' | 'finalized') => {
-  const result = await s.discovery.discover('ethereum', account, finality);
+/** A discovery service over another tail instance or clock. */
+const discoveryFor = (s: Stack, tail: Tail, extra: Partial<DiscoveryDependencies> = {}) =>
+  createDiscoveryService({
+    adapters: { ethereum: s.adapter },
+    store: s.store,
+    tails: { ethereum: tail },
+    maxHeadAgeMs: 120_000,
+    maxNoAdvanceMs: 1_800_000,
+    now: () => s.clock.at,
+    ...extra,
+  });
 
-  if (result.status !== 'ready') throw new Error('expected ready');
-
-  return result;
-};
+const ready = (s: Pick<Stack, 'discovery'>, finality?: 'latest' | 'finalized') =>
+  s.discovery.discover('ethereum', account, { finality });
 
 test('follows the tip block by block with one header and one block-hash getLogs call per block', async () => {
   const chain = new FakeChain(100n);
   chain.latest = 101n;
   chain.addTransfer({ token, from: peer, to: account, value: 1n, blockNumber: 101n });
-  const s = await stack(chain);
+  const s = await tailStack(chain);
 
   try {
+    chain.calls = {};
     await s.tail.tick();
     expect(chain.calls).toEqual({ eth_getBlockByNumber: 1, eth_getLogs: 1 });
-    expect(await s.store.getTailTip('ethereum')).toMatchObject({ number: 101n, hash: blockHash(101n) });
+    expect(await s.store.tailTip('ethereum')).toMatchObject({ number: 101n, hash: blockHash(101n) });
 
     chain.latest = 102n;
     chain.addTransfer({ token, from: peer, to: account, value: 1n, blockNumber: 102n });
     chain.calls = {};
     await s.tail.tick();
     expect(chain.calls).toEqual({ eth_getBlockByNumber: 1, eth_getLogs: 1 });
-    expect((await ready(s)).holdings[0]).toMatchObject({ receivedCount: 2, unfinalizedReceivedCount: 2, lastBlock: 102n });
+    expect(await ready(s)).toMatchObject({
+      finality: 'latest',
+      blockHeight: 102n,
+      finalizedBlockHeight: 100n,
+      finalizedBlockHash: blockHash(100n),
+    });
+    expect((await ready(s)).holdings[0]).toMatchObject({
+      receivedCount: 2n,
+      unfinalizedReceivedCount: 2n,
+      lastBlock: 102n,
+    });
   } finally {
     await s.close();
   }
 });
 
-test('depth-1 and depth-3 reorgs delete old transfers and recompute counts, bounds and NFT state', async () => {
+test('depth-1 and depth-3 reorgs delete old transfers and recompute counts, bounds and NFT ownership', async () => {
   const chain = new FakeChain(100n);
   chain.latest = 104n;
 
@@ -82,17 +79,22 @@ test('depth-1 and depth-3 reorgs delete old transfers and recompute counts, boun
 
   chain.addTransfer({ token: nft, standard: 'erc721', from: peer, to: account, value: 7n, blockNumber: 102n });
   chain.addTransfer({ token: nft, standard: 'erc721', from: account, to: peer, value: 7n, blockNumber: 104n });
-  const s = await stack(chain);
+  const s = await tailStack(chain);
 
   try {
     await s.tail.tick();
-    expect((await ready(s)).nftItems[0]).toMatchObject({ heldBySeenLogs: false, unfinalized: true });
+    expect((await ready(s)).nftItems).toEqual([]);
 
     chain.reorg(1, [{ token, from: account, to: peer, value: 1n, blockNumber: 104n }]);
     await s.tail.tick();
     let result = await ready(s);
-    expect(result.holdings.find((h) => h.token === token)).toMatchObject({ sentCount: 1, receivedCount: 3, firstBlock: 101n, lastBlock: 104n });
-    expect(result.nftItems[0]).toMatchObject({ heldBySeenLogs: true, lastBlock: 102n });
+    expect(result.holdings.find((h) => h.token === token)).toMatchObject({
+      sentCount: 1n,
+      receivedCount: 3n,
+      firstBlock: 101n,
+      lastBlock: 104n,
+    });
+    expect(result.nftItems).toMatchObject([{ tokenId: 7n, heldBySeenLogs: true, lastBlock: 102n, unfinalized: true }]);
 
     chain.reorg(3, [
       { token, from: account, to: peer, value: 1n, blockNumber: 103n },
@@ -100,8 +102,13 @@ test('depth-1 and depth-3 reorgs delete old transfers and recompute counts, boun
     ]);
     await s.tail.tick();
     result = await ready(s);
-    expect(result.holdings.find((h) => h.token === token)).toMatchObject({ sentCount: 1, receivedCount: 1, firstBlock: 101n, lastBlock: 103n });
-    expect(result.nftItems[0]).toMatchObject({ heldBySeenLogs: false, lastBlock: 103n, unfinalized: true });
+    expect(result.holdings.find((h) => h.token === token)).toMatchObject({
+      sentCount: 1n,
+      receivedCount: 1n,
+      firstBlock: 101n,
+      lastBlock: 103n,
+    });
+    expect(result.nftItems).toEqual([]);
     expect(s.tail.status()).toMatchObject({ reorgs: 2, lastReorgDepth: 3n, healthy: true });
   } finally {
     await s.close();
@@ -111,47 +118,49 @@ test('depth-1 and depth-3 reorgs delete old transfers and recompute counts, boun
 test('a reorg to a shorter chain rewinds and re-ingests while a stale lower head is ignored', async () => {
   const chain = new FakeChain(100n);
   chain.latest = 103n;
-  chain.addTransfer({ token, from: peer, to: account, value: 1n, blockNumber: 101n });
-  chain.addTransfer({ token, from: peer, to: account, value: 1n, blockNumber: 102n });
-  chain.addTransfer({ token, from: peer, to: account, value: 1n, blockNumber: 103n });
-  const s = await stack(chain);
+
+  for (let blockNumber = 101n; blockNumber <= 103n; blockNumber += 1n) {
+    chain.addTransfer({ token, from: peer, to: account, value: 1n, blockNumber });
+  }
+
+  const s = await tailStack(chain);
 
   try {
     await s.tail.tick();
     chain.latest = 102n;
     await s.tail.tick();
-    expect((await s.store.getTailTip('ethereum'))?.number).toBe(103n); // same stored hash: lagging node
+    expect((await s.store.tailTip('ethereum'))?.number).toBe(103n); // same stored hash: lagging node
 
     chain.latest = 103n;
     chain.reorg(2, [{ token, from: account, to: peer, value: 1n, blockNumber: 102n }]);
     chain.latest = 102n;
     await s.tail.tick();
-    expect(await s.store.getTailBlocks('ethereum')).toHaveLength(2);
-    expect((await ready(s)).holdings[0]).toMatchObject({ sentCount: 1, receivedCount: 1, lastBlock: 102n });
+    expect(await s.store.tailBlocks('ethereum')).toHaveLength(2);
+    expect((await ready(s)).holdings[0]).toMatchObject({ sentCount: 1n, receivedCount: 1n, lastBlock: 102n });
   } finally {
     await s.close();
   }
 });
 
-test('deep reorgs wipe and degrade to finalized, then rebuild on the next tick', async () => {
+test('deep reorgs wipe and degrade to finalized with tailError, then rebuild on the next tick', async () => {
   const chain = new FakeChain(100n);
   chain.latest = 104n;
   chain.addTransfer({ token, from: peer, to: account, value: 1n, blockNumber: 104n });
-  const s = await stack(chain, 2n);
+  const s = await tailStack(chain, { maxDepth: 2n });
 
   try {
     await s.tail.tick();
     chain.reorg(3, [{ token, from: account, to: peer, value: 1n, blockNumber: 104n }]);
     await s.tail.tick();
-    expect(await s.store.getTailBlocks('ethereum')).toEqual([]);
+    expect(await s.store.tailBlocks('ethereum')).toEqual([]);
     expect(s.tail.status()).toMatchObject({ healthy: false, reorgs: 1 });
     const degraded = await ready(s);
-    expect(degraded).toMatchObject({ finality: 'finalized', blockHeight: 100n });
+    expect(degraded).toMatchObject({ finality: 'finalized', blockHeight: 100n, holdings: [] });
     expect(degraded.tailError).toContain('no common ancestor');
 
     await s.tail.tick();
     expect(s.tail.status().healthy).toBe(true);
-    expect(await ready(s)).toMatchObject({ finality: 'latest', blockHeight: 104n });
+    expect(await ready(s)).toMatchObject({ finality: 'latest', blockHeight: 104n, holdings: [{ sentCount: 1n }] });
   } finally {
     await s.close();
   }
@@ -161,7 +170,7 @@ test('a reorg whose only common ancestor is the finalized cursor also degrades b
   const chain = new FakeChain(100n);
   chain.latest = 102n;
   chain.addTransfer({ token, from: peer, to: account, value: 1n, blockNumber: 101n });
-  const s = await stack(chain);
+  const s = await tailStack(chain);
 
   try {
     await s.tail.tick();
@@ -176,7 +185,7 @@ test('a reorg whose only common ancestor is the finalized cursor also degrades b
   }
 });
 
-test('finalization prunes matching rows without double count and wipes a mismatched overlap', async () => {
+test('finalization prunes matching rows in the cursor transaction without double count and wipes a mismatched overlap', async () => {
   const chain = new FakeChain(100n);
   chain.latest = 103n;
 
@@ -184,43 +193,22 @@ test('finalization prunes matching rows without double count and wipes a mismatc
     chain.addTransfer({ token, from: peer, to: account, value: 1n, blockNumber });
   }
 
-  const s = await stack(chain);
+  const s = await tailStack(chain);
 
   try {
-    await s.store.trackAccount('ethereum', account, 1);
     await s.tail.tick();
-    const aggregate = emptyAggregate();
+    chain.finalized = 102n;
+    await s.follower.tick();
+    expect((await s.store.tailBlocks('ethereum')).map((block) => block.number)).toEqual([103n]);
+    expect((await ready(s)).holdings[0]).toMatchObject({ receivedCount: 3n, unfinalizedReceivedCount: 1n });
+    expect((await ready(s, 'finalized')).holdings[0]).toMatchObject({ receivedCount: 2n });
 
-    for (const event of chain.transfers.filter((event) => event.blockNumber <= 102n)) addTransfer(aggregate, account, event);
-    await s.store.applyFollowerRange('ethereum', { fromBlock: 101n, toBlock: 102n }, blockRef(102n), 2,
-      new Map<Address, ChunkAggregate>([[account, aggregate]]), new Set([account]));
-    expect((await s.store.getTailBlocks('ethereum')).map((block) => block.number)).toEqual([103n]);
-    const view = await s.store.readAccount('ethereum', account);
-    expect(view?.holdings[0].receivedCount).toBe(2);
-    expect(view?.tailTransfers).toHaveLength(1);
-
-    const fork: BlockHeader = { number: 104n, hash: '0xdead', parentHash: blockHash(103n), timestamp: 1_248n };
+    const fork: BlockHeader = { number: 104n, hash: blockHash(9_999n), parentHash: blockHash(103n), timestamp: 1_248n };
     await s.store.appendTailBlocks('ethereum', blockHash(103n), [{ header: fork, transfers: [] }]);
-    await s.store.applyFollowerRange('ethereum', { fromBlock: 103n, toBlock: 104n }, blockRef(104n), 3,
-      new Map(), new Set([account]));
-    expect(await s.store.getTailBlocks('ethereum')).toEqual([]);
-  } finally {
-    await s.close();
-  }
-});
-
-test('an account first tracked mid-tail is complete and stays correct after a reorg', async () => {
-  const chain = new FakeChain(100n);
-  chain.latest = 102n;
-  chain.addTransfer({ token, from: peer, to: account, value: 1n, blockNumber: 101n });
-  const s = await stack(chain);
-
-  try {
-    await s.tail.tick(); // no tracked account existed while ingesting
-    expect((await ready(s)).holdings[0]).toMatchObject({ receivedCount: 1 });
-    chain.reorg(1, [{ token, from: account, to: peer, value: 1n, blockNumber: 102n }]);
-    await s.tail.tick();
-    expect((await ready(s)).holdings[0]).toMatchObject({ sentCount: 1, receivedCount: 1 });
+    chain.finalized = 104n;
+    await s.follower.tick();
+    expect(s.follower.status()).toMatchObject({ ready: true, cursor: { number: 104n } });
+    expect(await s.store.tailBlocks('ethereum')).toEqual([]);
   } finally {
     await s.close();
   }
@@ -230,25 +218,25 @@ test('range hash mismatches are rejected, unknown block is retried next tick, an
   const chain = new FakeChain(100n);
   chain.latest = 102n;
   chain.addTransfer({ token, from: peer, to: account, value: 1n, blockNumber: 101n });
-  chain.mismatchRangeLogHash = true;
-  const s = await stack(chain);
+  const s = await tailStack(chain);
 
   try {
+    chain.mismatchRangeLogHash = true;
     await s.tail.tick();
-    expect(await s.store.getTailTip('ethereum')).toBeUndefined();
+    expect(await s.store.tailTip('ethereum')).toBeUndefined();
     expect(s.tail.status().lastError).toContain('does not match header');
     chain.mismatchRangeLogHash = false;
     await s.tail.tick();
-    expect((await s.store.getTailTip('ethereum'))?.number).toBe(102n);
+    expect((await s.store.tailTip('ethereum'))?.number).toBe(102n);
 
     chain.latest = 103n;
     const removed = chain.addRemovedTransfer({ token, from: peer, to: account, value: 1n, blockNumber: 103n });
     chain.unknownBlockOnce.add(removed.blockHash);
     await s.tail.tick();
-    expect((await s.store.getTailTip('ethereum'))?.number).toBe(102n);
+    expect((await s.store.tailTip('ethereum'))?.number).toBe(102n);
     await s.tail.tick();
-    expect((await s.store.getTailTip('ethereum'))?.number).toBe(103n);
-    expect((await ready(s)).holdings[0].receivedCount).toBe(1);
+    expect((await s.store.tailTip('ethereum'))?.number).toBe(103n);
+    expect((await ready(s)).holdings[0].receivedCount).toBe(1n);
   } finally {
     await s.close();
   }
@@ -258,7 +246,7 @@ test('restart re-validates a stored tip through the normal reorg path', async ()
   const chain = new FakeChain(100n);
   chain.latest = 102n;
   chain.addTransfer({ token, from: peer, to: account, value: 1n, blockNumber: 102n });
-  const s = await stack(chain);
+  const s = await tailStack(chain);
 
   try {
     await s.tail.tick();
@@ -267,9 +255,10 @@ test('restart re-validates a stored tip through the normal reorg path', async ()
     await restarted.load();
     await restarted.tick();
     expect(restarted.status()).toMatchObject({ reorgs: 1, healthy: true });
-    expect((await ready({ ...s, tail: restarted, discovery: createDiscoveryService({
-      adapters: { ethereum: s.adapter }, store: s.store, followers: { ethereum: s.follower }, tails: { ethereum: restarted },
-    }) })).holdings[0]).toMatchObject({ sentCount: 1, receivedCount: 0 });
+    expect((await ready({ discovery: discoveryFor(s, restarted) })).holdings[0]).toMatchObject({
+      sentCount: 1n,
+      receivedCount: 0n,
+    });
   } finally {
     await s.close();
   }
@@ -279,19 +268,17 @@ test('a tail tip older than maxTailTipAgeMs is served as finalized with tailErro
   const chain = new FakeChain(100n);
   chain.latest = 102n;
   chain.addTransfer({ token, from: peer, to: account, value: 1n, blockNumber: 102n });
-  const s = await stack(chain);
+  const s = await tailStack(chain);
 
   try {
     await s.tail.tick();
     const tipMs = 102 * 12 * 1000; // FakeChain timestamps are number * 12 s
 
-    const at = (nowMs: number) => ready({ ...s, discovery: createDiscoveryService({
-      adapters: { ethereum: s.adapter }, store: s.store, followers: { ethereum: s.follower }, tails: { ethereum: s.tail },
-      maxTailTipAgeMs: 60_000, now: () => nowMs,
-    }) });
+    const at = (nowMs: number) =>
+      ready({ discovery: discoveryFor(s, s.tail, { maxTailTipAgeMs: 60_000, now: () => nowMs }) });
 
     const old = await at(tipMs + 120_000);
-    expect(old).toMatchObject({ finality: 'finalized', blockHeight: 100n });
+    expect(old).toMatchObject({ finality: 'finalized', blockHeight: 100n, holdings: [] });
     expect(old.tailError).toMatch(/Tail tip is \d+ s old/);
     const fresh = await at(tipMs + 30_000);
     expect(fresh).toMatchObject({ finality: 'latest', blockHeight: 102n });
@@ -304,21 +291,27 @@ test('a tail tip older than maxTailTipAgeMs is served as finalized with tailErro
 test('lastProgressAt is the shared tip time, also in a process that loaded but never advanced the tail', async () => {
   const chain = new FakeChain(100n);
   chain.latest = 102n;
-  const s = await stack(chain);
+  const s = await tailStack(chain);
 
   try {
     await s.tail.tick();
-    const tip = (await s.store.getTailTip('ethereum'))!;
-    const nonLeader = createTail({ adapter: s.adapter, store: s.store, follower: s.follower, now: () => 1_900_000_000_000 });
+    const tip = (await s.store.tailTip('ethereum'))!;
+
+    const nonLeader = createTail({
+      adapter: s.adapter,
+      store: s.store,
+      follower: s.follower,
+      now: () => 1_900_000_000_000,
+    });
+
     await nonLeader.load(); // loaded like every server process, never ticked
-
-    const result = await ready({ ...s, discovery: createDiscoveryService({
-      adapters: { ethereum: s.adapter }, store: s.store, followers: { ethereum: s.follower }, tails: { ethereum: nonLeader },
-    }) });
-
-    expect(result).toMatchObject({ finality: 'latest', blockHeight: 102n });
-    expect(result.lastProgressAt).toBe(Number(tip.timestamp) * 1000);
-    expect((await ready(s)).lastProgressAt).toBe(Number(tip.timestamp) * 1000); // the leader reports the same value
+    const result = await ready({ discovery: discoveryFor(s, nonLeader) });
+    expect(result).toMatchObject({
+      finality: 'latest',
+      blockHeight: 102n,
+      lastProgressAt: Number(tip.timestamp) * 1000,
+    });
+    expect(await ready(s)).toMatchObject({ lastProgressAt: Number(tip.timestamp) * 1000 }); // the leader reports the same value
   } finally {
     await s.close();
   }
@@ -327,176 +320,34 @@ test('lastProgressAt is the shared tip time, also in a process that loaded but n
 test('the tail stops appending maxAheadBlocks above the cursor and degrades to finalized', async () => {
   const chain = new FakeChain(100n);
   chain.latest = 150n;
-  const s = await stack(chain);
+  const s = await tailStack(chain);
 
   try {
     let wakes = 0;
-    const bounded = createTail({ adapter: s.adapter, store: s.store, follower: s.follower, maxAheadBlocks: 4n, onEpoch: () => { wakes += 1; } });
 
-    for (let i = 0; i < 3; i += 1) await bounded.tick();
-    const tipNumber = (await s.store.getTailTip('ethereum'))!.number;
-    expect(tipNumber - chain.finalized).toBeLessThanOrEqual(4n);
-    expect(bounded.status()).toMatchObject({ healthy: false, tailError: expect.stringMatching(/finality/) });
-    expect(wakes).toBeGreaterThan(0);
-
-    const result = await ready({ ...s, discovery: createDiscoveryService({
-      adapters: { ethereum: s.adapter }, store: s.store, followers: { ethereum: s.follower }, tails: { ethereum: bounded },
-    }) });
-
-    expect(result).toMatchObject({ finality: 'finalized', blockHeight: 100n, tailError: expect.stringMatching(/finality/) });
-  } finally {
-    await s.close();
-  }
-});
-
-test('API finality overlays tail-only tokens and balances at the tip hash; finalized keeps the base shape', async () => {
-  const chain = new FakeChain(100n);
-  chain.latest = 101n;
-  chain.addTransfer({ token, from: peer, to: account, value: 1n, blockNumber: 101n });
-  let balanceAt: Hex | undefined;
-  chain.balanceOf = (_account, _token, at) => { balanceAt = at;
-
- return 9n; };
-
-  const s = await stack(chain);
-  const requestRpc = { limiter: createLimiter(2, 2), deadlineMs: 1_000 };
-
-  const balances = createBalanceWorker({
-    adapter: s.adapter, store: s.store, activeTtlMs: 300_000, refreshMs: 60_000, requestRpc,
-    tailTip: () => s.store.getTailTip('ethereum'),
-  });
-
-  const app = createApp({
-    discovery: s.discovery,
-    adapters: { ethereum: s.adapter },
-    balances: { ethereum: balances },
-    followers: { ethereum: s.follower },
-    tails: { ethereum: s.tail },
-    requestRpc,
-    rpcStats: () => chain.rpc.stats(),
-    startedAt: 0,
-  });
-
-  try {
-    await s.tail.tick();
-    const latest = await app.request(`/v1/ethereum/accounts/${account}/erc20?balances=true`);
-    const body = await latest.json();
-    expect(body).toMatchObject({ finality: 'latest', blockHeight: '101', finalizedBlockHeight: '100' });
-    expect(body.tokens[0]).toMatchObject({ contract: token, unfinalizedReceivedCount: 1, balance: '9', balanceBlockHash: blockHash(101n) });
-    expect(balanceAt).toBe(blockHash(101n));
-
-    const finalized = await (await app.request(`/v1/ethereum/accounts/${account}/erc20?finality=finalized`)).json();
-    expect(finalized).toMatchObject({ finality: 'finalized', blockHeight: '100', tokens: [] });
-    expect(finalized.finalizedBlockHeight).toBeUndefined();
-    expect(finalized.tailError).toBeUndefined();
-    const health = await (await app.request('/health')).json();
-    expect(health.tails.ethereum).toMatchObject({ healthy: true, tip: { number: '101' }, lagBlocks: '0' });
-  } finally {
-    await balances.stop();
-    await s.close();
-  }
-});
-
-test('a reorg refresh replaces balances from a newer orphaned tip', async () => {
-  const chain = new FakeChain(100n);
-  chain.latest = 103n;
-  chain.addTransfer({ token, from: peer, to: account, value: 1n, blockNumber: 103n });
-  chain.balanceOf = (_account, _token, at) => at === blockHash(103n) ? 9n : 4n;
-  const s = await stack(chain);
-  const requestRpc = { limiter: createLimiter(2, 2), deadlineMs: 1_000 };
-
-  const balances = createBalanceWorker({
-    adapter: s.adapter, store: s.store, activeTtlMs: 300_000, refreshMs: 60_000, requestRpc,
-    tailTip: () => s.store.getTailTip('ethereum'),
-  });
-
-  const tail = createTail({
-    adapter: s.adapter,
-    store: s.store,
-    follower: s.follower,
-    onAdvance: (_tip, reorg) => { if (reorg) balances.kick({ reorg: true }); },
-  });
-
-  await tail.load();
-
-  const discovery = createDiscoveryService({
-    adapters: { ethereum: s.adapter }, store: s.store, followers: { ethereum: s.follower }, tails: { ethereum: tail },
-  });
-
-  const app = createApp({
-    discovery,
-    adapters: { ethereum: s.adapter },
-    balances: { ethereum: balances },
-    followers: { ethereum: s.follower },
-    tails: { ethereum: tail },
-    requestRpc,
-    rpcStats: () => chain.rpc.stats(),
-    startedAt: 0,
-  });
-
-  balances.start();
-
-  try {
-    await tail.tick();
-    const before = await (await app.request(`/v1/ethereum/accounts/${account}/erc20?balances=true`)).json();
-    expect(before.tokens[0]).toMatchObject({ balance: '9', balanceBlock: '103', balanceBlockHash: blockHash(103n) });
-
-    chain.reorg(2, [{ token, from: peer, to: account, value: 1n, blockNumber: 102n }]);
-    chain.latest = 102n;
-    await tail.tick();
-    await balances.refresh();
-    const tip = await s.store.getTailTip('ethereum');
-    const after = await (await app.request(`/v1/ethereum/accounts/${account}/erc20?balances=true`)).json();
-    expect(after.tokens[0]).toMatchObject({ balance: '4', balanceBlock: '102', balanceBlockHash: tip?.hash });
-  } finally {
-    await balances.stop();
-    await s.close();
-  }
-});
-
-test('a reorg this worker was not kicked for (non-leader process) still re-reads the orphaned snapshot', async () => {
-  const chain = new FakeChain(100n);
-  chain.latest = 103n;
-  chain.addTransfer({ token, from: peer, to: account, value: 1n, blockNumber: 101n });
-  chain.addTransfer({ token, from: peer, to: account, value: 1n, blockNumber: 103n });
-  chain.balanceOf = (_account, _token, at) => at === blockHash(103n) ? 9n : 4n;
-  const s = await stack(chain);
-  const clock = { t: 1_800_000_000_000 };
-
-  const balances = createBalanceWorker({
-    adapter: s.adapter, store: s.store, activeTtlMs: 300_000, refreshMs: 60_000,
-    requestRpc: { limiter: createLimiter(2, 2), deadlineMs: 1_000 },
-    tailTip: () => s.store.getTailTip('ethereum'), now: () => clock.t,
-  });
-
-  try {
-    await s.tail.tick();
-    const tip = (await s.store.getTailTip('ethereum'))!;
-    await balances.forAccount(account, [token], tip);
-    await balances.refresh(); // the first refresh is a full sweep
-    expect((await s.store.balances('ethereum', account))[0]).toMatchObject({ blockNumber: 103n, blockHash: blockHash(103n) });
-
-    // The canonical chain now has the Transfer at 102 (<= the snapshot's 103), and this worker gets no reorg kick.
-    chain.reorg(2, [{ token, from: peer, to: account, value: 1n, blockNumber: 102n }]);
-    await s.tail.tick();
-    const newTip = (await s.store.getTailTip('ethereum'))!;
-    expect(newTip).toMatchObject({ number: 103n });
-    expect(newTip.hash).not.toBe(blockHash(103n));
-
-    clock.t += 60_000;
-    chain.multicallSizes = [];
-    expect(await balances.refresh()).toEqual({ pairs: 1, block: 103n });
-    expect(chain.multicallSizes).toEqual([1]);
-    expect(balances.stats().lastRefresh).toMatchObject({ read: 1, fullSweep: false });
-    expect((await s.store.balances('ethereum', account))[0]).toMatchObject({
-      result: { status: 'ok', balance: 4n }, blockNumber: 103n, blockHash: newTip.hash,
+    const bounded = createTail({
+      adapter: s.adapter,
+      store: s.store,
+      follower: s.follower,
+      maxAheadBlocks: 4n,
+      onEpoch: () => {
+        wakes += 1;
+      },
     });
 
-    clock.t += 60_000;
-    chain.multicallSizes = [];
-    expect(await balances.refresh()).toEqual({ pairs: 0, block: 103n }); // canonical again: nothing to read
+    for (let i = 0; i < 3; i += 1) {
+      await bounded.tick();
+    }
+
+    expect((await s.store.tailTip('ethereum'))!.number - chain.finalized).toBeLessThanOrEqual(4n);
+    expect(bounded.status()).toMatchObject({ healthy: false, tailError: expect.stringMatching(/finality/) });
+    expect(wakes).toBeGreaterThan(0);
+    expect(await ready({ discovery: discoveryFor(s, bounded) })).toMatchObject({
+      finality: 'finalized',
+      blockHeight: 100n,
+      tailError: expect.stringMatching(/finality/),
+    });
   } finally {
-    await balances.stop();
     await s.close();
   }
 });
@@ -505,13 +356,13 @@ test('a lagging head at the cursor height is ignored, not treated as a reorg tha
   const chain = new FakeChain(100n);
   chain.latest = 102n;
   chain.addTransfer({ token, from: peer, to: account, value: 1n, blockNumber: 102n });
-  const s = await stack(chain);
+  const s = await tailStack(chain);
 
   try {
     await s.tail.tick();
     chain.latest = 100n;
     await s.tail.tick();
-    expect((await s.store.getTailBlocks('ethereum')).map((block) => block.number)).toEqual([101n, 102n]);
+    expect((await s.store.tailBlocks('ethereum')).map((block) => block.number)).toEqual([101n, 102n]);
     expect(s.tail.status()).toMatchObject({ reorgs: 0, healthy: true });
   } finally {
     await s.close();
@@ -521,7 +372,7 @@ test('a lagging head at the cursor height is ignored, not treated as a reorg tha
 test('a header that changes mid catch-up (load-balanced nodes) is retried, not counted as a reorg', async () => {
   const chain = new FakeChain(100n);
   chain.latest = 101n;
-  const s = await stack(chain);
+  const s = await tailStack(chain);
   let flaky = true;
 
   const adapter = {
@@ -529,10 +380,13 @@ test('a header that changes mid catch-up (load-balanced nodes) is retried, not c
     headerByNumber: async (number: bigint): Promise<BlockHeader> => {
       const header = await s.adapter.headerByNumber(number);
 
-      if (number !== 102n || !flaky) return header;
+      if (number !== 102n || !flaky) {
+        return header;
+      }
+
       flaky = false;
 
-      return { ...header, parentHash: '0xbad' };
+      return { ...header, parentHash: blockHash(8_888n) };
     },
   };
 
@@ -559,7 +413,9 @@ test('range catch-up splits a too-large getLogs and still verifies every log has
     chain.addTransfer({ token, from: peer, to: account, value: 1n, blockNumber });
   }
 
+  const s = await tailStack(chain);
   let refused = false;
+
   chain.beforeLogs = (filter) => {
     if (!refused && filter.fromBlock < filter.toBlock) {
       refused = true;
@@ -567,13 +423,12 @@ test('range catch-up splits a too-large getLogs and still verifies every log has
     }
   };
 
-  const s = await stack(chain);
-
   try {
+    chain.calls = {};
     await s.tail.tick();
     expect(refused).toBe(true);
     expect(chain.calls.eth_getLogs).toBe(3);
-    expect((await ready(s)).holdings[0]).toMatchObject({ receivedCount: 4, unfinalizedReceivedCount: 4 });
+    expect((await ready(s)).holdings[0]).toMatchObject({ receivedCount: 4n, unfinalizedReceivedCount: 4n });
   } finally {
     await s.close();
   }
@@ -582,9 +437,17 @@ test('range catch-up splits a too-large getLogs and still verifies every log has
 test('the tail wakes the follower at each epoch boundary, then every 4 slots until finalized moves', async () => {
   const chain = new FakeChain(100n);
   chain.latest = 101n;
-  const s = await stack(chain);
+  const s = await tailStack(chain);
   let epochs = 0;
-  const tail = createTail({ adapter: s.adapter, store: s.store, follower: s.follower, onEpoch: () => { epochs += 1; } });
+
+  const tail = createTail({
+    adapter: s.adapter,
+    store: s.store,
+    follower: s.follower,
+    onEpoch: () => {
+      epochs += 1;
+    },
+  });
 
   try {
     await tail.load();
@@ -595,15 +458,26 @@ test('the tail wakes the follower at each epoch boundary, then every 4 slots unt
     chain.latest = 101n + 32n; // fake blocks are 12 s apart, so 32 blocks always cross one epoch boundary
     await tail.tick();
     expect(epochs).toBe(1);
-    const step = async (): Promise<void> => { chain.latest! += 1n; await tail.tick(); };
 
-    for (let i = 0; i < 3; i += 1) await step();
+    const step = async (): Promise<void> => {
+      chain.latest! += 1n;
+      await tail.tick();
+    };
+
+    for (let i = 0; i < 3; i += 1) {
+      await step();
+    }
+
     expect(epochs).toBe(1);
     await step(); // finalized has not moved 4 slots later: wake the follower again
     expect(epochs).toBe(2);
-    chain.finalized = 101n; // the follower saw the new finalized head
+    chain.finalized = 101n;
+    await s.follower.tick(); // the follower saw the new finalized head
 
-    for (let i = 0; i < 8; i += 1) await step();
+    for (let i = 0; i < 8; i += 1) {
+      await step();
+    }
+
     expect(epochs).toBe(2);
   } finally {
     await s.close();
@@ -613,7 +487,14 @@ test('the tail wakes the follower at each epoch boundary, then every 4 slots unt
 test('polling skips the rest of a slot once its block is in, and retries later offsets while it is missing', () => {
   const genesis = 1_606_824_023_000;
   const slotStart = genesis + 1_000 * 12_000;
-  const header = (slot: number): BlockHeader => ({ number: 1n, hash: blockHash(1n), parentHash: blockHash(0n), timestamp: BigInt((genesis + slot * 12_000) / 1_000) });
+
+  const header = (slot: number): BlockHeader => ({
+    number: 1n,
+    hash: blockHash(1n),
+    parentHash: blockHash(0n),
+    timestamp: BigInt((genesis + slot * 12_000) / 1_000),
+  });
+
   const offsets = [2_500, 5_000, 9_000];
   expect(nextPollDelay(slotStart + 1_000, offsets, header(999))).toBe(1_500);
   expect(nextPollDelay(slotStart + 2_500, offsets, header(999))).toBe(2_500); // block late: retry at +5 s
@@ -622,24 +503,53 @@ test('polling skips the rest of a slot once its block is in, and retries later o
   expect(nextPollDelay(slotStart + 2_600, offsets)).toBe(2_400);
 });
 
-test('while the follower catches up more than an epoch behind finalized, the tail waits and wakes it', async () => {
+test('while the global index is more than an epoch behind finalized, the tail waits and wakes the follower', async () => {
   const chain = new FakeChain(100n);
   chain.latest = 300n;
-  const s = await stack(chain);
+  const s = await tailStack(chain);
   let wakes = 0;
-  let headNumber = 250n;
-  const follower = { status: () => ({ ...s.follower.status(), headNumber }) };
-  const tail = createTail({ adapter: s.adapter, store: s.store, follower, onEpoch: () => { wakes += 1; } });
+
+  const tail = createTail({
+    adapter: s.adapter,
+    store: s.store,
+    follower: s.follower,
+    onEpoch: () => {
+      wakes += 1;
+    },
+  });
+
+  try {
+    await s.store.observeHead('ethereum', blockRef(250n), s.clock.at);
+    chain.calls = {};
+    await tail.tick();
+    expect(chain.total).toBe(0);
+    expect(wakes).toBe(1);
+    chain.finalized = 250n;
+    await s.follower.tick();
+    chain.latest = 252n;
+    await tail.tick();
+    expect((await s.store.tailTip('ethereum'))?.number).toBe(252n);
+  } finally {
+    await s.close();
+  }
+});
+
+test('a non-leader process never polls the chain', async () => {
+  const chain = new FakeChain(100n);
+  chain.latest = 102n;
+  const s = await tailStack(chain);
+
+  const tail = createTail({
+    adapter: s.adapter,
+    store: s.store,
+    follower: { status: () => ({ ...s.follower.status(), leader: false }) },
+  });
 
   try {
     chain.calls = {};
     await tail.tick();
     expect(chain.total).toBe(0);
-    expect(wakes).toBe(1);
-    headNumber = 100n;
-    chain.latest = 102n;
-    await tail.tick();
-    expect((await s.store.getTailTip('ethereum'))?.number).toBe(102n);
+    expect(await s.store.tailTip('ethereum')).toBeUndefined();
   } finally {
     await s.close();
   }

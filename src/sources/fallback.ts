@@ -29,11 +29,10 @@ export function withFallback(
   return {
     name: `${primary.name}+${fallback.name}`,
     preferredMaxRange: primary.preferredMaxRange,
-    // Fixed large primary chunks stay independent of RPC's persisted adaptive range. If fallback is needed,
-    // RpcLogSource still splits provider-limited ranges internally and the whole composite chunk commits atomically.
-    adaptiveRange: primary.adaptiveRange,
     async scanAccount(account, range) {
-      if (now() < cooldownUntil) return useFallback(account, range);
+      if (now() < cooldownUntil) {
+        return useFallback(account, range);
+      }
 
       try {
         const result = await primary.scanAccount(account, range);
@@ -44,7 +43,9 @@ export function withFallback(
       } catch {
         consecutiveFailures += 1;
 
-        if (consecutiveFailures >= threshold) cooldownUntil = now() + cooldownMs;
+        if (consecutiveFailures >= threshold) {
+          cooldownUntil = now() + cooldownMs;
+        }
 
         return useFallback(account, range);
       }
@@ -53,11 +54,13 @@ export function withFallback(
       const stats = { ...primary.stats(), ...fallback.stats() };
       const primaryState = stats[primary.name];
 
-      if (primaryState) stats[primary.name] = {
-        ...primaryState,
-        fallbacks: primaryState.fallbacks + fallbacks,
-        cooldownUntil: cooldownUntil > now() ? cooldownUntil : undefined,
-      };
+      if (primaryState) {
+        stats[primary.name] = {
+          ...primaryState,
+          fallbacks: primaryState.fallbacks + fallbacks,
+          cooldownUntil: cooldownUntil > now() ? cooldownUntil : undefined,
+        };
+      }
 
       return stats;
     },

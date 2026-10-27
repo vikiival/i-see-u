@@ -1,190 +1,169 @@
-import { addTransfer, emptyAggregate } from '../core/aggregate.ts';
 import { thrownMessage } from '../core/parse.ts';
-import type {
-  Address,
-  BlockRange,
-  BlockRef,
-  ChainAdapter,
-  ChunkAggregate,
-  Follower,
-  FollowerCursor,
-  FollowerStatus,
-  Store,
-  TransferEvent,
-} from '../core/types.ts';
+import type { BlockHeader, ChainAdapter, Follower, FollowerStatus, IndexState, Store } from '../core/types.ts';
 import type { LeaderLock } from '../store/advisory-lock.ts';
+import { ChainGapError } from '../core/errors.ts';
 
 export interface FollowerOptions {
   adapter: ChainAdapter;
   store: Store;
-  /** Leadership across processes; without one this follower always leads (tests, single process). */
   lock?: LeaderLock;
   pollMs: number;
-  /** Discovery refuses (503) when the cursor is more than this many blocks behind the finalized head. */
-  maxLagBlocks: bigint;
-  /** Responses are flagged stale after this long without an advance. */
-  staleAfterMs: number;
-  /** Discovery refuses (503) after this long without an advance. */
   maxNoAdvanceMs: number;
+  /** Bound catch-up work per tick and header concurrency independently of user count. */
+  maxRangesPerTick?: number;
+  headerConcurrency?: number;
   now?: () => number;
-  /** Called once per tick that advanced the cursor (e.g. to refresh balances at the new block). */
-  onAdvance?: (cursor: FollowerCursor) => void;
-  /** The message of each tick failure. */
   onError?: (message: string) => void;
 }
 
-/** More than one epoch behind means the follower is not keeping up, even if still within maxLagBlocks. */
-const STALE_LAG_BLOCKS = 32n;
-const MAX_REFOLDS = 8;
-const HEAD_REFRESH_FAILED = 'Finalized head refresh failed; serving cached head';
-
-
-/**
- * One finalized follower per network. Each tick reads the finalized head and, when it is ahead of the global cursor,
- * fetches every Transfer log of (cursor, head] in ranges of at most adapter.followerMaxRange, folds the logs of
- * tracked accounts into per-account aggregates, and commits each range together with the cursor advance.
- */
 export function createFollower(o: FollowerOptions): Follower {
   const now = o.now ?? Date.now;
   const { adapter, store } = o;
-  const network = adapter.network;
-  let tracked: Set<Address> | undefined; // loaded when this process becomes leader
-  let cursor: FollowerCursor | undefined;
-  let headNumber: bigint | undefined;
-  let lastError: string | undefined;
-  /** The last finalized head observation was flagged stale (failed refresh, lagging node or no progress). */
-  let headStale = false;
+  let state: IndexState | undefined;
   let leader = false;
+  let lastError: string | undefined;
   let stopped = false;
   let ticking: Promise<void> | undefined;
   let loop: Promise<void> | undefined;
   let wake = (): void => {};
   let kicked = false;
+  const concurrency = o.headerConcurrency ?? 8;
 
-  /** Fetch, fold and commit one range; false when too many concurrent sign-ups force a refetch. */
-  const applyRange = async (range: BlockRange, head: BlockRef): Promise<boolean> => {
-    const known = new Set(tracked);
-    const aggregates = new Map<Address, ChunkAggregate>();
-    const skipped: { from: Address; to: Address; decode: () => TransferEvent | undefined }[] = [];
-    /** Every event folded so far: an endpoint tracked later was unknown when it was folded, so it is added on refold. */
-    const folded: TransferEvent[] = [];
+  const fetchHeaders = async (from: bigint, to: bigint): Promise<BlockHeader[]> => {
+    const headers: BlockHeader[] = [];
 
-    const add = (account: Address, event: TransferEvent): void => {
-      let aggregate = aggregates.get(account);
-
-      if (!aggregate) aggregates.set(account, aggregate = emptyAggregate());
-      addTransfer(aggregate, account, event);
-    };
-
-    const fold = (event: TransferEvent): void => {
-      folded.push(event);
-
-      if (known.has(event.from)) add(event.from, event);
-
-      if (event.to !== event.from && known.has(event.to)) add(event.to, event);
-    };
-
-    await adapter.scanAllTransfers(range, fold, (address) => known.has(address),
-      (from, to, decode) => skipped.push({ from, to, decode }));
-    const to = range.toBlock === head.number ? head : await adapter.blockByNumber(range.toBlock);
-    const at = now();
-
-    for (let refolds = 0; refolds < MAX_REFOLDS; refolds += 1) {
-      const result = await store.applyFollowerRange(network, range, to, at, aggregates, known);
-
-      if (result.applied) {
-        cursor = { number: to.number, hash: to.hash, timestamp: to.timestamp, updatedAt: at };
-
-        return true;
-      }
-
-      const newlyKnown = new Set(result.missing);
-
-      for (const account of newlyKnown) {
-        tracked!.add(account);
-        known.add(account);
-      }
-
-      for (const event of folded) {
-        if (newlyKnown.has(event.from)) add(event.from, event);
-
-        if (event.to !== event.from && newlyKnown.has(event.to)) add(event.to, event);
-      }
-
-      for (let i = skipped.length - 1; i >= 0; i -= 1) {
-        const entry = skipped[i];
-
-        if (!newlyKnown.has(entry.from) && !newlyKnown.has(entry.to)) continue;
-        const event = entry.decode();
-
-        if (event) fold(event);
-        skipped.splice(i, 1);
-      }
+    for (let start = from; start <= to; start += BigInt(concurrency)) {
+      const count = Number(to - start + 1n < BigInt(concurrency) ? to - start + 1n : BigInt(concurrency));
+      headers.push(
+        ...(await Promise.all(Array.from({ length: count }, (_, i) => adapter.headerByNumber(start + BigInt(i))))),
+      );
     }
 
-    return false;
+    return headers;
   };
 
-  const run = async (): Promise<void> => {
+  const run = async () => {
     try {
       leader = false;
       leader = o.lock ? await o.lock.tryAcquire() : true;
+      state = await store.indexState(adapter.network);
 
-      if (!leader) tracked = undefined;
-      const head = await adapter.finalizedHead();
-      headStale = head.stale;
+      if (!state) {
+        lastError = 'Global index awaits bootstrap initialization';
 
-      if (headNumber === undefined || head.block.number > headNumber) headNumber = head.block.number;
-      cursor = await store.getFollowerCursor(network);
-
-      if (leader) {
-        cursor ??= await store.initFollowerCursor(network, head.block, now());
-        tracked ??= new Set(await store.trackedAccounts(network));
-        const startedAt = cursor.number;
-
-        while (!stopped && cursor.number < head.block.number) {
-          const end = cursor.number + adapter.followerMaxRange;
-          await applyRange({
-            fromBlock: cursor.number + 1n,
-            toBlock: end < head.block.number ? end : head.block.number,
-          }, head.block);
-        }
-
-        if (cursor.number > startedAt) o.onAdvance?.(cursor);
+        return;
       }
 
-      lastError = head.refreshFailed ? HEAD_REFRESH_FAILED : undefined;
+      if (!leader) {
+        lastError = undefined;
+
+        return;
+      }
+
+      const head = await adapter.finalizedHead();
+
+      if (head.stale || head.refreshFailed) {
+        throw new Error('Finalized head observation is stale');
+      }
+
+      await store.observeHead(adapter.network, head.block, now());
+      state = (await store.indexState(adapter.network))!;
+      const target = state.head!;
+
+      if (target.number === state.cursor.number && target.hash !== state.cursor.hash) {
+        await store.enqueueRepair(
+          adapter.network,
+          { fromBlock: target.number, toBlock: target.number },
+          'Finalized head hash changed',
+          now(),
+        );
+        throw new ChainGapError('Finalized head hash changed');
+      }
+
+      for (
+        let ranges = 0;
+        !stopped && state.cursor.number < target.number && ranges < (o.maxRangesPerTick ?? 8);
+        ranges += 1
+      ) {
+        if (o.lock && !o.lock.held()) {
+          throw new Error('Follower leadership lost');
+        }
+
+        const end = state.cursor.number + adapter.followerMaxRange;
+        const range = { fromBlock: state.cursor.number + 1n, toBlock: end < target.number ? end : target.number };
+        const blocks = await fetchHeaders(range.fromBlock, range.toBlock);
+
+        if (blocks[0].parentHash !== state.cursor.hash) {
+          const suspect = state.cursor.number < state.startBlock ? state.startBlock : state.cursor.number;
+          await store.enqueueRepair(
+            adapter.network,
+            { fromBlock: suspect, toBlock: suspect },
+            'Next range parent hash mismatch',
+            now(),
+          );
+          throw new ChainGapError('Next range parent hash mismatch');
+        }
+
+        try {
+          for (const [i, block] of blocks.entries()) {
+            if (block.number !== range.fromBlock + BigInt(i) || (i > 0 && block.parentHash !== blocks[i - 1].hash)) {
+              throw new ChainGapError(`Header chain gap at ${block.number}`);
+            }
+          }
+
+          const transfers = await adapter.transfersInRange(range, blocks);
+          await store.appendRange(adapter.network, range, blocks, transfers, now());
+        } catch (error) {
+          if (error instanceof ChainGapError) {
+            await store.enqueueRepair(adapter.network, range, error.message, now());
+          }
+
+          throw error;
+        }
+
+        state = (await store.indexState(adapter.network))!;
+      }
+
+      lastError = undefined;
     } catch (error) {
-      const message = thrownMessage(error);
-      lastError = message.slice(0, 200);
-      o.onError?.(message);
+      lastError = thrownMessage(error).slice(0, 200);
+      state = await store.indexState(adapter.network).catch(() => state);
+      o.onError?.(lastError);
     }
   };
 
   const tick = (): Promise<void> => {
-    ticking ??= run().finally(() => { ticking = undefined; });
+    ticking ??= run().finally(() => {
+      ticking = undefined;
+    });
 
     return ticking;
   };
 
   return {
     tick,
-
     async load() {
-      cursor ??= await store.getFollowerCursor(network);
+      state = await store.indexState(adapter.network);
     },
-
     start() {
-      if (loop) return;
+      if (loop) {
+        return;
+      }
+
       stopped = false;
       loop = (async () => {
         while (!stopped) {
           kicked = false;
           await tick();
 
-          if (stopped) break;
+          if (stopped) {
+            break;
+          }
 
-          if (kicked) continue;
+          if (kicked) {
+            continue;
+          }
+
           await new Promise<void>((resolve) => {
             const timer = setTimeout(resolve, o.pollMs);
             wake = () => {
@@ -195,7 +174,6 @@ export function createFollower(o: FollowerOptions): Follower {
         }
       })();
     },
-
     async stop() {
       stopped = true;
       wake();
@@ -203,41 +181,42 @@ export function createFollower(o: FollowerOptions): Follower {
       await ticking;
       loop = undefined;
       leader = false;
-      tracked = undefined;
       await o.lock?.release();
     },
-
+    kick() {
+      kicked = true;
+      wake();
+    },
     status(): FollowerStatus {
-      const lagBlocks = cursor && headNumber !== undefined && headNumber > cursor.number ? headNumber - cursor.number : 0n;
-      const lastAdvanceAt = cursor?.updatedAt ?? 0;
-      const idleMs = now() - lastAdvanceAt;
+      const cursor = state?.cursor;
+      const headNumber = state?.head?.number;
 
-      const unhealthy = !cursor
-        ? 'Follower has not initialized its cursor yet'
-        : lagBlocks > o.maxLagBlocks
-          ? `Follower is ${lagBlocks} blocks behind the finalized head`
-          : idleMs > o.maxNoAdvanceMs ? 'Follower has not advanced recently enough' : undefined;
+      const lagBlocks =
+        cursor && headNumber !== undefined && headNumber > cursor.number ? headNumber - cursor.number : 0n;
+
+      const lastAdvanceAt = cursor?.updatedAt ?? 0;
+
+      const unhealthy = !state?.head
+        ? 'Global index awaits bootstrap or finalized head'
+        : state.pendingRepair
+          ? 'Global index has pending repairs'
+          : lagBlocks > 0n
+            ? `Global index is ${lagBlocks} blocks behind finalized`
+            : (lastError ??
+              (now() - lastAdvanceAt > o.maxNoAdvanceMs ? 'Global index has not advanced recently enough' : undefined));
 
       return {
-        ready: cursor !== undefined,
+        headStalled: adapter.headStalled?.() ?? false,
+        ready: unhealthy === undefined,
         leader: leader && (o.lock?.held() ?? true),
         cursor,
         headNumber,
         lagBlocks,
         lastAdvanceAt,
         lastError,
-        stale: headStale || lastError !== undefined || lagBlocks > STALE_LAG_BLOCKS || idleMs > o.staleAfterMs,
+        stale: unhealthy !== undefined,
         unhealthy,
       };
-    },
-
-    kick() {
-      kicked = true;
-      wake();
-    },
-
-    track(account) {
-      tracked?.add(account);
     },
   };
 }

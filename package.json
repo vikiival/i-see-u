@@ -2,20 +2,22 @@
   "name": "i-see-u",
   "version": "0.1.0",
   "private": true,
-  "type": "module",
   "description": "Token discovery PoC over plain JSON-RPC",
+  "type": "module",
   "scripts": {
     "start": "node src/server.ts",
+    "dev": "node --watch src/server.ts",
+    "status": "node scripts/status.ts",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "node src/store/migrate.ts",
+    "bootstrap": "node src/bootstrap/main.ts",
     "compare:sources": "node scripts/compare-sources.ts",
     "typecheck": "tsc --noEmit",
     "lint": "oxlint src test scripts",
     "test": "vitest run",
-    "test:watch": "vitest"
-  },
-  "engines": {
-    "node": ">=24"
+    "test:watch": "vitest",
+    "fmt": "oxfmt",
+    "fmt:check": "oxfmt --check"
   },
   "dependencies": {
     "@electric-sql/pglite": "^0.5.9",
@@ -31,8 +33,12 @@
     "@types/node": "^26.6.5",
     "@types/pg": "^8.23.1",
     "drizzle-kit": "^0.31.11",
+    "oxfmt": "^0.74.0",
     "oxlint": "1.88.0",
     "typescript": "^7.0.2",
     "vitest": "^5.0.4"
+  },
+  "engines": {
+    "node": ">=24"
   }
 }

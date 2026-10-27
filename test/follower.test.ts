@@ -1,768 +1,337 @@
 import { expect, test } from 'vitest';
 
-import { createApp } from '../src/api/routes.ts';
-import { createBalanceWorker } from '../src/balances/worker.ts';
-import { createLimiter } from '../src/core/limiter.ts';
-import type { Address, Store } from '../src/core/types.ts';
-import { createDiscoveryService } from '../src/discovery/service.ts';
 import { createFollower } from '../src/follower/follower.ts';
 import { RpcError } from '../src/rpc/errors.ts';
-import { advisoryKey, singleConnectionLeaderLock } from '../src/store/advisory-lock.ts';
-import { address, blockHash, blockRef, FakeChain, gate } from './fake-chain.ts';
-import { createTestStore } from './store-fixture.ts';
+import { address, blockHash, FakeChain, gate } from './fake-chain.ts';
+import { blockRange, header, headersFor, stack } from './stack.ts';
 
-type AdapterOverrides = Parameters<FakeChain['adapter']>[0];
+const [account, peer, token] = [1, 2, 3].map(address);
 
-/** The full service (store, follower, balance worker, discovery, routes) over a FakeChain, with a test clock. */
-async function stack(chain: FakeChain, opts: {
-  adapter?: AdapterOverrides; deadlineMs?: number; fullSweepMs?: number; alwaysRefreshTokens?: Address[];
-} = {}) {
-  const { db, store } = await createTestStore();
-  const clock = { t: 1_800_000_000_000 };
-  const now = () => clock.t;
-  const adapter = chain.adapter(opts.adapter);
+test('follower awaits bootstrap instead of initializing a cursor at the head', async () => {
+  const s = await stack(new FakeChain(102n), { initialize: false });
+
+  try {
+    await s.follower.tick();
+    expect(s.follower.status()).toMatchObject({
+      ready: false,
+      lastError: 'Global index awaits bootstrap initialization',
+    });
+    expect(await s.store.indexState('ethereum')).toBeUndefined();
+    expect(s.chain.total).toBe(0);
+  } finally {
+    await s.close();
+  }
+});
+
+test('a non-leader clears its bootstrap error once the shared index exists', async () => {
+  const s = await stack(new FakeChain(102n), { initialize: false });
 
   const follower = createFollower({
-    adapter,
-    store,
-    lock: singleConnectionLeaderLock(db, advisoryKey('follower:ethereum')),
-    pollMs: 60_000,
-    maxLagBlocks: 96n,
-    staleAfterMs: 1_200_000,
+    adapter: s.adapter,
+    store: s.store,
+    pollMs: 1000,
     maxNoAdvanceMs: 1_800_000,
-    now,
+    lock: { tryAcquire: async () => false, held: () => false, release: async () => {} },
   });
-
-  const requestRpc = { limiter: createLimiter(8, 1_000), deadlineMs: opts.deadlineMs ?? 30_000 };
-
-  const balances = createBalanceWorker({
-    adapter, store, activeTtlMs: 300_000, refreshMs: 60_000, requestRpc, now,
-    fullSweepMs: opts.fullSweepMs, alwaysRefreshTokens: opts.alwaysRefreshTokens,
-  });
-
-  const discovery = createDiscoveryService({
-    adapters: { ethereum: adapter },
-    store,
-    followers: { ethereum: follower },
-    requestDeadlineMs: opts.deadlineMs ?? 30_000,
-    now,
-  });
-
-  const app = createApp({
-    discovery,
-    adapters: { ethereum: adapter },
-    balances: { ethereum: balances },
-    followers: { ethereum: follower },
-    requestRpc,
-    rpcStats: () => chain.rpc.stats(),
-    startedAt: 0,
-  });
-
-  const get = async (path: string) => {
-    const response = await app.request(path);
-
-    return { status: response.status, headers: response.headers, body: await response.json() };
-  };
-
-  return {
-    store, adapter, follower, balances, discovery, clock, get,
-    close: async () => {
-      await follower.stop();
-      await balances.stop();
-      await store.close();
-    },
-  };
-}
-
-/** Holdings and NFT items in the store equal a perfect fold of every transfer in [fromBlock, toBlock]. */
-async function expectTruth(store: Store, chain: FakeChain, account: Address, fromBlock: bigint, toBlock: bigint) {
-  const truth = chain.truth(account, fromBlock, toBlock);
-  const holdings = await store.holdings('ethereum', account);
-  expect(Object.fromEntries(holdings.map((h) => [h.token, {
-    standard: h.standard, firstBlock: h.firstBlock, lastBlock: h.lastBlock, sentCount: h.sentCount, receivedCount: h.receivedCount,
-  }]))).toEqual(Object.fromEntries(truth.tokens));
-  const items = await store.nftItems('ethereum', account);
-  expect(Object.fromEntries(items.map((i) => [`${i.token}:${i.tokenId}`, { held: i.heldBySeenLogs, block: i.lastBlock }])))
-    .toEqual(Object.fromEntries([...truth.nfts].map(([key, n]) => [key, { held: n.held, block: n.block }])));
-}
-
-test('5k accounts x 10 tokens: one follower tick and one refresh cost O(ranges + pairs/1000) calls; an unchanged refresh and 5k requests then cost zero', async () => {
-  const chain = new FakeChain(1_000n);
-  const s = await stack(chain, { adapter: { startBlock: 1_001n } });
 
   try {
-    await s.follower.tick(); // initializes the cursor at the finalized head (1000)
-    expect(s.follower.status()).toMatchObject({ ready: true, leader: true, lagBlocks: 0n });
-    const accounts = Array.from({ length: 5_000 }, (_, i) => address(1_000_000 + i));
-    const tokens = Array.from({ length: 10 }, (_, j) => address(500 + j));
-
-    const each = async (fn: (account: Address) => Promise<void>) => {
-      for (let i = 0; i < accounts.length; i += 250) await Promise.all(accounts.slice(i, i + 250).map(fn));
-    };
-
-    // First polls: every account is tracked (nothing to backfill: the cursor is below startBlock) and active.
-    const before = chain.total;
-    await each(async (account) => {
-      const r = await s.get(`/v1/ethereum/accounts/${account}/erc20?balances=true`);
-      expect(r.status).toBe(200);
-      expect(r.body.tokens).toEqual([]);
+    await follower.tick();
+    expect(follower.status()).toMatchObject({
+      ready: false,
+      leader: false,
+      lastError: 'Global index awaits bootstrap initialization',
     });
-    expect(chain.total).toBe(before);
-
-    // One finalized epoch with 50k transfers to tracked accounts plus noise.
-    chain.finalized = 1_032n;
-    accounts.forEach((account, i) => tokens.forEach((token) => chain.addTransfer({
-      token, from: address(900), to: account, value: 5n, blockNumber: 1_001n + BigInt(i % 32),
-    })));
-
-    for (let i = 0; i < 1_000; i += 1) chain.addTransfer({ token: tokens[0], from: address(901), to: address(902), value: 1n, blockNumber: 1_010n });
-    chain.balanceOf = (account, token) => BigInt(Number.parseInt(account.slice(-4), 16) + Number.parseInt(token.slice(-3), 16));
-
-    const tickStart = { ...chain.calls };
+    await s.store.initialize('ethereum', 100n, header(99n), s.clock.at);
     await s.follower.tick();
-    expect(s.follower.status().cursor?.number).toBe(1_032n);
-    expect((chain.calls.eth_getLogs ?? 0) - (tickStart.eth_getLogs ?? 0)).toBe(1); // one 32-block range
-    expect((chain.calls.eth_getBlockByNumber ?? 0) - (tickStart.eth_getBlockByNumber ?? 0)).toBeLessThanOrEqual(2);
-
-    expect(await s.balances.refresh()).toEqual({ pairs: 50_000, block: 1_032n });
-    expect(chain.calls.eth_call).toBe(50); // 50k pairs / 1000 per aggregate3
-    expect(chain.multicallSizes.every((size) => size === 1_000)).toBe(true);
-
-    // No Transfer since the snapshots and the hourly sweep not due: the next 60 s refresh reads nothing (was 50 calls).
-    s.clock.t += 60_000;
-    expect(await s.balances.refresh()).toEqual({ pairs: 0, block: 1_032n });
-    expect(chain.calls.eth_call).toBe(50);
-    expect(s.balances.stats().lastRefresh).toMatchObject({ candidates: 50_000, read: 0, fullSweep: false });
-
-    const served = chain.total;
-    await each(async (account) => {
-      const r = await s.get(`/v1/ethereum/accounts/${account}/erc20?balances=true`);
-      expect(r.status).toBe(200);
-      expect(r.body).toMatchObject({ blockHeight: '1032', blockHash: blockHash(1_032n), balancesAtBlockHeight: true, followerLagBlocks: '0' });
-      expect(r.body.tokens).toHaveLength(10);
-      expect(r.body.tokens[0]).toMatchObject({ receivedCount: 1, balanceStatus: 'ok', balanceBlock: '1032' });
-      expect(r.body.tokens[0].balance).toBe(chain.balanceOf(account, r.body.tokens[0].contract, '0x')!.toString());
+    const calls = s.chain.total;
+    await follower.tick();
+    expect(follower.status()).toMatchObject({
+      ready: true,
+      stale: false,
+      leader: false,
+      lastError: undefined,
+      unhealthy: undefined,
     });
-    expect(chain.total).toBe(served); // zero RPC calls for 5k requests
-  } finally {
-    await s.close();
-  }
-}, 300_000);
-
-/** A transfer history around the handoff boundary C = 150: counts, bounds and an NFT that moves at C and C+1. */
-function historyFor(chain: FakeChain, account: Address) {
-  const erc20 = address(31);
-  const nft = address(32);
-  const peer = address(33);
-
-  for (const blockNumber of [100n, 149n, 150n, 151n, 175n, 200n]) {
-    chain.addTransfer({ token: erc20, from: peer, to: account, value: 1n, blockNumber });
-    chain.addTransfer({ token: erc20, from: account, to: peer, value: 1n, blockNumber });
-  }
-
-  chain.addTransfer({ token: erc20, from: account, to: account, value: 1n, blockNumber: 150n }); // self-transfer
-  chain.addTransfer({ token: address(34), from: peer, to: account, value: 9n, blockNumber: 151n }); // first seen above C
-  chain.addTransfer({ token: nft, from: peer, to: account, value: 7n, blockNumber: 150n, standard: 'erc721' });
-  chain.addTransfer({ token: nft, from: account, to: peer, value: 7n, blockNumber: 151n, standard: 'erc721' });
-  chain.addTransfer({ token: nft, from: peer, to: account, value: 8n, blockNumber: 120n, standard: 'erc721' });
-  chain.addTransfer({ token: nft, from: account, to: peer, value: 8n, blockNumber: 150n, standard: 'erc721' });
-  chain.addTransfer({ token: nft, from: peer, to: account, value: 8n, blockNumber: 199n, standard: 'erc721' });
-}
-
-test('handoff: the follower advances during a backfill without missing or double-counting across C', async () => {
-  const chain = new FakeChain(150n);
-  const account = address(77);
-  historyFor(chain, account);
-  const s = await stack(chain, { adapter: { logsMaxRange: 20n }, deadlineMs: 50 });
-  const backfillGate = gate();
-  chain.beforeLogs = (filter) => (filter.filtered ? backfillGate.opened : undefined);
-
-  try {
-    await s.follower.tick(); // cursor C = 150
-    const first = await s.get(`/v1/ethereum/accounts/${account}/erc20`);
-    expect(first.status).toBe(202);
-    expect(first.headers.get('retry-after')).toBe('2');
-    expect(first.body).toMatchObject({ status: 'syncing', progressBlocks: '0', targetBlocks: '51' });
-    expect(await s.store.getTracking('ethereum', account)).toEqual({ target: 150n, progress: undefined });
-
-    chain.finalized = 210n;
-    await s.follower.tick(); // applies (150, 210] for the tracked account while its backfill is stuck
-    expect(s.follower.status().cursor?.number).toBe(210n);
-    expect((await s.get(`/v1/ethereum/accounts/${account}/erc20`)).status).toBe(202);
-
-    backfillGate.release();
-    let ready = await s.get(`/v1/ethereum/accounts/${account}/erc721`);
-
-    while (ready.status === 202) ready = await s.get(`/v1/ethereum/accounts/${account}/erc721`);
-    expect(ready.status).toBe(200);
-    expect(ready.body.blockHeight).toBe('210');
-    await expectTruth(s.store, chain, account, 100n, 210n);
-    expect(ready.body.collections[0].tokens).toEqual([
-      { tokenId: '8', heldBySeenLogs: true },
-      { tokenId: '7', heldBySeenLogs: false },
-    ]);
+    expect(s.chain.total).toBe(calls);
   } finally {
     await s.close();
   }
 });
 
-test('an account tracked while a range is decoded is folded from the retained logs without refetching', async () => {
-  const chain = new FakeChain(150n);
-  const account = address(78);
-  historyFor(chain, account);
-  const s = await stack(chain);
+test('global ranges index all accounts before their first request; RPC cost is independent of accounts', async () => {
+  const chain = new FakeChain(102n);
 
-  try {
-    await s.follower.tick(); // C = 150
-    chain.finalized = 210n;
-    const followerGate = gate();
-    let unfiltered = 0;
-    chain.beforeLogs = (filter) => {
-      if (filter.filtered) return undefined;
-      unfiltered += 1;
-
-      return unfiltered === 1 ? followerGate.opened : undefined;
-    };
-
-    const ticking = s.follower.tick();
-
-    while (unfiltered === 0) await new Promise((resolve) => setImmediate(resolve));
-
-    // Tracked while the follower holds logs of (150, 210] decoded without it: target is still 150.
-    const response = await s.get(`/v1/ethereum/accounts/${account}/erc20`);
-    expect(response.status).toBe(200);
-    expect(response.body.blockHeight).toBe('150');
-    expect(await s.store.getTracking('ethereum', account)).toEqual({ target: 150n, progress: 150n });
-
-    followerGate.release();
-    await ticking;
-    expect(unfiltered).toBe(1); // the commit saw the new account and re-folded the retained logs without another RPC
-    expect(s.follower.status()).toMatchObject({ lastError: undefined, cursor: { number: 210n } });
-    await expectTruth(s.store, chain, account, 100n, 210n);
-  } finally {
-    await s.close();
+  for (let i = 1; i <= 1000; i += 1) {
+    chain.addTransfer({ token, from: peer, to: address(1000 + i), value: 1n, blockNumber: 100n + BigInt(i % 3) });
   }
-});
 
-test('a self-transfer of a newly tracked account is counted once after a refold', async () => {
-  const chain = new FakeChain(150n);
-  const account = address(79);
-  chain.addTransfer({ token: address(31), from: account, to: account, value: 1n, blockNumber: 151n });
   const s = await stack(chain);
 
   try {
     await s.follower.tick();
-    chain.finalized = 160n;
-    const followerGate = gate();
-    let unfiltered = 0;
-    chain.beforeLogs = (filter) => {
-      if (filter.filtered) return undefined;
-      unfiltered += 1;
+    expect(s.follower.status()).toMatchObject({ ready: true, cursor: { number: 102n } });
+    expect(chain.calls.eth_getLogs).toBe(1);
+    const calls = chain.total;
 
-      return unfiltered === 1 ? followerGate.opened : undefined;
-    };
+    for (const who of [address(1001), address(1500), address(2000)]) {
+      expect((await s.discovery.discover('ethereum', who)).holdings).toMatchObject([{ token, receivedCount: 1n }]);
+    }
 
-    const ticking = s.follower.tick();
-
-    while (unfiltered === 0) await new Promise((resolve) => setImmediate(resolve));
-    expect((await s.get(`/v1/ethereum/accounts/${account}/erc20`)).status).toBe(200);
-
-    followerGate.release();
-    await ticking;
-    expect(unfiltered).toBe(1);
-    await expectTruth(s.store, chain, account, 100n, 160n);
+    expect(chain.total).toBe(calls);
+    expect((await s.store.holdings('ethereum', peer))[0].sentCount).toBe(1000n);
   } finally {
     await s.close();
   }
 });
 
-test('status().leader turns false as soon as the lock is lost', async () => {
-  const chain = new FakeChain(150n);
-  const { store } = await createTestStore();
+test('failed ranges preserve progress and resume without repeating committed transfers', async () => {
+  const chain = new FakeChain(105n);
+
+  for (let blockNumber = 100n; blockNumber <= 105n; blockNumber += 1n) {
+    chain.addTransfer({ token, from: peer, to: account, value: 1n, blockNumber });
+  }
+
+  const s = await stack(chain, { range: 2n });
+  let fail = true;
+  chain.beforeLogs = ({ fromBlock }) => {
+    if (fail && fromBlock === 102n) {
+      throw new RpcError('transient', 'unavailable');
+    }
+  };
+
+  try {
+    await s.follower.tick();
+    expect(s.follower.status()).toMatchObject({ ready: false, cursor: { number: 101n }, lagBlocks: 4n });
+    expect((await s.store.holdings('ethereum', account))[0].receivedCount).toBe(2n);
+    fail = false;
+    await s.follower.tick();
+    expect(s.follower.status()).toMatchObject({ ready: true, cursor: { number: 105n } });
+    expect((await s.store.holdings('ethereum', account))[0].receivedCount).toBe(6n);
+    expect(chain.calls.eth_getLogs).toBe(4);
+  } finally {
+    await s.close();
+  }
+});
+
+test('range budget bounds catch-up; service readiness stays false until the observed head is reached', async () => {
+  const s = await stack(new FakeChain(105n), { range: 2n, maxRanges: 1 });
+
+  try {
+    await s.follower.tick();
+    expect(s.follower.status()).toMatchObject({ ready: false, cursor: { number: 101n } });
+    await s.follower.tick();
+    expect(s.follower.status()).toMatchObject({ ready: false, cursor: { number: 103n } });
+    await s.follower.tick();
+    expect(s.follower.status()).toMatchObject({ ready: true, cursor: { number: 105n } });
+  } finally {
+    await s.close();
+  }
+});
+
+test('parent hash mismatch enqueues a durable repair and never advances the cursor', async () => {
+  const s = await stack();
+
+  try {
+    await s.follower.tick();
+    s.chain.finalized = 103n;
+
+    const follower = createFollower({
+      adapter: { ...s.adapter, headerByNumber: async (n) => ({ ...header(n), parentHash: blockHash(900n) }) },
+      store: s.store,
+      pollMs: 1000,
+      maxNoAdvanceMs: 1_800_000,
+    });
+
+    await follower.tick();
+    expect(follower.status()).toMatchObject({
+      ready: false,
+      cursor: { number: 102n },
+      lastError: 'Next range parent hash mismatch',
+    });
+    expect(await s.store.repairs('ethereum')).toMatchObject([{ fromBlock: 102n, toBlock: 102n }]);
+    await follower.tick();
+    expect(await s.store.repairs('ethereum')).toHaveLength(1);
+  } finally {
+    await s.close();
+  }
+});
+
+test('same-height finalized hash disagreement is queued, then a canonical replacement restores the tip', async () => {
+  const s = await stack();
+
+  try {
+    await s.follower.tick();
+    s.chain.latest = s.chain.finalized;
+    s.chain.reorg(1, []);
+    await s.follower.tick();
+    expect(s.follower.status()).toMatchObject({ ready: false, lastError: 'Finalized head hash changed' });
+    const canonical = await s.adapter.headerByNumber(102n);
+    await s.store.replaceRange('ethereum', blockRange(102n), [canonical], []);
+    await s.follower.tick();
+    expect(s.follower.status()).toMatchObject({ ready: true, cursor: { hash: canonical.hash, revision: 1n } });
+  } finally {
+    await s.close();
+  }
+});
+
+test('inconsistent log/header hashes fail the complete range and retry cleanly', async () => {
+  const chain = new FakeChain(102n);
+  chain.addTransfer({ token, from: peer, to: account, value: 1n, blockNumber: 100n });
+  chain.mismatchRangeLogHash = true;
+  const s = await stack(chain);
+
+  try {
+    await s.follower.tick();
+    expect(s.follower.status()).toMatchObject({ ready: false, cursor: { number: 99n } });
+    expect(await s.store.holdings('ethereum', account)).toEqual([]);
+    chain.mismatchRangeLogHash = false;
+    await s.follower.tick();
+    expect(s.follower.status().ready).toBe(true);
+    expect((await s.store.holdings('ethereum', account))[0].receivedCount).toBe(1n);
+  } finally {
+    await s.close();
+  }
+});
+
+test('splits provider-limited ranges and ignores removed logs while retaining the complete header chain', async () => {
+  const chain = new FakeChain(103n);
+  chain.addTransfer({ token, from: peer, to: account, value: 1n, blockNumber: 100n });
+  chain.addRemovedTransfer({ token, from: peer, to: account, value: 1n, blockNumber: 103n });
+  chain.beforeLogs = ({ fromBlock, toBlock }) => {
+    if (toBlock - fromBlock > 1n) {
+      throw new RpcError('too_large', 'response too large');
+    }
+  };
+
+  const s = await stack(chain);
+
+  try {
+    await s.follower.tick();
+    expect(s.follower.status().ready).toBe(true);
+    expect(chain.calls.eth_getLogs).toBe(3);
+    expect((await s.store.holdings('ethereum', account))[0].receivedCount).toBe(1n);
+  } finally {
+    await s.close();
+  }
+});
+
+test('read-only replicas load shared progress; a lost or failed lock clears leader status', async () => {
+  const s = await stack();
   let held = true;
+  let fail = false;
 
   const follower = createFollower({
-    adapter: chain.adapter(),
-    store,
-    lock: { tryAcquire: async () => true, held: () => held, release: async () => {} },
-    pollMs: 60_000,
-    maxLagBlocks: 96n,
-    staleAfterMs: 1_200_000,
+    adapter: s.adapter,
+    store: s.store,
+    pollMs: 1000,
     maxNoAdvanceMs: 1_800_000,
+    lock: {
+      tryAcquire: async () => {
+        if (fail) {
+          throw new Error('lock lost');
+        }
+
+        return held;
+      },
+      held: () => held,
+      release: async () => {},
+    },
   });
 
   try {
+    await s.follower.tick();
+    const calls = s.chain.total;
+    await follower.load();
+    expect(s.chain.total).toBe(calls);
+    expect(follower.status()).toMatchObject({ ready: true, leader: false });
     await follower.tick();
     expect(follower.status().leader).toBe(true);
     held = false;
     expect(follower.status().leader).toBe(false);
-  } finally {
-    await follower.stop();
-    await store.close();
-  }
-});
-
-test('a failed leadership acquisition clears the previous leader state', async () => {
-  const chain = new FakeChain(150n);
-  const { store } = await createTestStore();
-  let fail = false;
-
-  const follower = createFollower({
-    adapter: chain.adapter(),
-    store,
-    lock: {
-      tryAcquire: async () => {
-        if (fail) throw new Error('lock failed');
-
-        return true;
-      },
-      held: () => true,
-      release: async () => {},
-    },
-    pollMs: 60_000,
-    maxLagBlocks: 96n,
-    staleAfterMs: 1_200_000,
-    maxNoAdvanceMs: 1_800_000,
-  });
-
-  try {
-    await follower.tick();
-    expect(follower.status().leader).toBe(true);
     fail = true;
     await follower.tick();
-    expect(follower.status()).toMatchObject({ leader: false, lastError: 'lock failed' });
-  } finally {
-    await follower.stop();
-    await store.close();
-  }
-});
-
-test('a frozen or failing follower flags stale, then 503s past the thresholds, and recovers', async () => {
-  const chain = new FakeChain(1_000n);
-  const account = address(5);
-  const s = await stack(chain, { adapter: { startBlock: 1_001n } });
-  const erc20 = (async () => s.get(`/v1/ethereum/accounts/${account}/erc20`));
-
-  try {
-    await s.follower.tick();
-    expect((await erc20()).body).toMatchObject({ stale: false, followerLagBlocks: '0' });
-
-    // getLogs failing while finalized moves on: stale within the lag budget, 503 beyond it.
-    const failing = () => { throw new RpcError('transient', 'HTTP 503'); };
-
-    chain.beforeLogs = failing;
-    chain.finalized = 1_050n;
-    await s.follower.tick();
-    expect(s.follower.status()).toMatchObject({ stale: true, lagBlocks: 50n, lastError: 'HTTP 503' });
-    expect((await erc20()).body).toMatchObject({ stale: true, blockHeight: '1000', followerLagBlocks: '50' });
-    chain.finalized = 1_200n;
-    await s.follower.tick();
-    const behind = await erc20();
-    expect(behind.status).toBe(503);
-    expect(behind.headers.get('retry-after')).toBe('30');
-    expect(behind.body.error).toBe('Follower is 200 blocks behind the finalized head');
-
-    chain.beforeLogs = undefined;
-    await s.follower.tick();
-    expect((await erc20()).body).toMatchObject({ status: 'ready', stale: false, blockHeight: '1200', followerLagBlocks: '0' });
-
-    // Finalized stops advancing (and the head RPC fails): stale after 20 min, 503 after 30 min.
-    chain.failHead = true;
-    s.clock.t += 1_200_001;
-    await s.follower.tick();
-    expect((await erc20()).body).toMatchObject({ status: 'ready', stale: true });
-    s.clock.t += 600_000;
-    expect((await erc20()).status).toBe(503);
-
-    chain.failHead = false;
-    chain.finalized = 1_232n;
-    await s.follower.tick();
-    expect((await erc20()).body).toMatchObject({ status: 'ready', stale: false, blockHeight: '1232' });
+    expect(follower.status()).toMatchObject({ leader: false, lastError: 'lock lost' });
   } finally {
     await s.close();
   }
 });
 
-test('balances: concurrent first requests share one read; different accounts are batched by the refresh', async () => {
-  const chain = new FakeChain(150n);
-  const [a, b] = [address(41), address(42)];
-  const tokens = [address(51), address(52), address(53)];
-
-  for (const account of [a, b]) for (const token of tokens) chain.addTransfer({ token, from: address(99), to: account, value: 1n, blockNumber: 120n });
-  chain.balanceOf = (account, token, at) => at === blockHash(150n) ? 10n : account === a && token === tokens[0] ? undefined : 20n;
-  const s = await stack(chain);
+test('stale head observations never renew shared freshness and recover after a successful poll', async () => {
+  const s = await stack();
 
   try {
     await s.follower.tick();
-    await s.get(`/v1/ethereum/accounts/${a}/erc20`);
-    await s.get(`/v1/ethereum/accounts/${b}/erc20`);
-    chain.calls = {};
-
-    const [r1, r2, r3] = await Promise.all([1, 2, 3].map(() => s.get(`/v1/ethereum/accounts/${a}/erc20?balances=true`)));
-    expect(chain.calls).toEqual({ eth_call: 1 });
-    expect(r1.body).toEqual(r2.body);
-    expect(r3.body.tokens.map((t: { balance: string; balanceBlock: string }) => [t.balance, t.balanceBlock]))
-      .toEqual([['10', '150'], ['10', '150'], ['10', '150']]);
-    await s.get(`/v1/ethereum/accounts/${b}/erc20?balances=true`);
-    expect(chain.calls).toEqual({ eth_call: 2 });
-
-    // The follower advances: snapshots keep their own block until the refresh re-reads every pair at the new one.
-    chain.finalized = 182n;
+    const checkedAt = (await s.store.indexState('ethereum'))?.checkedAt;
+    s.chain.failHead = true;
+    s.clock.at += 60_000;
     await s.follower.tick();
-    const old = await s.get(`/v1/ethereum/accounts/${a}/erc20?balances=true`);
-    expect(old.body).toMatchObject({ blockHeight: '182', balancesAtBlockHeight: false });
-    expect(old.body.tokens[0]).toMatchObject({ balance: '10', balanceBlock: '150' });
-
-    chain.calls = {};
-    chain.multicallSizes = [];
-    expect(await s.balances.refresh()).toEqual({ pairs: 6, block: 182n });
-    expect(chain.calls).toEqual({ eth_call: 1 });
-    expect(chain.multicallSizes).toEqual([6]);
-    const fresh = await s.get(`/v1/ethereum/accounts/${a}/erc20?balances=true`);
-    expect(fresh.body.balancesAtBlockHeight).toBe(true);
-    const byToken = Object.fromEntries(fresh.body.tokens.map((t: { contract: string }) => [t.contract, t]));
-    expect(byToken[tokens[0]]).toMatchObject({ balanceStatus: 'error', balanceBlock: '182' });
-    expect(byToken[tokens[1]]).toMatchObject({ balance: '20', balanceStatus: 'ok', balanceBlock: '182' });
-    expect(chain.calls).toEqual({ eth_call: 1 });
-  } finally {
-    await s.close();
-  }
-});
-
-test('balances: a first read fetches only tokens without snapshots', async () => {
-  const chain = new FakeChain(150n);
-  const account = address(41);
-  const tokens = [address(51), address(52), address(53), address(54)];
-
-  for (const token of tokens) chain.addTransfer({ token, from: address(99), to: account, value: 1n, blockNumber: 120n });
-  chain.balanceOf = () => 9n;
-  const s = await stack(chain);
-
-  try {
-    await s.follower.tick();
-    await s.get(`/v1/ethereum/accounts/${account}/erc20`);
-    await s.store.saveBalances('ethereum', blockRef(150n), tokens.slice(0, 3).map((token) => ({
-      account, token, result: { status: 'ok' as const, balance: 7n },
-    })));
-    chain.calls = {};
-    chain.multicallSizes = [];
-
-    const result = await s.get(`/v1/ethereum/accounts/${account}/erc20?balances=true`);
-    expect(result.status).toBe(200);
-    expect(chain.calls).toEqual({ eth_call: 1 });
-    expect(chain.multicallSizes).toEqual([1]);
-    expect(Object.fromEntries(result.body.tokens.map((item: { contract: Address; balance: string }) => [item.contract, item.balance])))
-      .toEqual({ [tokens[0]]: '7', [tokens[1]]: '7', [tokens[2]]: '7', [tokens[3]]: '9' });
-  } finally {
-    await s.close();
-  }
-});
-
-test('balances: a transient failed refresh chunk does not replace its last good snapshot', async () => {
-  const chain = new FakeChain(100n);
-  const account = address(41);
-  const [failedToken, successfulToken] = [address(51), address(52)];
-
-  for (const token of [failedToken, successfulToken]) {
-    chain.addTransfer({ token, from: address(99), to: account, value: 1n, blockNumber: 100n });
-  }
-
-  const s = await stack(chain, { adapter: { multicallBatch: 1 } });
-
-  try {
-    await s.follower.tick();
-    let tracked = await s.get(`/v1/ethereum/accounts/${account}/erc20`);
-
-    while (tracked.status === 202) tracked = await s.get(`/v1/ethereum/accounts/${account}/erc20`);
-
-    await s.store.saveBalances('ethereum', blockRef(100n), [
-      { account, token: failedToken, result: { status: 'ok', balance: 10n } },
-      { account, token: successfulToken, result: { status: 'ok', balance: 20n } },
-    ]);
-    await s.balances.forAccount(account, [failedToken, successfulToken], blockRef(100n));
-
-    chain.finalized = 101n;
-    await s.follower.tick();
-    chain.balanceOf = () => 21n;
-    chain.beforeMulticall = (targets) => {
-      if (targets[0] === failedToken) throw new RpcError('transient', 'upstream unavailable after retries');
-    };
-
-    expect(await s.balances.refresh()).toEqual({ pairs: 2, block: 101n });
-    const snapshots = Object.fromEntries((await s.store.balances('ethereum', account)).map((row) => [row.token, row]));
-    expect(snapshots[failedToken]).toMatchObject({
-      result: { status: 'ok', balance: 10n }, blockNumber: 100n, blockHash: blockHash(100n),
+    // A failed finalized-head poll is served cached with refreshFailed; the follower must surface it as stale.
+    expect(s.follower.status()).toMatchObject({
+      ready: false,
+      stale: true,
+      lastError: 'Finalized head observation is stale',
     });
-    expect(snapshots[successfulToken]).toMatchObject({
-      result: { status: 'ok', balance: 21n }, blockNumber: 101n, blockHash: blockHash(101n),
+    expect((await (await s.app.request('/health')).json()).followers.ethereum).toMatchObject({
+      stale: true,
+      lastError: 'Finalized head observation is stale',
     });
-
-    // The failed pair has no Transfer after its old snapshot, but is retried by the next refresh anyway.
-    chain.beforeMulticall = undefined;
-    chain.multicallSizes = [];
-    expect(await s.balances.refresh()).toEqual({ pairs: 1, block: 101n });
-    expect(chain.multicallSizes).toEqual([1]);
-    expect((await s.store.balances('ethereum', account)).find((row) => row.token === failedToken))
-      .toMatchObject({ result: { status: 'ok', balance: 21n }, blockNumber: 101n });
-  } finally {
-    await s.close();
-  }
-});
-
-/** One tracked account holding `tokens` (Transfers at 120, cursor at 150) whose first balances request has been served. */
-async function warmBalances(chain: FakeChain, tokens: Address[], opts: Parameters<typeof stack>[1] = {}) {
-  const account = address(41);
-
-  for (const token of tokens) chain.addTransfer({ token, from: address(99), to: account, value: 1n, blockNumber: 120n });
-  const s = await stack(chain, opts);
-  await s.follower.tick();
-  await s.get(`/v1/ethereum/accounts/${account}/erc20`);
-  expect((await s.get(`/v1/ethereum/accounts/${account}/erc20?balances=true`)).status).toBe(200);
-  /** Pairs read by multicall since the last reset, as token addresses. */
-  const readTokens: Address[] = [];
-  chain.beforeMulticall = (targets) => { readTokens.push(...targets); };
-
-  const reset = () => { chain.calls = {}; chain.multicallSizes = []; readTokens.length = 0; };
-
-  return { s, account, readTokens, reset };
-}
-
-test('balances: a refresh with no new Transfers reads nothing', async () => {
-  const chain = new FakeChain(150n);
-  const tokens = [address(51), address(52), address(53)];
-  chain.balanceOf = () => 7n;
-  const { s, reset } = await warmBalances(chain, tokens);
-
-  try {
-    expect(await s.balances.refresh()).toEqual({ pairs: 3, block: 150n }); // the first refresh is a full sweep
-    s.clock.t += 60_000;
-    reset();
-    expect(await s.balances.refresh()).toEqual({ pairs: 0, block: 150n });
-    expect(chain.calls).toEqual({});
-    expect(s.balances.stats().lastRefresh).toMatchObject({ candidates: 3, read: 0, pairs: 0, fullSweep: false });
-  } finally {
-    await s.close();
-  }
-});
-
-test('balances: a Transfer after the snapshot re-reads only that pair', async () => {
-  const chain = new FakeChain(150n);
-  const tokens = [address(51), address(52), address(53)];
-  chain.balanceOf = (_account, _token, at) => at === blockHash(150n) ? 7n : 8n;
-  const { s, account, readTokens, reset } = await warmBalances(chain, tokens);
-
-  try {
-    await s.balances.refresh();
-    chain.addTransfer({ token: tokens[1], from: address(99), to: account, value: 1n, blockNumber: 160n });
-    chain.finalized = 182n;
+    expect((await s.store.indexState('ethereum'))?.checkedAt).toBe(checkedAt);
+    s.chain.failHead = false;
+    s.chain.finalized = 103n;
     await s.follower.tick();
-    s.clock.t += 60_000;
-    reset();
-    expect(await s.balances.refresh()).toEqual({ pairs: 1, block: 182n });
-    expect(chain.calls).toEqual({ eth_call: 1 });
-    expect(readTokens).toEqual([tokens[1]]);
-    const byToken = Object.fromEntries((await s.store.balances('ethereum', account)).map((row) => [row.token, row]));
-    expect(byToken[tokens[1]]).toMatchObject({ result: { status: 'ok', balance: 8n }, blockNumber: 182n });
-    expect(byToken[tokens[0]]).toMatchObject({ result: { status: 'ok', balance: 7n }, blockNumber: 150n });
+    expect(s.follower.status()).toMatchObject({ ready: true, stale: false, lastError: undefined });
   } finally {
     await s.close();
   }
 });
 
-test('balances: the hourly sweep re-reads non-zero pairs and skips zero balances', async () => {
-  const chain = new FakeChain(150n);
-  const [zero, nonZero] = [address(51), address(52)];
-  chain.balanceOf = (_account, token) => token === zero ? 0n : 5n;
-  // A 4 min sweep stands in for the hour: the test clock must stay within the follower's staleness bounds.
-  const { s, account, readTokens, reset } = await warmBalances(chain, [zero, nonZero], { fullSweepMs: 240_000 });
-
-  try {
-    await s.balances.refresh();
-    s.clock.t += 60_000;
-    reset();
-    await s.balances.refresh();
-    expect(chain.calls).toEqual({});
-
-    s.clock.t += 180_000;
-    await s.get(`/v1/ethereum/accounts/${account}/erc20?balances=true`); // still active; served from snapshots
-    expect(chain.calls).toEqual({});
-    expect(await s.balances.refresh()).toEqual({ pairs: 1, block: 150n });
-    expect(readTokens).toEqual([nonZero]);
-    expect(s.balances.stats().lastRefresh).toMatchObject({ candidates: 2, read: 1, fullSweep: true });
-
-    s.clock.t += 60_000;
-    reset();
-    await s.balances.refresh();
-    expect(chain.calls).toEqual({}); // the sweep is not due again for another interval
-  } finally {
-    await s.close();
-  }
-});
-
-test('balances: always-refresh tokens are read every cycle', async () => {
-  const chain = new FakeChain(150n);
-  const tokens = [address(51), address(52), address(53)];
-  chain.balanceOf = () => 7n;
-  const { s, readTokens, reset } = await warmBalances(chain, tokens, { alwaysRefreshTokens: [tokens[2]] });
-
-  try {
-    await s.balances.refresh();
-
-    for (let cycle = 0; cycle < 2; cycle += 1) {
-      s.clock.t += 60_000;
-      reset();
-      expect(await s.balances.refresh()).toEqual({ pairs: 1, block: 150n });
-      expect(readTokens).toEqual([tokens[2]]);
-    }
-  } finally {
-    await s.close();
-  }
-});
-
-test('balances: a reorg-kicked refresh still re-reads every pair, zero balances included', async () => {
-  const chain = new FakeChain(150n);
-  const tokens = [address(51), address(52), address(53)];
-  chain.balanceOf = () => 0n;
-  const { s, readTokens, reset } = await warmBalances(chain, tokens);
-
-  try {
-    expect(await s.balances.refresh()).toEqual({ pairs: 0, block: 150n }); // zero balances are not swept
-    s.clock.t += 60_000;
-    reset();
-    s.balances.start();
-    s.balances.kick({ reorg: true });
-    expect(await s.balances.refresh()).toEqual({ pairs: 3, block: 150n }); // joins the kicked refresh
-    expect([...readTokens].sort()).toEqual([...tokens].sort());
-    expect(s.balances.stats().lastRefresh).toMatchObject({ candidates: 3, read: 3, fullSweep: true });
-  } finally {
-    await s.close();
-  }
-});
-
-test('a backfill that fails mid-way resumes from its last chunk and stays syncing until done', async () => {
-  const chain = new FakeChain(160n);
-  const account = address(66);
-  historyFor(chain, account);
-  const s = await stack(chain, { adapter: { logsMaxRange: 10n, scanConcurrency: 1 }, deadlineMs: 50 });
-  let failing = true;
-  const retryGate = gate();
-  const requested: bigint[] = [];
-  chain.beforeLogs = async (filter) => {
-    if (!filter.filtered) return;
-    requested.push(filter.fromBlock);
-
-    if (filter.fromBlock === 130n) {
-      if (failing) throw new RpcError('transient', 'HTTP 503');
-      await retryGate.opened;
-    }
+test('concurrent ticks share work and a request during ingestion sees the committed stale snapshot', async () => {
+  const s = await stack();
+  const pause = gate();
+  let entered = false;
+  s.chain.beforeLogs = async () => {
+    entered = true;
+    await pause.opened;
   };
 
   try {
-    await s.follower.tick();
-    const failed = await s.get(`/v1/ethereum/accounts/${account}/erc20`);
-    expect(failed.status).toBe(503);
-    expect(await s.store.getTracking('ethereum', account)).toEqual({ target: 160n, progress: 129n });
+    const a = s.follower.tick();
+    const b = s.follower.tick();
 
-    failing = false;
-    requested.length = 0;
-    const syncing = await s.get(`/v1/ethereum/accounts/${account}/erc20`);
-    expect(syncing.status).toBe(202);
-    expect(syncing.body).toMatchObject({ status: 'syncing', progressBlocks: '30', targetBlocks: '61' });
-    expect(requested[0]).toBe(130n);
+    while (!entered) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
 
-    retryGate.release();
-    let done = await s.get(`/v1/ethereum/accounts/${account}/erc20`);
-
-    while (done.status === 202) done = await s.get(`/v1/ethereum/accounts/${account}/erc20`);
-    expect(done.status).toBe(200);
-    expect(requested.filter((from) => from < 130n)).toEqual([]);
-    await expectTruth(s.store, chain, account, 100n, 160n);
-  } finally {
-    await s.close();
-  }
-});
-
-test('overloaded backfills get 503 with Retry-After instead of queueing without bound', async () => {
-  const chain = new FakeChain(150n);
-  const { store } = await createTestStore();
-  const adapter = chain.adapter();
-  const stuck = gate();
-  chain.beforeLogs = () => stuck.opened;
-  const follower = createFollower({ adapter, store, pollMs: 60_000, maxLagBlocks: 96n, staleAfterMs: 1e6, maxNoAdvanceMs: 1e7 });
-
-  const discovery = createDiscoveryService({
-    adapters: { ethereum: adapter },
-    store,
-    followers: { ethereum: follower },
-    requestDeadlineMs: 20,
-    backfillLimiter: createLimiter(1, 1),
-  });
-
-  try {
-    await follower.tick();
-    expect(await discovery.discover('ethereum', address(1))).toMatchObject({ status: 'syncing' });
-    expect(await discovery.discover('ethereum', address(2))).toMatchObject({ status: 'syncing' }); // queued
-    await expect(discovery.discover('ethereum', address(3))).rejects.toMatchObject({ statusCode: 503, retryAfterS: 5 });
-    stuck.release();
-  } finally {
-    await follower.stop();
-    await store.close();
-  }
-});
-
-test('a restarted follower serves its persisted cursor after load(), before its first tick reaches the RPC', async () => {
-  const chain = new FakeChain(1_000n);
-  const s = await stack(chain);
-
-  try {
-    await s.follower.tick();
-
-    const restarted = createFollower({
-      adapter: s.adapter, store: s.store, pollMs: 60_000, maxLagBlocks: 96n,
-      staleAfterMs: 1_200_000, maxNoAdvanceMs: 1_800_000, now: () => s.clock.t,
+    expect(await s.discovery.discover('ethereum', account)).toMatchObject({
+      status: 'ready',
+      stale: true,
+      blockHeight: 99n,
+      holdings: [],
     });
-
-    expect(restarted.status()).toMatchObject({ ready: false });
-    const before = chain.total;
-    await restarted.load();
-    expect(chain.total).toBe(before);
-    expect(restarted.status()).toMatchObject({ ready: true, unhealthy: undefined, cursor: { number: 1_000n } });
+    pause.release();
+    await Promise.all([a, b]);
+    expect(s.chain.calls.eth_getLogs).toBe(1);
   } finally {
+    pause.release();
     await s.close();
   }
 });
 
-test('kick() wakes a follower with a long fallback poll, even when it arrives during a tick', async () => {
-  const chain = new FakeChain(1_000n);
-  const { store } = await createTestStore();
-
-  const follower = createFollower({
-    adapter: chain.adapter(), store, pollMs: 3_600_000, maxLagBlocks: 96n, staleAfterMs: 1e6, maxNoAdvanceMs: 1e7,
-  });
-
-  const until = async (done: () => boolean) => { for (let i = 0; i < 200 && !done(); i += 1) await new Promise((r) => setTimeout(r, 5)); };
+test('bootstrap append uses exactly the same cursor and the follower continues from it', async () => {
+  const s = await stack(new FakeChain(103n));
 
   try {
-    follower.start();
-    await until(() => follower.status().cursor?.number === 1_000n);
-    chain.finalized = 1_032n;
-    follower.kick();
-    await until(() => follower.status().cursor?.number === 1_032n);
-    expect(follower.status().cursor?.number).toBe(1_032n);
+    await s.store.observeHead('ethereum', header(103n), s.clock.at);
+    await s.store.appendRange('ethereum', blockRange(100n, 101n), headersFor(100n, 101n), [], s.clock.at);
+    const ranges: bigint[] = [];
+    s.chain.beforeLogs = ({ fromBlock }) => {
+      ranges.push(fromBlock);
+    };
 
-    const stuck = gate();
-    chain.beforeLogs = () => stuck.opened;
-    chain.finalized = 1_064n;
-    follower.kick();
-    await until(() => follower.status().headNumber === 1_064n);
-    chain.finalized = 1_096n;
-    follower.kick(); // during the tick that is waiting on getLogs
-    chain.beforeLogs = undefined;
-    stuck.release();
-    await until(() => follower.status().cursor?.number === 1_096n);
-    expect(follower.status().cursor?.number).toBe(1_096n);
+    await s.follower.tick();
+    expect(ranges).toEqual([102n]);
+    expect(s.follower.status().ready).toBe(true);
   } finally {
-    await follower.stop();
-    await store.close();
+    await s.close();
   }
 });

@@ -1,29 +1,27 @@
-import { createLimiter, unavailable, withDeadline } from '../core/limiter.ts';
-import type { Limiter } from '../core/limiter.ts';
 import { addTransfer, emptyAggregate } from '../core/aggregate.ts';
 import type {
+  AccountView,
   Address,
-  BlockRange,
+  BlockHeader,
   ChainAdapter,
-  ChunkScan,
-  DiscoveryResult,
   DiscoveryService,
-  Follower,
-  Store,
-  SyncingResult,
+  IndexSnapshot,
+  IndexState,
+  ServingMetadata,
+  ServingStatus,
   TailStatus,
-  Tracking,
 } from '../core/types.ts';
+import type { Store } from '../core/types.ts';
 
-interface DiscoveryDependencies {
+const ZERO: Address = `0x${'0'.repeat(40)}`;
+
+export interface DiscoveryDependencies {
   adapters: Record<string, ChainAdapter>;
   store: Store;
-  followers: Record<string, Pick<Follower, 'status' | 'track'>>;
+  maxHeadAgeMs: number;
+  maxNoAdvanceMs: number;
+  /** Per-network tail; without one every read is finalized. */
   tails?: Record<string, { status(): TailStatus }>;
-  /** How long a request waits for a cold backfill before answering `syncing`; the backfill continues. */
-  requestDeadlineMs?: number;
-  /** Bounds concurrent (and queued) backfills; beyond it requests get 503 with Retry-After. */
-  backfillLimiter?: Limiter;
   /**
    * Serve `latest` only while the shared tail tip's own block timestamp is at most this old (undefined: no check).
    * Every process reads the same tip, so a stalled leader degrades all of them, not just itself.
@@ -32,274 +30,287 @@ interface DiscoveryDependencies {
   now?: () => number;
 }
 
-interface BackfillStats {
-  newBlocks: bigint;
-  rpcCalls: number;
-  ms: number;
+const newestFirst = (a: { lastBlock: bigint }, b: { lastBlock: bigint }, tie: number) =>
+  a.lastBlock === b.lastBlock ? tie : a.lastBlock > b.lastBlock ? -1 : 1;
+
+/** Fold the account's tail Transfers over the finalized summaries and current owners (latest view). */
+function overlay(view: AccountView, account: Address): Pick<AccountView, 'holdings' | 'nftItems'> {
+  const aggregate = emptyAggregate();
+
+  for (const event of view.tailTransfers) {
+    addTransfer(aggregate, account, event);
+  }
+
+  const byToken = new Map(view.holdings.map((holding) => [holding.token, { ...holding }]));
+
+  for (const [token, tail] of aggregate.tokens) {
+    const sent = BigInt(tail.sentCount);
+    const received = BigInt(tail.receivedCount);
+    const base = byToken.get(token);
+
+    const unfinalized = {
+      ...(sent > 0n && { unfinalizedSentCount: sent }),
+      ...(received > 0n && { unfinalizedReceivedCount: received }),
+    };
+
+    byToken.set(
+      token,
+      base
+        ? {
+            ...base,
+            ...unfinalized,
+            standard: base.standard === 'erc721' ? base.standard : tail.standard,
+            lastBlock: tail.lastBlock > base.lastBlock ? tail.lastBlock : base.lastBlock,
+            sentCount: base.sentCount + sent,
+            receivedCount: base.receivedCount + received,
+          }
+        : {
+            token,
+            standard: tail.standard,
+            firstBlock: tail.firstBlock,
+            lastBlock: tail.lastBlock,
+            sentCount: sent,
+            receivedCount: received,
+            ...unfinalized,
+          },
+    );
+  }
+
+  // The account's latest tail Transfer of an item decides whether it still holds it; sent items leave the list.
+  const byItem = new Map(view.nftItems.map((item) => [`${item.token}:${item.tokenId}`, item]));
+
+  for (const [key, item] of aggregate.nfts) {
+    if (item.held) {
+      byItem.set(key, {
+        token: item.token,
+        tokenId: item.tokenId,
+        heldBySeenLogs: true,
+        lastBlock: item.block,
+        unfinalized: true,
+      });
+    } else {
+      byItem.delete(key);
+    }
+  }
+
+  return {
+    holdings: [...byToken.values()].sort((a, b) => newestFirst(a, b, a.token.localeCompare(b.token))),
+    nftItems:
+      account === ZERO
+        ? []
+        : [...byItem.values()].sort((a, b) =>
+            a.token === b.token ? (a.tokenId < b.tokenId ? -1 : 1) : a.token.localeCompare(b.token),
+          ),
+  };
 }
 
-type ChunkOutcome = ({ ok: true } & ChunkScan) | { ok: false; error: unknown };
-
-interface ChunkSlot {
-  range: BlockRange;
-  outcome?: ChunkOutcome;
-}
-
-const DEFAULT_REQUEST_DEADLINE_MS = 10_000;
-
-/** Consecutive light chunks (at the current range) before the range doubles again. */
-const GROW_AFTER = 3;
-
-const backfilled = (adapter: ChainAdapter, tracking: Tracking): boolean =>
-  tracking.target < adapter.startBlock || (tracking.progress !== undefined && tracking.progress >= tracking.target);
-
+/** Shared database state governs every replica. No RPC, tracking, or work scheduled by account requests. */
 export function createDiscoveryService(deps: DiscoveryDependencies): DiscoveryService {
   const now = deps.now ?? Date.now;
-  const requestDeadlineMs = deps.requestDeadlineMs ?? DEFAULT_REQUEST_DEADLINE_MS;
-  const limiter = deps.backfillLimiter ?? createLimiter(4, 64);
-  const inFlight = new Map<string, Promise<BackfillStats>>();
 
-  /** Resumable chunked scan of [startBlock, target]: the follower owns every block above target. */
-  const backfill = async (adapter: ChainAdapter, account: Address): Promise<BackfillStats> => {
-    const startedAt = Date.now();
-    const tracking = await deps.store.getTracking(adapter.network, account);
+  const validate = (network: string, input: string) => {
+    const adapter = Object.hasOwn(deps.adapters, network) ? deps.adapters[network] : undefined;
 
-    if (!tracking) throw new Error(`Account ${account} is not tracked`);
-    const target = tracking.target;
-    const appliedTo = tracking.progress;
-    const fromBlock = appliedTo !== undefined && appliedTo >= adapter.startBlock ? appliedTo + 1n : adapter.startBlock;
-
-    let newBlocks = 0n;
-    let rpcCalls = 0;
-
-    if (fromBlock <= target) {
-      const source = adapter.accountLogs;
-      const maxRange = source.preferredMaxRange;
-      const minRange = source.adaptiveRange?.minRange ?? maxRange;
-      const concurrency = adapter.scanConcurrency;
-      // Per-account adaptive persistence belongs to the source that understands `heavy` (RPC). A fixed-range
-      // HyperSync source deliberately ignores an old RPC range and keeps its large independently committed chunks.
-      const persisted = source.adaptiveRange ? await deps.store.getLogsRange(adapter.network, account) : undefined;
-      let range = persisted === undefined || persisted > maxRange ? maxRange : persisted < minRange ? minRange : persisted;
-      let lightStreak = 0;
-
-      // Called in completion order: shrink below a heavy chunk's own size, grow after a streak of light ones.
-      const adapt = (chunk: BlockRange, heavy: boolean): void => {
-        const size = chunk.toBlock - chunk.fromBlock + 1n;
-
-        if (heavy) {
-          const half = size / 2n > minRange ? size / 2n : minRange;
-
-          if (half < range) range = half;
-          lightStreak = 0;
-        } else if (size >= range && ++lightStreak >= GROW_AFTER) {
-          range = range * 2n < maxRange ? range * 2n : maxRange;
-          lightStreak = 0;
-        }
-      };
-
-      // Uncommitted chunks in block order. A new chunk starts whenever any in-flight one finishes;
-      // completed chunks wait here until every earlier chunk is committed, bounded at 2x concurrency.
-      const window: ChunkSlot[] = [];
-      let active = 0;
-      let nextFrom = fromBlock;
-      let stopped = false;
-      let wake = (): void => {};
-      const settled = (): Promise<void> => new Promise<void>((resolve) => { wake = resolve; });
-
-      const launch = (): void => {
-        while (!stopped && active < concurrency && window.length < 2 * concurrency && nextFrom <= target) {
-          const end = nextFrom + range - 1n;
-          const slot: ChunkSlot = { range: { fromBlock: nextFrom, toBlock: end < target ? end : target } };
-          nextFrom = slot.range.toBlock + 1n;
-          window.push(slot);
-          active += 1;
-          source.scanAccount(account, slot.range).then(
-            (value): ChunkOutcome => ({ ok: true, ...value }),
-            (error): ChunkOutcome => ({ ok: false, error }),
-          ).then((outcome) => {
-            slot.outcome = outcome;
-            active -= 1;
-
-            if (outcome.ok) adapt(slot.range, outcome.heavy);
-            else stopped = true; // commit what precedes the failure, start nothing new
-            launch();
-            wake();
-          });
-        }
-      };
-
-      try {
-        launch();
-
-        while (window.length > 0) {
-          const outcome = window[0].outcome;
-
-          if (!outcome) {
-            await settled();
-            continue;
-          }
-
-          if (!outcome.ok) throw outcome.error;
-          const { range: done } = window.shift()!;
-          await deps.store.applyScanChunk(adapter.network, account, done, outcome.aggregate);
-          rpcCalls += outcome.calls;
-          newBlocks += done.toBlock - done.fromBlock + 1n;
-          launch();
-        }
-      } finally {
-        stopped = true;
-
-        while (active > 0) await settled();
-
-        if (source.adaptiveRange && range !== persisted) await deps.store.setLogsRange(adapter.network, account, range);
-      }
+    if (!adapter) {
+      throw Object.assign(new Error(`Unknown network: ${network}`), { statusCode: 404 });
     }
 
-    return { newBlocks, rpcCalls, ms: Date.now() - startedAt };
+    const account = adapter.normalizeAddress(input);
+
+    if (!account) {
+      throw Object.assign(new Error('Invalid account address'), { statusCode: 400 });
+    }
+
+    return { adapter, account };
   };
 
-  const startBackfill = (adapter: ChainAdapter, account: Address): Promise<BackfillStats> => {
-    const key = `${adapter.network}:${account}`;
-    let pending = inFlight.get(key);
+  const statusOf = (snapshot: { state?: IndexState } | undefined): ServingStatus => {
+    const state = snapshot?.state;
+    let reason: string | undefined;
 
-    if (!pending) {
-      pending = limiter.run(() => backfill(adapter, account)).finally(() => inFlight.delete(key));
-      inFlight.set(key, pending);
+    if (!state) {
+      return { ready: false, serving: 'partial', reason: 'Global index bootstrap is incomplete' };
     }
 
-    return pending;
+    if (state.pendingRepair) {
+      reason = 'Global index has pending repairs';
+    } else if (state.head && state.cursor.number === state.head.number && state.cursor.hash !== state.head.hash) {
+      reason = 'Global index head hash mismatch';
+    } else if (!state.head || state.checkedAt === undefined) {
+      reason = 'Global index awaits finalized head observation';
+    } else if (state.cursor.number < state.head.number) {
+      reason = 'Global index has not reached the finalized head';
+    } else if (now() - state.checkedAt > deps.maxHeadAgeMs) {
+      reason = 'Finalized head observation is too old';
+    } else if (now() - state.cursor.updatedAt > deps.maxNoAdvanceMs) {
+      reason = 'Global index has not advanced recently enough';
+    }
+
+    return { ready: reason === undefined, serving: reason ? 'stale' : 'full', ...(reason && { reason }) };
+  };
+
+  const emptyIndex = (network: string): IndexSnapshot => ({
+    bootstrap: {
+      startBlock: deps.adapters[network].startBlock,
+      coveredRanges: [],
+      coveredBlocks: 0n,
+    },
+  });
+
+  const metadata = (
+    snapshot: IndexSnapshot,
+    served?: BlockHeader | IndexState['cursor'],
+    latest?: bigint,
+  ): ServingMetadata => {
+    if (snapshot.bootstrap) {
+      return {
+        ...snapshot.bootstrap,
+        status: 'partial',
+        complete: false,
+        note: 'Applied ranges only. Counts and last seen blocks are lower bounds; first seen blocks may move earlier. NFT owners may be outdated where later ranges are missing.',
+      };
+    }
+
+    const { cursor, head } = snapshot.state;
+    const block = served ?? cursor;
+    const status = statusOf(snapshot);
+
+    return {
+      status: 'ready',
+      complete: true,
+      blockHeight: block.number,
+      blockHash: block.hash,
+      blockTimestamp: block.timestamp,
+      revision: cursor.revision,
+      lastProgressAt: block === cursor ? cursor.updatedAt : Number(block.timestamp) * 1000,
+      stale: status.serving === 'stale',
+      ...(status.reason && { staleReason: status.reason }),
+      ...(snapshot.state.pendingRepair && {
+        repairPending: true as const,
+        note: 'Rows in the repaired range and derived counts/ownership may change when repair commits.',
+      }),
+      ...(head && cursor.number === head.number && cursor.hash !== head.hash && { headHashMismatch: true as const }),
+      lagBlocks: latest !== undefined && latest > block.number ? latest - block.number : 0n,
+      followerLagBlocks: head && head.number > cursor.number ? head.number - cursor.number : 0n,
+    };
+  };
+
+  const tailOf = (network: string) =>
+    deps.tails && Object.hasOwn(deps.tails, network) ? deps.tails[network] : undefined;
+
+  /** Why the latest view cannot be served from this tip (undefined: serve it). */
+  const tailProblem = (status: TailStatus, tip: BlockHeader | undefined, cursor: bigint): string | undefined => {
+    if (!status.healthy) {
+      return status.tailError ?? 'Tail is unhealthy';
+    }
+
+    if (!tip || tip.number <= cursor) {
+      return 'Tail has no complete snapshot yet';
+    }
+
+    const ageMs = now() - Number(tip.timestamp) * 1000;
+
+    if (deps.maxTailTipAgeMs !== undefined && ageMs > deps.maxTailTipAgeMs) {
+      return `Tail tip is ${Math.round(ageMs / 1000)} s old`;
+    }
+
+    return undefined;
   };
 
   return {
-    async discover(network: string, input: string, requestedFinality?: 'latest' | 'finalized'): Promise<DiscoveryResult | SyncingResult> {
-      // Own-property lookup: names like `constructor` must 404, not hit Object.prototype.
-      const adapter = Object.hasOwn(deps.adapters, network) ? deps.adapters[network] : undefined;
-      const follower = Object.hasOwn(deps.followers, network) ? deps.followers[network] : undefined;
-
-      if (!adapter || !follower) {
+    async status(network, snapshot) {
+      if (!Object.hasOwn(deps.adapters, network)) {
         throw Object.assign(new Error(`Unknown network: ${network}`), { statusCode: 404 });
       }
 
-      const account = adapter.normalizeAddress(input);
+      return statusOf(snapshot ?? (await deps.store.indexSnapshot(network)));
+    },
+    async discover(network, input, options = {}) {
+      const { adapter, account } = validate(network, input);
+      const tail = options.finality === 'finalized' ? undefined : tailOf(network)?.status();
 
-      if (!account) throw Object.assign(new Error('Invalid account address'), { statusCode: 400 });
+      const view = await deps.store.readAccount(network, account, {
+        tail: tail !== undefined,
+        balances: options.balances,
+      });
 
-      const status = follower.status();
+      const snapshot: AccountView = view ?? { ...emptyIndex(network), holdings: [], nftItems: [], tailTransfers: [] };
 
-      if (status.unhealthy) throw unavailable(status.unhealthy, 30);
-      // Tracked first (target = follower cursor, atomically), then backfilled up to that target.
-      let tracking = await deps.store.getTracking(network, account) ?? await deps.store.trackAccount(network, account, now());
-      follower.track(account);
-
-      let scan: BackfillStats = { newBlocks: 0n, rpcCalls: 0, ms: 0 };
-
-      if (!backfilled(adapter, tracking)) {
-        const done = await withDeadline(startBackfill(adapter, account), requestDeadlineMs, () => undefined);
-
-        if (!done) {
-          tracking = await deps.store.getTracking(network, account) ?? tracking;
-          const blocks = (to: bigint | undefined): bigint => to !== undefined && to >= adapter.startBlock ? to - adapter.startBlock + 1n : 0n;
-
-          return {
-            status: 'syncing',
-            network,
-            account,
-            fromBlock: adapter.startBlock,
-            progressBlocks: blocks(tracking.progress),
-            targetBlocks: blocks(tracking.target),
-            followerLagBlocks: status.lagBlocks,
-          };
-        }
-
-        scan = done;
+      if (snapshot.bootstrap) {
+        return {
+          ...metadata(snapshot),
+          network,
+          account,
+          fromBlock: snapshot.bootstrap.startBlock,
+          finality: 'finalized',
+          ...(options.finality !== 'finalized' && { tailError: 'Global index bootstrap is incomplete' }),
+          holdings: snapshot.holdings,
+          nftItems: snapshot.nftItems,
+        };
       }
 
-      // Pure database read from here on: no RPC on the request path once the account is backfilled.
-      const view = await deps.store.readAccount(network, account);
+      const { cursor, startBlock } = snapshot.state;
+      const staleReason = statusOf(snapshot).reason;
 
-      if (!view) throw unavailable('Follower has no cursor yet', 5);
-      const { cursor } = view;
-      const tailStatus = (deps.tails && Object.hasOwn(deps.tails, network) ? deps.tails[network] : undefined)?.status();
-      const wantsLatest = requestedFinality !== 'finalized' && tailStatus !== undefined;
-      const tipAgeMs = view.tailTip && now() - Number(view.tailTip.timestamp) * 1000;
+      const tailError =
+        options.finality !== 'finalized'
+          ? (staleReason ?? (tail && tailProblem(tail, snapshot.tailTip, cursor.number)))
+          : undefined;
 
-      const tipTooOld = wantsLatest && deps.maxTailTipAgeMs !== undefined && tipAgeMs !== undefined
-        && tipAgeMs > deps.maxTailTipAgeMs;
-
-      const serveLatest = wantsLatest && tailStatus.healthy && view.tailTip !== undefined && !tipTooOld;
-      let holdings = view.holdings;
-      let nftItems = view.nftItems;
-
-      if (serveLatest) {
-        const aggregate = emptyAggregate();
-
-        for (const event of view.tailTransfers) addTransfer(aggregate, account, event);
-        const byToken = new Map(holdings.map((holding) => [holding.token, { ...holding }]));
-
-        for (const [token, tail] of aggregate.tokens) {
-          const base = byToken.get(token);
-
-          if (base) {
-            base.firstBlock = tail.firstBlock < base.firstBlock ? tail.firstBlock : base.firstBlock;
-            base.lastBlock = tail.lastBlock > base.lastBlock ? tail.lastBlock : base.lastBlock;
-            base.sentCount += tail.sentCount;
-            base.receivedCount += tail.receivedCount;
-
-            if (tail.sentCount > 0) base.unfinalizedSentCount = tail.sentCount;
-
-            if (tail.receivedCount > 0) base.unfinalizedReceivedCount = tail.receivedCount;
-          } else {
-            byToken.set(token, {
-              token,
-              ...tail,
-              ...(tail.sentCount > 0 && { unfinalizedSentCount: tail.sentCount }),
-              ...(tail.receivedCount > 0 && { unfinalizedReceivedCount: tail.receivedCount }),
-            });
-          }
-        }
-
-        holdings = [...byToken.values()].sort((a, b) => a.lastBlock === b.lastBlock
-          ? a.token.localeCompare(b.token) : a.lastBlock > b.lastBlock ? -1 : 1);
-        const byItem = new Map(nftItems.map((item) => [`${item.token}:${item.tokenId}`, { ...item }]));
-
-        for (const [key, item] of aggregate.nfts) byItem.set(key, {
-          token: item.token,
-          tokenId: item.tokenId,
-          heldBySeenLogs: item.held,
-          lastBlock: item.block,
-          unfinalized: true,
-        });
-        nftItems = [...byItem.values()].sort((a, b) => a.lastBlock === b.lastBlock
-          ? `${a.token}:${a.tokenId}`.localeCompare(`${b.token}:${b.tokenId}`) : a.lastBlock > b.lastBlock ? -1 : 1);
-      }
-
-      const served = serveLatest ? view.tailTip! : cursor;
-      const latest = tailStatus?.latestNumber ?? adapter.cachedLatestBlockNumber?.() ?? served.number;
-      const head = status.headNumber ?? cursor.number;
+      const tip = tail && !tailError ? snapshot.tailTip : undefined;
+      const latest = tail?.latestNumber ?? adapter.cachedLatestBlockNumber?.() ?? cursor.number;
 
       return {
-        status: 'ready',
+        ...metadata(snapshot, tip ?? cursor, latest),
         network,
         account,
-        fromBlock: adapter.startBlock,
-        blockHeight: served.number,
-        blockHash: served.hash,
-        blockTimestamp: served.timestamp,
-        finality: serveLatest ? 'latest' : 'finalized',
-        ...(serveLatest && { finalizedBlockHeight: cursor.number, finalizedBlockHash: cursor.hash }),
-        ...(wantsLatest && !serveLatest && {
-          tailError: tailStatus?.tailError
-            ?? (tipTooOld ? `Tail tip is ${Math.round(tipAgeMs! / 1000)} s old` : 'Tail has no complete snapshot yet'),
-        }),
-        // The shared tip's block time, not process memory: identical in every process, leader or not.
-        lastProgressAt: serveLatest ? Number(view.tailTip!.timestamp) * 1000 : cursor.updatedAt,
-        stale: serveLatest ? false : status.stale,
-        lagBlocks: latest > served.number ? latest - served.number : 0n,
-        followerLagBlocks: head > cursor.number ? head - cursor.number : 0n,
-        holdings,
-        nftItems,
-        scan,
+        fromBlock: startBlock,
+        finality: tip ? 'latest' : 'finalized',
+        ...(tip && { finalizedBlockHeight: cursor.number, finalizedBlockHash: cursor.hash }),
+        ...(tailError && { tailError }),
+        ...(tip ? overlay(snapshot, account) : { holdings: snapshot.holdings, nftItems: snapshot.nftItems }),
+        ...(snapshot.balances && { balances: snapshot.balances }),
+      };
+    },
+    async history(network, input, limit, before, finality) {
+      const { adapter, account } = validate(network, input);
+      const tail = finality === 'finalized' ? undefined : tailOf(network)?.status();
+      let page = await deps.store.transferHistory(network, account, limit, before, tail !== undefined);
+
+      if (!page && before) {
+        throw Object.assign(new Error('History changed; restart pagination'), { statusCode: 409 });
+      }
+
+      page ??= { ...emptyIndex(network), throughBlock: 0n, transfers: [] };
+
+      let tailError =
+        finality !== 'finalized'
+          ? (statusOf(page).reason ?? (tail && tailProblem(tail, page.tailTip, page.state!.cursor.number)))
+          : undefined;
+
+      // Recheck metadata in the second snapshot; a latest cursor may now get 409.
+      if (tailError && page.state && page.throughBlock > page.state.cursor.number) {
+        page = (await deps.store.transferHistory(network, account, limit, before)) ?? {
+          ...emptyIndex(network),
+          throughBlock: 0n,
+          transfers: [],
+        };
+        tailError = statusOf(page).reason ?? tailError;
+      }
+
+      const cursor = page.state?.cursor;
+      const tip = tail && !tailError ? page.tailTip : undefined;
+      const latest = tail?.latestNumber ?? adapter.cachedLatestBlockNumber?.() ?? cursor?.number;
+
+      return {
+        ...metadata(page, tip ?? cursor, latest),
+        network,
+        account,
+        page,
+        fromBlock: page.state?.startBlock ?? page.bootstrap!.startBlock,
+        finality: tip ? 'latest' : 'finalized',
+        ...(tip && cursor && { finalizedBlockHeight: cursor.number, finalizedBlockHash: cursor.hash }),
+        ...(tailError && { tailError }),
       };
     },
   };

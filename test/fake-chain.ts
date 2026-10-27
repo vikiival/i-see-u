@@ -5,9 +5,18 @@ import { createEvmAdapter } from '../src/chains/evm/adapter.ts';
 import { TRANSFER_TOPIC } from '../src/chains/evm/logs.ts';
 import { MULTICALL3 } from '../src/chains/evm/multicall.ts';
 import { addTransfer, emptyAggregate } from '../src/core/aggregate.ts';
-import type { Address, BlockHeader, BlockRef, ChainAdapter, ChunkAggregate, Hex, RpcClient, TransferEvent } from '../src/core/types.ts';
+import type {
+  Address,
+  BlockHeader,
+  BlockRef,
+  ChainAdapter,
+  ChunkAggregate,
+  Hex,
+  RpcClient,
+  RpcRequestOptions,
+  TransferEvent,
+} from '../src/core/types.ts';
 import { RpcError } from '../src/rpc/errors.ts';
-import { createRpcLogSource } from '../src/sources/rpc-logs.ts';
 import { lowerAddress, rpcParam, staged } from './helpers.ts';
 
 export const address = (n: number): Address => `0x${n.toString(16).padStart(40, '0')}`;
@@ -42,6 +51,8 @@ export class FakeChain {
   readonly unknownBlockOnce = new Set<Hex>();
   /** Every eth_call received, as the decoded aggregate3 call count. */
   multicallSizes: number[] = [];
+  /** The cancellation signal each eth_call received. */
+  multicallSignals: AbortSignal[] = [];
   private logsPerBlock = new Map<bigint, number>();
   private headers = new Map<bigint, BlockHeader>();
   private fork = 0n;
@@ -57,7 +68,10 @@ export class FakeChain {
 
   private ensureHeaders(to: bigint): void {
     for (let number = 0n; number <= to; number += 1n) {
-      if (this.headers.has(number)) continue;
+      if (this.headers.has(number)) {
+        continue;
+      }
+
       this.headers.set(number, {
         number,
         hash: blockHash(number),
@@ -67,7 +81,9 @@ export class FakeChain {
     }
   }
 
-  addTransfer(t: Omit<TransferEvent, 'transactionHash' | 'logIndex' | 'standard' | 'blockHash'> & Partial<TransferEvent>): TransferEvent {
+  addTransfer(
+    t: Omit<TransferEvent, 'transactionHash' | 'logIndex' | 'standard' | 'blockHash'> & Partial<TransferEvent>,
+  ): TransferEvent {
     this.ensureHeaders(t.blockNumber);
 
     const event: TransferEvent = {
@@ -78,7 +94,10 @@ export class FakeChain {
       ...t,
     };
 
-    this.logsPerBlock.set(event.blockNumber, Math.max(this.logsPerBlock.get(event.blockNumber) ?? 0, event.logIndex) + 1);
+    this.logsPerBlock.set(
+      event.blockNumber,
+      Math.max(this.logsPerBlock.get(event.blockNumber) ?? 0, event.logIndex) + 1,
+    );
     this.transfers.push(event);
 
     return event;
@@ -107,14 +126,20 @@ export class FakeChain {
       this.logsPerBlock.delete(number);
     }
 
-    for (const event of newLogs) this.addTransfer(event);
+    for (const event of newLogs) {
+      this.addTransfer(event);
+    }
   }
 
   /** What a perfect indexer would hold for `account` from `fromBlock` through `toBlock`. */
   truth(account: Address, fromBlock: bigint, toBlock: bigint): ChunkAggregate {
     const aggregate = emptyAggregate();
 
-    for (const e of this.transfers) if (e.blockNumber >= fromBlock && e.blockNumber <= toBlock) addTransfer(aggregate, account, e);
+    for (const e of this.transfers) {
+      if (e.blockNumber >= fromBlock && e.blockNumber <= toBlock) {
+        addTransfer(aggregate, account, e);
+      }
+    }
 
     return aggregate;
   }
@@ -123,13 +148,25 @@ export class FakeChain {
     this.ensureHeaders(n);
     const header = this.headers.get(n)!;
 
-    return { number: hex(n), hash: header.hash, parentHash: header.parentHash, timestamp: hex(header.timestamp), transactions: [] };
+    // A full bloom where the block has Transfers, an empty one elsewhere (enough for the bootstrap's zero-log check).
+    const logsBloom = `0x${(this.transfers.some((event) => event.blockNumber === n) ? 'f' : '0').repeat(512)}`;
+
+    return {
+      number: hex(n),
+      hash: header.hash,
+      parentHash: header.parentHash,
+      timestamp: hex(header.timestamp),
+      logsBloom,
+      transactions: [],
+    };
   }
 
   private wireLog(e: TransferEvent) {
     const topics = [TRANSFER_TOPIC, pad(e.from, { size: 32 }), pad(e.to, { size: 32 })];
 
-    if (e.standard === 'erc721') topics.push(pad(hex(e.value), { size: 32 }));
+    if (e.standard === 'erc721') {
+      topics.push(pad(hex(e.value), { size: 32 }));
+    }
 
     return {
       address: e.token,
@@ -144,13 +181,22 @@ export class FakeChain {
   }
 
   readonly rpc: RpcClient = {
-    request: async <T>(method: string, params: unknown[]): Promise<T> => {
+    request: async <T>(method: string, params: unknown[], opts?: RpcRequestOptions): Promise<T> => {
       this.calls[method] = (this.calls[method] ?? 0) + 1;
 
       if (method === 'eth_getBlockByNumber') {
-        if (this.failHead) throw new RpcError('transient', 'HTTP 503');
+        if (this.failHead) {
+          throw new RpcError('transient', 'HTTP 503');
+        }
+
         const tag = params[0];
-        const n = tag === 'finalized' ? this.finalized : tag === 'latest' ? this.latest ?? this.finalized + 64n : BigInt(String(tag));
+
+        const n =
+          tag === 'finalized'
+            ? this.finalized
+            : tag === 'latest'
+              ? (this.latest ?? this.finalized + 64n)
+              : BigInt(String(tag));
 
         return staged<T>(this.block(n));
       }
@@ -161,10 +207,16 @@ export class FakeChain {
         let toBlock: bigint;
 
         if (f.blockHash) {
-          if (this.unknownBlockOnce.delete(f.blockHash)) throw new RpcError('transient', 'unknown block');
+          if (this.unknownBlockOnce.delete(f.blockHash)) {
+            throw new RpcError('transient', 'unknown block');
+          }
+
           const header = [...this.headers.values()].find((block) => block.hash === f.blockHash);
 
-          if (!header) throw new RpcError('transient', 'unknown block');
+          if (!header) {
+            throw new RpcError('transient', 'unknown block');
+          }
+
           fromBlock = toBlock = header.number;
         } else {
           fromBlock = BigInt(f.fromBlock!);
@@ -175,14 +227,24 @@ export class FakeChain {
         await this.beforeLogs?.(filter);
         const topicOf = (a: Address) => pad(a, { size: 32 });
 
-        return staged<T>(this.transfers.filter((e) => e.blockNumber >= filter.fromBlock && e.blockNumber <= filter.toBlock
-          && (!f.blockHash || e.blockHash === f.blockHash)
-          && (!f.topics[1] || f.topics[1] === topicOf(e.from))
-          && (!f.topics[2] || f.topics[2] === topicOf(e.to))).map((e, index) => {
-            const log = this.wireLog(e);
+        return staged<T>(
+          this.transfers
+            .filter(
+              (e) =>
+                e.blockNumber >= filter.fromBlock &&
+                e.blockNumber <= filter.toBlock &&
+                (!f.blockHash || e.blockHash === f.blockHash) &&
+                (!f.topics[1] || f.topics[1] === topicOf(e.from)) &&
+                (!f.topics[2] || f.topics[2] === topicOf(e.to)),
+            )
+            .map((e, index) => {
+              const log = this.wireLog(e);
 
-            return this.mismatchRangeLogHash && !f.blockHash && index === 0 ? { ...log, blockHash: blockHash(9_999_999n) } : log;
-          }));
+              return this.mismatchRangeLogHash && !f.blockHash && index === 0
+                ? { ...log, blockHash: blockHash(9_999_999n) }
+                : log;
+            }),
+        );
       }
 
       if (method === 'eth_call') {
@@ -190,49 +252,67 @@ export class FakeChain {
         const { blockHash: at } = rpcParam<{ blockHash: Hex }>(params, 1);
         const decoded = decodeFunctionData({ abi: multicall3Abi, data });
 
-        if (decoded.functionName !== 'aggregate3') throw new RpcError('fatal', `unexpected call ${decoded.functionName}`);
+        if (decoded.functionName !== 'aggregate3') {
+          throw new RpcError('fatal', `unexpected call ${decoded.functionName}`);
+        }
+
         const [calls] = decoded.args;
         this.multicallSizes.push(calls.length);
+
+        if (opts?.signal) {
+          this.multicallSignals.push(opts.signal);
+        }
+
         await this.beforeMulticall?.(calls.map((call) => lowerAddress(call.target)));
 
-        return staged<T>(encodeFunctionResult({
-          abi: multicall3Abi,
-          functionName: 'aggregate3',
-          result: calls.map((call) => {
-            const inner = decodeFunctionData({ abi: erc20Abi, data: call.callData });
+        return staged<T>(
+          encodeFunctionResult({
+            abi: multicall3Abi,
+            functionName: 'aggregate3',
+            result: calls.map((call) => {
+              const inner = decodeFunctionData({ abi: erc20Abi, data: call.callData });
 
-            if (inner.functionName !== 'balanceOf') throw new RpcError('fatal', `unexpected inner call ${inner.functionName}`);
-            const [account] = inner.args;
-            const balance = this.balanceOf(lowerAddress(account), lowerAddress(call.target), at);
+              if (inner.functionName !== 'balanceOf') {
+                throw new RpcError('fatal', `unexpected inner call ${inner.functionName}`);
+              }
 
-            return balance === undefined
-              ? { success: false, returnData: '0x' as const }
-              : { success: true, returnData: encodeFunctionResult({ abi: erc20Abi, functionName: 'balanceOf', result: balance }) };
+              const [account] = inner.args;
+              const balance = this.balanceOf(lowerAddress(account), lowerAddress(call.target), at);
+
+              return balance === undefined
+                ? { success: false, returnData: '0x' as const }
+                : {
+                    success: true,
+                    returnData: encodeFunctionResult({ abi: erc20Abi, functionName: 'balanceOf', result: balance }),
+                  };
+            }),
           }),
-        }));
+        );
       }
 
       throw new RpcError('fatal', `unexpected method ${method}`);
     },
-    stats: () => ({ requests: this.total, attempts: this.total, byMethod: { ...this.calls }, errors: {}, endpoints: [] }),
+    stats: () => ({
+      requests: this.total,
+      attempts: this.total,
+      byMethod: { ...this.calls },
+      errors: {},
+      endpoints: [],
+    }),
   };
 
-  adapter(overrides: Partial<{
-    startBlock: bigint;
-    logsMaxRange: bigint;
-    followerMaxRange: bigint;
-    scanConcurrency: number;
-    multicallBatch: number;
-  }> = {}): ChainAdapter {
-    const logsMaxRange = overrides.logsMaxRange ?? 1_000n;
-
+  adapter(
+    overrides: Partial<{
+      startBlock: bigint;
+      followerMaxRange: bigint;
+      multicallBatch: number;
+    }> = {},
+  ): ChainAdapter {
     return createEvmAdapter(this.rpc, {
       network: 'ethereum',
       chain: mainnet,
       startBlock: 100n,
-      accountLogs: createRpcLogSource(this.rpc, { preferredMaxRange: logsMaxRange, minRange: 1n }),
       finalizedMaxNoProgressMs: 1_200_000,
-      scanConcurrency: 2,
       followerMaxRange: 500n,
       multicallBatch: 1_000,
       multicall3: MULTICALL3,
@@ -245,7 +325,10 @@ export class FakeChain {
 /** A gate a fake RPC can await; release() opens it. */
 export const gate = () => {
   let release = (): void => {};
-  const opened = new Promise<void>((resolve) => { release = resolve; });
+
+  const opened = new Promise<void>((resolve) => {
+    release = resolve;
+  });
 
   return { opened, release };
 };
